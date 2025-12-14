@@ -157,20 +157,31 @@ async def bin_lookup(bin_number: str):
         return {"error": str(e), "status": "error"}
 
 
+def user_has_products(user_id: int) -> bool:
+    """Check if user has set product URLs"""
+    settings = get_user_settings(user_id)
+    return len(settings.get("products", [])) > 0
+
+
 async def process_single_card(card: str, user_id: int = None) -> dict:
     """Process a single card and return result"""
     async with sem:
         logger.info(f'Processing card: {card}')
 
-        # Get user settings or use defaults
+        # Get user settings
         settings = get_user_settings(user_id) if user_id else {}
 
-        # Use user's product URLs or fall back to config
+        # Use user's product URLs (required)
         user_products = settings.get("products", [])
-        if user_products:
-            product_url = random.choice(user_products)
-        else:
-            product_url = config._get_rnd_product_url()
+        if not user_products:
+            return {
+                "card": card,
+                "product_url": None,
+                "response": {"error": "No product set. Use /addproduct first.", "success": False},
+                "bin_data": {}
+            }
+
+        product_url = random.choice(user_products)
 
         # Use user's proxy or fall back to config
         user_proxy = settings.get("proxy")
@@ -338,6 +349,16 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /chk command for single card"""
     user_id = update.effective_user.id
 
+    # Check if user has products set
+    if not user_has_products(user_id):
+        await update.message.reply_text(
+            "❌ *No product set!*\n\n"
+            "Add a product first with:\n"
+            "`/addproduct https://store.com/products/item`",
+            parse_mode="Markdown"
+        )
+        return
+
     if not context.args:
         await update.message.reply_text("❌ Usage: `/chk 4111111111111111|12|2025|123`", parse_mode="Markdown")
         return
@@ -365,6 +386,16 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle .txt file uploads for mass checking"""
     user_id = update.effective_user.id
     document = update.message.document
+
+    # Check if user has products set
+    if not user_has_products(user_id):
+        await update.message.reply_text(
+            "❌ *No product set!*\n\n"
+            "Add a product first with:\n"
+            "`/addproduct https://store.com/products/item`",
+            parse_mode="Markdown"
+        )
+        return
 
     if not document.file_name.endswith('.txt'):
         await update.message.reply_text("❌ Please send a .txt file containing cards.")
@@ -464,6 +495,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not cards:
         return  # Ignore messages without cards
+
+    # Check if user has products set
+    if not user_has_products(user_id):
+        await update.message.reply_text(
+            "❌ *No product set!*\n\n"
+            "Add a product first with:\n"
+            "`/addproduct https://store.com/products/item`",
+            parse_mode="Markdown"
+        )
+        return
 
     if len(cards) == 1:
         # Single card - check it

@@ -930,6 +930,95 @@ async def clearproducts_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("✅ All products cleared!")
 
 
+def is_admin(user_id: int) -> bool:
+    """Check if user is admin"""
+    return config.ADMIN_USER_ID and user_id == config.ADMIN_USER_ID
+
+
+async def dbstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /dbstatus command - admin only debug command"""
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("🚫 This command is restricted to administrators.")
+        return
+
+    status_parts = ["🔧 *Database Status*\n"]
+
+    # Check if PostgreSQL is available
+    if not HAS_POSTGRES:
+        status_parts.append("⚠️ *PostgreSQL driver*: Not installed")
+        status_parts.append("📦 Using: In-memory storage (data lost on restart)")
+    else:
+        status_parts.append("✅ *PostgreSQL driver*: Installed")
+
+    # Check DATABASE_URL
+    if DATABASE_URL:
+        # Mask the URL for security
+        masked_url = DATABASE_URL[:20] + "..." if len(DATABASE_URL) > 20 else DATABASE_URL
+        status_parts.append(f"✅ *DATABASE\\_URL*: Set (`{masked_url}`)")
+    else:
+        status_parts.append("❌ *DATABASE\\_URL*: Not set")
+
+    # Test actual connection
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+
+            # Count users
+            cur.execute("SELECT COUNT(*) FROM user_settings")
+            user_count = cur.fetchone()[0]
+            status_parts.append(f"\n📊 *Database Stats*:")
+            status_parts.append(f"• Total users: {user_count}")
+
+            # Get recent users (last 5)
+            cur.execute("""
+                SELECT user_id,
+                       COALESCE(array_length(products, 1), 0) as product_count,
+                       proxy IS NOT NULL as has_proxy
+                FROM user_settings
+                ORDER BY user_id DESC
+                LIMIT 5
+            """)
+            recent_users = cur.fetchall()
+
+            if recent_users:
+                status_parts.append(f"\n👥 *Recent Users* (last 5):")
+                for row in recent_users:
+                    uid, prod_count, has_proxy = row
+                    proxy_icon = "🌐" if has_proxy else "➖"
+                    status_parts.append(f"• `{uid}`: {prod_count} products {proxy_icon}")
+
+            # Test write capability
+            cur.execute("SELECT 1")
+            status_parts.append(f"\n✅ *Connection*: Active & working")
+
+            cur.close()
+            conn.close()
+        except Exception as e:
+            status_parts.append(f"\n❌ *Error*: {str(e)}")
+            conn.close()
+    else:
+        if DATABASE_URL:
+            status_parts.append(f"\n❌ *Connection*: Failed to connect")
+        else:
+            # Show in-memory cache stats
+            status_parts.append(f"\n📊 *In-Memory Stats*:")
+            status_parts.append(f"• Cached users: {len(user_settings_cache)}")
+            if user_settings_cache:
+                for uid, settings in list(user_settings_cache.items())[:5]:
+                    prod_count = len(settings.get("products", []))
+                    has_proxy = settings.get("proxy") is not None
+                    proxy_icon = "🌐" if has_proxy else "➖"
+                    status_parts.append(f"• `{uid}`: {prod_count} products {proxy_icon}")
+
+    await update.message.reply_text(
+        "\n".join(status_parts),
+        parse_mode="Markdown"
+    )
+
+
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /settings command"""
     user_id = update.effective_user.id
@@ -1456,6 +1545,7 @@ def main():
     app.add_handler(CommandHandler("products", products_command))
     app.add_handler(CommandHandler("clearproducts", clearproducts_command))
     app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("dbstatus", dbstatus_command))
     app.add_handler(CommandHandler("chk", check_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))

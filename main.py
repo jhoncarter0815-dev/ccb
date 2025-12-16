@@ -391,6 +391,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Setup Commands:*\n"
         "`/setproxy host:port:user:pass` - Set your proxy\n"
         "`/addproduct <url>` - Add product URL\n"
+        "`/removeproduct <url>` - Remove product URL\n"
         "`/products` - View your product list\n"
         "`/clearproducts` - Clear all products\n"
         "`/settings` - View your current settings\n\n"
@@ -426,6 +427,46 @@ async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Proxy set to: `{proxy_str}`", parse_mode="Markdown")
 
 
+async def validate_shopify_product(url: str) -> tuple[bool, str]:
+    """Validate if a URL is a valid Shopify product page"""
+    try:
+        # Check URL format
+        if "/products/" not in url:
+            return False, "URL must contain '/products/' (Shopify product URL)"
+
+        # Try to fetch product JSON
+        json_url = url.rstrip('/') + ".json"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(json_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if "product" in data:
+                        product_title = data["product"].get("title", "Unknown")
+                        return True, f"Product found: {product_title}"
+                    else:
+                        return False, "Not a valid Shopify product page"
+                elif resp.status == 404:
+                    return False, "Product not found (404)"
+                elif resp.status == 401 or resp.status == 403:
+                    # Some stores block JSON access, try HTML
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as html_resp:
+                        if html_resp.status == 200:
+                            text = await html_resp.text()
+                            if 'Shopify' in text or 'shopify' in text or '/products/' in text:
+                                return True, "Product page accessible"
+                            else:
+                                return False, "Not a Shopify store"
+                        else:
+                            return False, f"Page not accessible (HTTP {html_resp.status})"
+                else:
+                    return False, f"Failed to access product (HTTP {resp.status})"
+    except asyncio.TimeoutError:
+        return False, "Request timed out"
+    except Exception as e:
+        return False, f"Error: {str(e)[:50]}"
+
+
 async def addproduct_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /addproduct command"""
     user_id = update.effective_user.id
@@ -442,16 +483,64 @@ async def addproduct_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     settings = get_user_settings(user_id)
     products = settings.get("products", [])
 
-    if url not in products:
+    if url in products:
+        await update.message.reply_text("⚠️ This product URL is already in your list.")
+        return
+
+    # Validate the product URL
+    status_msg = await update.message.reply_text("⏳ Validating product URL...")
+
+    is_valid, message = await validate_shopify_product(url)
+
+    if is_valid:
         products.append(url)
         update_user_setting(user_id, "products", products)
-        await update.message.reply_text(
+        await status_msg.edit_text(
             f"✅ Product added!\n\n"
+            f"📝 {message}\n"
             f"📦 Total products: {len(products)}",
             parse_mode="Markdown"
         )
     else:
-        await update.message.reply_text("⚠️ This product URL is already in your list.")
+        await status_msg.edit_text(
+            f"❌ *Failed to add product*\n\n"
+            f"📝 {message}\n\n"
+            f"Make sure the URL is a valid Shopify product page.",
+            parse_mode="Markdown"
+        )
+
+
+async def removeproduct_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /removeproduct command"""
+    user_id = update.effective_user.id
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usage: `/removeproduct <url>`\n"
+            "Example: `/removeproduct https://store.com/products/item`\n\n"
+            "Use `/products` to see your product list.",
+            parse_mode="Markdown"
+        )
+        return
+
+    url = context.args[0]
+    settings = get_user_settings(user_id)
+    products = settings.get("products", [])
+
+    if url in products:
+        products.remove(url)
+        update_user_setting(user_id, "products", products)
+        await update.message.reply_text(
+            f"✅ Product removed!\n\n"
+            f"📦 Remaining products: {len(products)}",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Product not found in your list.\n\n"
+            "Use `/products` to see your saved products.",
+            parse_mode="Markdown"
+        )
 
 
 async def products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -821,6 +910,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("setproxy", setproxy_command))
     app.add_handler(CommandHandler("addproduct", addproduct_command))
+    app.add_handler(CommandHandler("removeproduct", removeproduct_command))
     app.add_handler(CommandHandler("products", products_command))
     app.add_handler(CommandHandler("clearproducts", clearproducts_command))
     app.add_handler(CommandHandler("settings", settings_command))

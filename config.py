@@ -9,7 +9,13 @@ class CheckerConfig:
 
         self.DEFAULT_EMAIL = os.getenv("DEFAULT_EMAIL", None)
 
-        self.CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "15"))
+        # Per-user concurrency: how many cards each user can check at once
+        # Increase this for faster checking (default 20, max recommended 30)
+        self.CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "20"))
+
+        # Global concurrency: total concurrent operations across ALL users
+        # Prevents server overload (default 150)
+        self.GLOBAL_CONCURRENCY_LIMIT = int(os.getenv("GLOBAL_CONCURRENCY_LIMIT", "150"))
 
         self.BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 

@@ -10,12 +10,16 @@ class CheckerConfig:
         self.DEFAULT_EMAIL = os.getenv("DEFAULT_EMAIL", None)
 
         # Per-user concurrency: how many cards each user can check at once
-        # Increase this for faster checking (default 20, max recommended 30)
-        self.CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "20"))
+        # Lower values avoid captcha triggers (default 5, max recommended 10)
+        self.CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "5"))
 
         # Global concurrency: total concurrent operations across ALL users
-        # Prevents server overload (default 150)
-        self.GLOBAL_CONCURRENCY_LIMIT = int(os.getenv("GLOBAL_CONCURRENCY_LIMIT", "150"))
+        # Prevents server overload and captcha (default 20)
+        self.GLOBAL_CONCURRENCY_LIMIT = int(os.getenv("GLOBAL_CONCURRENCY_LIMIT", "20"))
+
+        # Delay between starting each card check (in seconds)
+        # Helps avoid captcha by spacing out requests (default 0.5)
+        self.CARD_DELAY = float(os.getenv("CARD_DELAY", "0.5"))
 
         self.BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 

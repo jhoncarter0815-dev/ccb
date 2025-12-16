@@ -569,11 +569,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No valid cards found in the file.")
         return
 
-    max_cards = 500
-    if len(cards) > max_cards:
-        cards = cards[:max_cards]
-        await update.message.reply_text(f"⚠️ Limited to {max_cards} cards.")
-
     status_msg = await update.message.reply_text(
         f"📂 *File Received*\n\n"
         f"💳 Cards found: {len(cards)}\n"
@@ -584,6 +579,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     charged = []
     declined = []
     three_ds = []
+    all_results = []
     last_response = ""
 
     tasks = [process_single_card(card, user_id) for card in cards]
@@ -592,40 +588,46 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             result = await future
             response = result["response"]
+            card = result["card"]
 
             # Get the response message for display
             error_msg = response.get("error", "") or response.get("message", "") or "Processing..."
-            # Truncate long messages
+            full_response = error_msg
             if len(error_msg) > 50:
                 error_msg = error_msg[:47] + "..."
             last_response = error_msg
 
+            # Store result with response
+            result_line = f"{card} | {full_response}"
+
             if response.get("success"):
                 charged.append(result)
-                # Send charged card immediately
+                all_results.append(f"✅ CHARGED | {result_line}")
                 await update.message.reply_text(format_result(result), parse_mode="Markdown")
             elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
                 three_ds.append(result)
-                # Send 3DS cards too
+                all_results.append(f"🔐 3DS | {result_line}")
                 await update.message.reply_text(format_result(result), parse_mode="Markdown")
             else:
                 declined.append(result)
+                all_results.append(f"❌ DECLINED | {result_line}")
 
-            # Update progress every card
-            try:
-                progress_bar = create_progress_bar(i + 1, len(cards))
-                await status_msg.edit_text(
-                    f"⏳ *Checking Cards...*\n\n"
-                    f"{progress_bar}\n"
-                    f"📊 {i + 1}/{len(cards)} checked\n\n"
-                    f"✅ Charged: {len(charged)}\n"
-                    f"🔐 3DS: {len(three_ds)}\n"
-                    f"❌ Declined: {len(declined)}\n\n"
-                    f"💬 *Last*: `{last_response}`",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass  # Ignore edit errors
+            # Update progress every 5 cards to reduce API calls
+            if (i + 1) % 5 == 0 or i + 1 == len(cards):
+                try:
+                    progress_bar = create_progress_bar(i + 1, len(cards))
+                    await status_msg.edit_text(
+                        f"⏳ *Checking Cards...*\n\n"
+                        f"{progress_bar}\n"
+                        f"📊 {i + 1}/{len(cards)} checked\n\n"
+                        f"✅ Charged: {len(charged)}\n"
+                        f"🔐 3DS: {len(three_ds)}\n"
+                        f"❌ Declined: {len(declined)}\n\n"
+                        f"💬 *Last*: `{last_response}`",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
 
         except Exception as e:
             logger.error(f"Mass check error: {e}")
@@ -641,8 +643,18 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await status_msg.edit_text(summary, parse_mode="Markdown")
 
-    # Send charged cards as a file if many
-    if len(charged) > 5:
+    # Send full results file
+    if all_results:
+        results_text = "\n".join(all_results)
+        file_buffer = io.BytesIO(results_text.encode('utf-8'))
+        file_buffer.name = "results.txt"
+        await update.message.reply_document(
+            document=file_buffer,
+            caption=f"📊 Full Results: {len(charged)} Charged | {len(three_ds)} 3DS | {len(declined)} Declined"
+        )
+
+    # Send charged cards separately
+    if charged:
         charged_text = "\n".join([r["card"] for r in charged])
         file_buffer = io.BytesIO(charged_text.encode('utf-8'))
         file_buffer.name = "charged_cards.txt"
@@ -683,14 +695,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Check error: {e}")
             await status_msg.edit_text(f"❌ Error: {str(e)}")
     else:
-        # Multiple cards - process them all
-        if len(cards) > 50:
-            cards = cards[:50]
-
+        # Multiple cards - process them all (no limit)
         status_msg = await update.message.reply_text(f"⏳ Checking {len(cards)} cards...")
 
         charged = []
         declined = []
+        three_ds = []
+        all_results = []
         last_response = ""
 
         tasks = [process_single_card(card, user_id) for card in cards]
@@ -699,41 +710,71 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 result = await future
                 response = result["response"]
+                card = result["card"]
 
                 # Get the response message for display
                 error_msg = response.get("error", "") or response.get("message", "") or "Processing..."
+                full_response = error_msg
                 if len(error_msg) > 50:
                     error_msg = error_msg[:47] + "..."
                 last_response = error_msg
 
+                result_line = f"{card} | {full_response}"
+
                 if response.get("success"):
                     charged.append(result)
+                    all_results.append(f"✅ CHARGED | {result_line}")
                     await update.message.reply_text(format_result(result), parse_mode="Markdown")
-                elif '3ds' in str(response.get("error", "")).lower():
-                    charged.append(result)  # Count 3DS as potential
+                elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
+                    three_ds.append(result)
+                    all_results.append(f"🔐 3DS | {result_line}")
                     await update.message.reply_text(format_result(result), parse_mode="Markdown")
                 else:
                     declined.append(result)
+                    all_results.append(f"❌ DECLINED | {result_line}")
 
-                try:
-                    progress_bar = create_progress_bar(i + 1, len(cards))
-                    await status_msg.edit_text(
-                        f"⏳ *Checking Cards...*\n\n"
-                        f"{progress_bar}\n"
-                        f"📊 {i + 1}/{len(cards)} checked\n\n"
-                        f"✅ Charged: {len(charged)}\n"
-                        f"❌ Declined: {len(declined)}\n\n"
-                        f"💬 *Last*: `{last_response}`",
-                        parse_mode="Markdown"
-                    )
-                except Exception:
-                    pass
+                # Update progress every 5 cards
+                if (i + 1) % 5 == 0 or i + 1 == len(cards):
+                    try:
+                        progress_bar = create_progress_bar(i + 1, len(cards))
+                        await status_msg.edit_text(
+                            f"⏳ *Checking Cards...*\n\n"
+                            f"{progress_bar}\n"
+                            f"📊 {i + 1}/{len(cards)} checked\n\n"
+                            f"✅ Charged: {len(charged)}\n"
+                            f"🔐 3DS: {len(three_ds)}\n"
+                            f"❌ Declined: {len(declined)}\n\n"
+                            f"💬 *Last*: `{last_response}`",
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.error(f"Mass check error: {e}")
                 last_response = f"Error: {str(e)[:30]}"
 
-        summary = f"📊 *FINAL RESULTS*\n\n✅ Charged: {len(charged)}\n❌ Declined: {len(declined)}\n📝 Total: {len(cards)}"
+        summary = f"📊 *FINAL RESULTS*\n\n✅ Charged: {len(charged)}\n🔐 3DS: {len(three_ds)}\n❌ Declined: {len(declined)}\n📝 Total: {len(cards)}"
         await status_msg.edit_text(summary, parse_mode="Markdown")
+
+        # Send full results file
+        if all_results:
+            results_text = "\n".join(all_results)
+            file_buffer = io.BytesIO(results_text.encode('utf-8'))
+            file_buffer.name = "results.txt"
+            await update.message.reply_document(
+                document=file_buffer,
+                caption=f"📊 Full Results: {len(charged)} Charged | {len(three_ds)} 3DS | {len(declined)} Declined"
+            )
+
+        # Send charged cards separately
+        if charged:
+            charged_text = "\n".join([r["card"] for r in charged])
+            file_buffer = io.BytesIO(charged_text.encode('utf-8'))
+            file_buffer.name = "charged_cards.txt"
+            await update.message.reply_document(
+                document=file_buffer,
+                caption=f"✅ {len(charged)} Charged Cards"
+            )
 
 
 def main():

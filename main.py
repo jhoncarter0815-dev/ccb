@@ -3,12 +3,22 @@ import asyncio
 import re
 import random
 import sys
+import os
+import json
 import aiohttp
 from curl_cffi.requests import AsyncSession
 from loguru import logger
 from telegram import Update, Document
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import io
+
+# PostgreSQL support
+try:
+    import psycopg2
+    from psycopg2.extras import Json
+    HAS_POSTGRES = True
+except ImportError:
+    HAS_POSTGRES = False
 
 # Setup logger
 def setup_logger(script_name: str = "CC BOT") -> None:
@@ -32,20 +42,133 @@ def setup_logger(script_name: str = "CC BOT") -> None:
 setup_logger()
 config = CheckerConfig()
 
-# User settings storage (in-memory - resets on restart)
-# For persistent storage, use a database
-user_settings = {}
+# Database connection
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+def get_db_connection():
+    """Get PostgreSQL database connection"""
+    if not HAS_POSTGRES or not DATABASE_URL:
+        return None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        logger.error(f"Database connection error: {e}")
+        return None
+
+def init_database():
+    """Initialize database tables"""
+    conn = get_db_connection()
+    if not conn:
+        logger.warning("No database connection - using in-memory storage")
+        return False
+
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id BIGINT PRIMARY KEY,
+                proxy TEXT,
+                products TEXT[],
+                email TEXT,
+                is_shippable BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("Database initialized successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Database init error: {e}")
+        return False
+
+# In-memory fallback
+user_settings_cache = {}
 
 def get_user_settings(user_id: int) -> dict:
-    """Get or create user settings"""
-    if user_id not in user_settings:
-        user_settings[user_id] = {
+    """Get or create user settings from database or cache"""
+    # Try database first
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT proxy, products, email, is_shippable FROM user_settings WHERE user_id = %s",
+                (user_id,)
+            )
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+
+            if row:
+                return {
+                    "proxy": row[0],
+                    "products": row[1] if row[1] else [],
+                    "email": row[2],
+                    "is_shippable": row[3]
+                }
+            else:
+                # Create new user settings
+                return save_user_settings(user_id, {
+                    "proxy": None,
+                    "products": [],
+                    "email": None,
+                    "is_shippable": False
+                })
+        except Exception as e:
+            logger.error(f"Database read error: {e}")
+
+    # Fallback to in-memory
+    if user_id not in user_settings_cache:
+        user_settings_cache[user_id] = {
             "proxy": None,
             "products": [],
             "email": None,
             "is_shippable": False
         }
-    return user_settings[user_id]
+    return user_settings_cache[user_id]
+
+def save_user_settings(user_id: int, settings: dict) -> dict:
+    """Save user settings to database"""
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO user_settings (user_id, proxy, products, email, is_shippable, updated_at)
+                VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    proxy = EXCLUDED.proxy,
+                    products = EXCLUDED.products,
+                    email = EXCLUDED.email,
+                    is_shippable = EXCLUDED.is_shippable,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (
+                user_id,
+                settings.get("proxy"),
+                settings.get("products", []),
+                settings.get("email"),
+                settings.get("is_shippable", False)
+            ))
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.debug(f"Saved settings for user {user_id}")
+        except Exception as e:
+            logger.error(f"Database save error: {e}")
+
+    # Also update cache
+    user_settings_cache[user_id] = settings
+    return settings
+
+def update_user_setting(user_id: int, key: str, value) -> dict:
+    """Update a single setting for a user"""
+    settings = get_user_settings(user_id)
+    settings[key] = value
+    return save_user_settings(user_id, settings)
 
 def create_lista_(text: str):
     """Extract credit card numbers from text"""
@@ -294,13 +417,12 @@ async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     proxy_str = context.args[0]
-    settings = get_user_settings(user_id)
 
     if proxy_str.lower() == "clear":
-        settings["proxy"] = None
+        update_user_setting(user_id, "proxy", None)
         await update.message.reply_text("✅ Proxy cleared! Using default proxy.")
     else:
-        settings["proxy"] = proxy_str
+        update_user_setting(user_id, "proxy", proxy_str)
         await update.message.reply_text(f"✅ Proxy set to: `{proxy_str}`", parse_mode="Markdown")
 
 
@@ -318,12 +440,14 @@ async def addproduct_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     url = context.args[0]
     settings = get_user_settings(user_id)
+    products = settings.get("products", [])
 
-    if url not in settings["products"]:
-        settings["products"].append(url)
+    if url not in products:
+        products.append(url)
+        update_user_setting(user_id, "products", products)
         await update.message.reply_text(
             f"✅ Product added!\n\n"
-            f"📦 Total products: {len(settings['products'])}",
+            f"📦 Total products: {len(products)}",
             parse_mode="Markdown"
         )
     else:
@@ -354,9 +478,8 @@ async def products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clearproducts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /clearproducts command"""
     user_id = update.effective_user.id
-    settings = get_user_settings(user_id)
-    settings["products"] = []
-    await update.message.reply_text("✅ All products cleared! Using default product.")
+    update_user_setting(user_id, "products", [])
+    await update.message.reply_text("✅ All products cleared!")
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -620,6 +743,13 @@ def main():
         return
 
     logger.info("Starting CC Checker Bot...")
+
+    # Initialize database
+    if DATABASE_URL:
+        logger.info("Connecting to PostgreSQL database...")
+        init_database()
+    else:
+        logger.warning("DATABASE_URL not set - using in-memory storage (settings won't persist)")
 
     app = Application.builder().token(config.BOT_TOKEN).build()
 

@@ -171,7 +171,7 @@ def update_user_setting(user_id: int, key: str, value) -> dict:
     return save_user_settings(user_id, settings)
 
 
-# Session state management for pause/stop functionality
+# Session state management for pause/stop and input waiting
 user_sessions = {}
 
 def get_user_session(user_id: int) -> dict:
@@ -180,7 +180,8 @@ def get_user_session(user_id: int) -> dict:
         user_sessions[user_id] = {
             "paused": False,
             "stopped": False,
-            "checking": False
+            "checking": False,
+            "waiting_for": None  # None, "proxy", "product"
         }
     return user_sessions[user_id]
 
@@ -189,8 +190,19 @@ def reset_user_session(user_id: int):
     user_sessions[user_id] = {
         "paused": False,
         "stopped": False,
-        "checking": False
+        "checking": False,
+        "waiting_for": None
     }
+
+def set_waiting_for(user_id: int, waiting_type: str):
+    """Set what input the bot is waiting for from user"""
+    session = get_user_session(user_id)
+    session["waiting_for"] = waiting_type
+
+def get_waiting_for(user_id: int) -> str:
+    """Get what input the bot is waiting for"""
+    session = get_user_session(user_id)
+    return session.get("waiting_for")
 
 
 def create_lista_(text: str):
@@ -410,9 +422,10 @@ def format_result(result: dict, show_full: bool = True) -> str:
 def get_main_menu_keyboard():
     """Build the main menu inline keyboard"""
     keyboard = [
-        [InlineKeyboardButton("📦 View Products", callback_data="menu_products")],
-        [InlineKeyboardButton("🌐 Manage Proxy", callback_data="menu_proxy")],
-        [InlineKeyboardButton("⚙️ View Settings", callback_data="menu_settings")],
+        [InlineKeyboardButton("📦 Products", callback_data="menu_products")],
+        [InlineKeyboardButton("🌐 Proxy", callback_data="menu_proxy")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")],
+        [InlineKeyboardButton("💳 Check Cards", callback_data="menu_check_info")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -422,13 +435,19 @@ def get_products_keyboard(user_id: int):
     products = settings.get("products", [])
 
     keyboard = []
+    # Add product button at top
+    keyboard.append([InlineKeyboardButton("➕ Add Product", callback_data="prod_add")])
+
     for i, url in enumerate(products):
         # Shorten URL for display
-        display = url.split("/products/")[-1][:25] if "/products/" in url else url[:25]
+        display = url.split("/products/")[-1][:20] if "/products/" in url else url[:20]
         keyboard.append([
             InlineKeyboardButton(f"📦 {display}", callback_data=f"prod_view_{i}"),
             InlineKeyboardButton("🗑️", callback_data=f"prod_del_{i}")
         ])
+
+    if products:
+        keyboard.append([InlineKeyboardButton("🗑️ Clear All", callback_data="prod_clear_all")])
 
     keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="menu_main")])
     return InlineKeyboardMarkup(keyboard)
@@ -439,6 +458,7 @@ def get_proxy_keyboard(user_id: int):
     proxy = settings.get("proxy")
 
     keyboard = []
+    keyboard.append([InlineKeyboardButton("➕ Set Proxy", callback_data="proxy_set")])
     if proxy:
         keyboard.append([InlineKeyboardButton("🗑️ Clear Proxy", callback_data="proxy_clear")])
     keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="menu_main")])
@@ -462,33 +482,38 @@ def get_checking_keyboard(paused: bool = False):
         ]
     return InlineKeyboardMarkup(keyboard)
 
+def get_back_keyboard(callback: str = "menu_main"):
+    """Simple back button keyboard"""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Back", callback_data=callback)]])
+
+def get_cancel_keyboard():
+    """Cancel input keyboard"""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_input")]])
+
 
 # Telegram Bot Handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
-    welcome_msg = (
+    """Handle /start command - show main menu"""
+    user_id = update.effective_user.id
+    set_waiting_for(user_id, None)  # Clear any pending input
+
+    await update.message.reply_text(
         "🔥 *CC Checker Bot*\n\n"
-        "*Setup Commands:*\n"
-        "`/setproxy host:port:user:pass` - Set your proxy\n"
-        "`/addproduct <url>` - Add product URL\n"
-        "`/removeproduct <url>` - Remove product URL\n"
-        "`/products` - View your product list\n"
-        "`/clearproducts` - Clear all products\n"
-        "`/settings` - View your current settings\n"
-        "`/menu` - Interactive menu\n\n"
-        "*Checking Commands:*\n"
-        "`/chk <card>` - Check single card\n"
-        "📎 *Send .txt file* - Mass check cards from file\n\n"
-        "*Card Format:*\n"
-        "`4111111111111111|12|2025|123`"
+        "Welcome! Use the buttons below to navigate.\n\n"
+        "📎 *Send .txt file* or paste cards to check them.\n\n"
+        "*Card Format:* `4111111111111111|12|2025|123`",
+        parse_mode="Markdown",
+        reply_markup=get_main_menu_keyboard()
     )
-    await update.message.reply_text(welcome_msg, parse_mode="Markdown")
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /menu command - show interactive menu"""
+    user_id = update.effective_user.id
+    set_waiting_for(user_id, None)  # Clear any pending input
+
     await update.message.reply_text(
-        "🔥 *CC Checker Bot - Menu*\n\n"
+        "🔥 *CC Checker Bot*\n\n"
         "Select an option below:",
         parse_mode="Markdown",
         reply_markup=get_main_menu_keyboard()
@@ -503,10 +528,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
 
+    # Clear waiting state when navigating menus
+    if data.startswith("menu_"):
+        set_waiting_for(user_id, None)
+
     # Main menu
     if data == "menu_main":
+        set_waiting_for(user_id, None)
         await query.edit_message_text(
-            "🔥 *CC Checker Bot - Menu*\n\n"
+            "🔥 *CC Checker Bot*\n\n"
             "Select an option below:",
             parse_mode="Markdown",
             reply_markup=get_main_menu_keyboard()
@@ -520,15 +550,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if products:
             text = f"📦 *Your Products* ({len(products)})\n\n"
             for i, url in enumerate(products):
-                text += f"{i+1}. `{url}`\n"
-            text += "\nClick 🗑️ to remove a product."
+                short_url = url[:50] + "..." if len(url) > 50 else url
+                text += f"{i+1}. `{short_url}`\n"
         else:
-            text = "📦 *Your Products*\n\nNo products added yet.\n\nUse `/addproduct <url>` to add one."
+            text = "📦 *Your Products*\n\nNo products added yet.\n\nClick ➕ Add Product to add one."
 
         await query.edit_message_text(
             text,
             parse_mode="Markdown",
             reply_markup=get_products_keyboard(user_id)
+        )
+
+    # Add product - ask for URL
+    elif data == "prod_add":
+        set_waiting_for(user_id, "product")
+        await query.edit_message_text(
+            "📦 *Add Product*\n\n"
+            "Send me a Shopify product URL:\n\n"
+            "Example: `https://store.com/products/item`",
+            parse_mode="Markdown",
+            reply_markup=get_cancel_keyboard()
         )
 
     # View single product
@@ -561,10 +602,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"✅ *Product Removed*\n\n`{removed}`\n\n📦 Remaining: {len(products)}",
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("◀️ Back to Products", callback_data="menu_products")]
-                ])
+                reply_markup=get_back_keyboard("menu_products")
             )
+
+    # Clear all products
+    elif data == "prod_clear_all":
+        update_user_setting(user_id, "products", [])
+        await query.edit_message_text(
+            "✅ *All Products Cleared*",
+            parse_mode="Markdown",
+            reply_markup=get_back_keyboard("menu_products")
+        )
 
     # Proxy menu
     elif data == "menu_proxy":
@@ -574,7 +622,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if proxy:
             text = f"🌐 *Your Proxy*\n\n`{proxy}`"
         else:
-            text = "🌐 *Your Proxy*\n\nNo proxy set.\n\nUse `/setproxy host:port:user:pass` to set one."
+            text = "🌐 *Your Proxy*\n\nNo proxy set.\n\nClick ➕ Set Proxy to add one."
 
         await query.edit_message_text(
             text,
@@ -582,21 +630,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_proxy_keyboard(user_id)
         )
 
+    # Set proxy - ask for input
+    elif data == "proxy_set":
+        set_waiting_for(user_id, "proxy")
+        await query.edit_message_text(
+            "🌐 *Set Proxy*\n\n"
+            "Send me your proxy in this format:\n\n"
+            "`host:port:username:password`\n\n"
+            "Example: `proxy.example.com:8080:user:pass`",
+            parse_mode="Markdown",
+            reply_markup=get_cancel_keyboard()
+        )
+
     # Clear proxy
     elif data == "proxy_clear":
         update_user_setting(user_id, "proxy", None)
         await query.edit_message_text(
-            "✅ *Proxy Cleared*\n\nYour proxy has been removed.",
+            "✅ *Proxy Cleared*",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("◀️ Back", callback_data="menu_main")]
-            ])
+            reply_markup=get_back_keyboard("menu_proxy")
         )
 
     # Settings menu
     elif data == "menu_settings":
         settings = get_user_settings(user_id)
-        proxy = settings.get("proxy", "Not set")
+        proxy = settings.get("proxy")
         products = settings.get("products", [])
 
         text = (
@@ -608,9 +666,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             text,
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("◀️ Back", callback_data="menu_main")]
-            ])
+            reply_markup=get_back_keyboard()
+        )
+
+    # Check cards info
+    elif data == "menu_check_info":
+        await query.edit_message_text(
+            "💳 *Check Cards*\n\n"
+            "*How to check cards:*\n\n"
+            "1️⃣ Paste a card directly:\n"
+            "`4111111111111111|12|2025|123`\n\n"
+            "2️⃣ Send a .txt file with cards\n\n"
+            "*Supported formats:*\n"
+            "• `card|mm|yyyy|cvv`\n"
+            "• `card|mm|yy|cvv`\n"
+            "• `card:mm:yyyy:cvv`\n"
+            "• `card/mm/yyyy/cvv`",
+            parse_mode="Markdown",
+            reply_markup=get_back_keyboard()
+        )
+
+    # Cancel input
+    elif data == "cancel_input":
+        set_waiting_for(user_id, None)
+        await query.edit_message_text(
+            "❌ *Cancelled*",
+            parse_mode="Markdown",
+            reply_markup=get_back_keyboard()
         )
 
     # Checking controls
@@ -628,7 +710,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = get_user_session(user_id)
         session["stopped"] = True
         session["paused"] = False
-        # Remove keyboard since checking will stop
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except:
@@ -826,9 +907,9 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_has_products(user_id):
         await update.message.reply_text(
             "❌ *No product set!*\n\n"
-            "Add a product first with:\n"
-            "`/addproduct https://store.com/products/item`",
-            parse_mode="Markdown"
+            "Use the menu to add a product first.",
+            parse_mode="Markdown",
+            reply_markup=get_main_menu_keyboard()
         )
         return
 
@@ -864,9 +945,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_has_products(user_id):
         await update.message.reply_text(
             "❌ *No product set!*\n\n"
-            "Add a product first with:\n"
-            "`/addproduct https://store.com/products/item`",
-            parse_mode="Markdown"
+            "Use the menu to add a product first.",
+            parse_mode="Markdown",
+            reply_markup=get_main_menu_keyboard()
         )
         return
 
@@ -1025,9 +1106,106 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle direct card messages"""
+    """Handle direct card messages and input waiting"""
     user_id = update.effective_user.id
     text = update.message.text or ""
+
+    # Check if waiting for input
+    waiting_for = get_waiting_for(user_id)
+
+    # Handle proxy input
+    if waiting_for == "proxy":
+        set_waiting_for(user_id, None)
+        proxy = text.strip()
+
+        # Basic validation
+        parts = proxy.replace(":", ":").split(":")
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "❌ *Invalid proxy format!*\n\n"
+                "Use: `host:port:username:password`",
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard("menu_proxy")
+            )
+            return
+
+        update_user_setting(user_id, "proxy", proxy)
+        await update.message.reply_text(
+            f"✅ *Proxy Set!*\n\n`{proxy}`",
+            parse_mode="Markdown",
+            reply_markup=get_back_keyboard("menu_proxy")
+        )
+        return
+
+    # Handle product input
+    if waiting_for == "product":
+        set_waiting_for(user_id, None)
+        url = text.strip()
+
+        # Validate URL format
+        if "/products/" not in url:
+            await update.message.reply_text(
+                "❌ *Invalid URL!*\n\n"
+                "URL must contain `/products/`\n\n"
+                "Example: `https://store.com/products/item`",
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard("menu_products")
+            )
+            return
+
+        # Validate product exists
+        status_msg = await update.message.reply_text("⏳ Validating product URL...")
+
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{url}.json", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        product_title = data.get("product", {}).get("title", "Unknown")
+
+                        settings = get_user_settings(user_id)
+                        products = settings.get("products", [])
+
+                        if url in products:
+                            await status_msg.edit_text(
+                                "⚠️ *Product already in your list!*",
+                                parse_mode="Markdown",
+                                reply_markup=get_back_keyboard("menu_products")
+                            )
+                            return
+
+                        products.append(url)
+                        update_user_setting(user_id, "products", products)
+
+                        await status_msg.edit_text(
+                            f"✅ *Product Added!*\n\n"
+                            f"📝 *{product_title}*\n"
+                            f"📦 Total products: {len(products)}",
+                            parse_mode="Markdown",
+                            reply_markup=get_back_keyboard("menu_products")
+                        )
+                    elif resp.status == 404:
+                        await status_msg.edit_text(
+                            "❌ *Product not found!*\n\nCheck the URL and try again.",
+                            parse_mode="Markdown",
+                            reply_markup=get_back_keyboard("menu_products")
+                        )
+                    else:
+                        await status_msg.edit_text(
+                            f"❌ *Error: HTTP {resp.status}*",
+                            parse_mode="Markdown",
+                            reply_markup=get_back_keyboard("menu_products")
+                        )
+        except Exception as e:
+            await status_msg.edit_text(
+                f"❌ *Failed to validate URL*\n\n{str(e)}",
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard("menu_products")
+            )
+        return
+
+    # Parse cards from message
     cards = create_lista_(text)
 
     if not cards:
@@ -1037,9 +1215,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_has_products(user_id):
         await update.message.reply_text(
             "❌ *No product set!*\n\n"
-            "Add a product first with:\n"
-            "`/addproduct https://store.com/products/item`",
-            parse_mode="Markdown"
+            "Use /menu → Products → Add Product",
+            parse_mode="Markdown",
+            reply_markup=get_main_menu_keyboard()
         )
         return
 

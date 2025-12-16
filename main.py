@@ -295,7 +295,35 @@ async def auto_shopify_client(
     return last_error or {"status": "UnknownError", "error": "Unexpected error. Try again..."}
 
 
-sem = asyncio.Semaphore(config.CONCURRENCY_LIMIT)
+# =============================================================================
+# CONCURRENCY MANAGEMENT - Per-user + Global limits
+# =============================================================================
+
+# Global semaphore - prevents server overload (all users combined)
+# Higher limit to allow multiple users to work simultaneously
+GLOBAL_CONCURRENCY_LIMIT = 100
+global_semaphore = asyncio.Semaphore(GLOBAL_CONCURRENCY_LIMIT)
+
+# Per-user semaphores - each user gets their own limit
+# This ensures User A's checking doesn't block User B
+user_semaphores = {}
+user_semaphore_lock = asyncio.Lock()
+
+
+async def get_user_semaphore(user_id: int) -> asyncio.Semaphore:
+    """Get or create a semaphore for a specific user"""
+    async with user_semaphore_lock:
+        if user_id not in user_semaphores:
+            # Each user can process CONCURRENCY_LIMIT cards at once
+            user_semaphores[user_id] = asyncio.Semaphore(config.CONCURRENCY_LIMIT)
+        return user_semaphores[user_id]
+
+
+def cleanup_user_semaphore(user_id: int):
+    """Remove user semaphore when they're done (optional cleanup)"""
+    if user_id in user_semaphores:
+        del user_semaphores[user_id]
+
 
 async def bin_lookup(bin_number: str):
     """Lookup BIN information"""
@@ -333,44 +361,57 @@ def create_progress_bar(current: int, total: int, length: int = 10) -> str:
 
 
 async def process_single_card(card: str, user_id: int = None) -> dict:
-    """Process a single card and return result"""
-    async with sem:
-        logger.info(f'Processing card: {card}')
+    """
+    Process a single card and return result.
 
-        # Get user settings
-        settings = get_user_settings(user_id) if user_id else {}
+    Uses two-level concurrency control:
+    1. Per-user semaphore: Each user can process up to CONCURRENCY_LIMIT cards at once
+    2. Global semaphore: Total concurrent operations across all users capped at GLOBAL_CONCURRENCY_LIMIT
 
-        # Use user's product URLs (required)
-        user_products = settings.get("products", [])
-        if not user_products:
+    This ensures User A checking cards doesn't block User B.
+    """
+    # Get user-specific semaphore (or create one)
+    user_sem = await get_user_semaphore(user_id) if user_id else asyncio.Semaphore(config.CONCURRENCY_LIMIT)
+
+    # Acquire both: user limit AND global limit
+    async with user_sem:
+        async with global_semaphore:
+            logger.info(f'Processing card: {card} (user: {user_id})')
+
+            # Get user settings
+            settings = get_user_settings(user_id) if user_id else {}
+
+            # Use user's product URLs (required)
+            user_products = settings.get("products", [])
+            if not user_products:
+                return {
+                    "card": card,
+                    "product_url": None,
+                    "response": {"error": "No product set. Use /addproduct first.", "success": False},
+                    "bin_data": {}
+                }
+
+            product_url = random.choice(user_products)
+
+            # Use user's proxy or fall back to config
+            user_proxy = settings.get("proxy")
+            proxies = [user_proxy] if user_proxy else config.PROXY_LIST
+
+            response = await auto_shopify_client(
+                card=card,
+                product_url=product_url,
+                email=settings.get("email") or config.DEFAULT_EMAIL,
+                is_shippable=settings.get("is_shippable", config.IS_SHIPPABLE),
+                proxies=proxies,
+                logger=logger
+            )
+            bin_data = await bin_lookup(card[:6])
             return {
                 "card": card,
-                "product_url": None,
-                "response": {"error": "No product set. Use /addproduct first.", "success": False},
-                "bin_data": {}
+                "product_url": product_url,
+                "response": response,
+                "bin_data": bin_data
             }
-
-        product_url = random.choice(user_products)
-
-        # Use user's proxy or fall back to config
-        user_proxy = settings.get("proxy")
-        proxies = [user_proxy] if user_proxy else config.PROXY_LIST
-
-        response = await auto_shopify_client(
-            card=card,
-            product_url=product_url,
-            email=settings.get("email") or config.DEFAULT_EMAIL,
-            is_shippable=settings.get("is_shippable", config.IS_SHIPPABLE),
-            proxies=proxies,
-            logger=logger
-        )
-        bin_data = await bin_lookup(card[:6])
-        return {
-            "card": card,
-            "product_url": product_url,
-            "response": response,
-            "bin_data": bin_data
-        }
 
 
 def format_result(result: dict, show_full: bool = True) -> str:
@@ -1012,6 +1053,18 @@ async def dbstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     has_proxy = settings.get("proxy") is not None
                     proxy_icon = "🌐" if has_proxy else "➖"
                     status_parts.append(f"• `{uid}`: {prod_count} products {proxy_icon}")
+
+    # Add concurrency stats
+    status_parts.append(f"\n⚡ *Concurrency*:")
+    status_parts.append(f"• Global limit: {GLOBAL_CONCURRENCY_LIMIT}")
+    status_parts.append(f"• Per-user limit: {config.CONCURRENCY_LIMIT}")
+    status_parts.append(f"• Active user semaphores: {len(user_semaphores)}")
+
+    # Show active users with semaphores
+    if user_semaphores:
+        status_parts.append(f"• Users with active checks:")
+        for uid in list(user_semaphores.keys())[:5]:
+            status_parts.append(f"  └ `{uid}`")
 
     await update.message.reply_text(
         "\n".join(status_parts),

@@ -8,8 +8,8 @@ import json
 import aiohttp
 from curl_cffi.requests import AsyncSession
 from loguru import logger
-from telegram import Update, Document
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, Document, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import io
 
 # PostgreSQL support
@@ -169,6 +169,29 @@ def update_user_setting(user_id: int, key: str, value) -> dict:
     settings = get_user_settings(user_id)
     settings[key] = value
     return save_user_settings(user_id, settings)
+
+
+# Session state management for pause/stop functionality
+user_sessions = {}
+
+def get_user_session(user_id: int) -> dict:
+    """Get or create a user's checking session state"""
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {
+            "paused": False,
+            "stopped": False,
+            "checking": False
+        }
+    return user_sessions[user_id]
+
+def reset_user_session(user_id: int):
+    """Reset a user's session state"""
+    user_sessions[user_id] = {
+        "paused": False,
+        "stopped": False,
+        "checking": False
+    }
+
 
 def create_lista_(text: str):
     """Extract credit card numbers from text"""
@@ -383,6 +406,63 @@ def format_result(result: dict, show_full: bool = True) -> str:
             return f"❌ *DECLINED*\n\n💳 `{card}`\n📝 *Response*: {status_text}{bin_info}"
 
 
+# Inline Keyboard Builders
+def get_main_menu_keyboard():
+    """Build the main menu inline keyboard"""
+    keyboard = [
+        [InlineKeyboardButton("📦 View Products", callback_data="menu_products")],
+        [InlineKeyboardButton("🌐 Manage Proxy", callback_data="menu_proxy")],
+        [InlineKeyboardButton("⚙️ View Settings", callback_data="menu_settings")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_products_keyboard(user_id: int):
+    """Build products management keyboard"""
+    settings = get_user_settings(user_id)
+    products = settings.get("products", [])
+
+    keyboard = []
+    for i, url in enumerate(products):
+        # Shorten URL for display
+        display = url.split("/products/")[-1][:25] if "/products/" in url else url[:25]
+        keyboard.append([
+            InlineKeyboardButton(f"📦 {display}", callback_data=f"prod_view_{i}"),
+            InlineKeyboardButton("🗑️", callback_data=f"prod_del_{i}")
+        ])
+
+    keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="menu_main")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_proxy_keyboard(user_id: int):
+    """Build proxy management keyboard"""
+    settings = get_user_settings(user_id)
+    proxy = settings.get("proxy")
+
+    keyboard = []
+    if proxy:
+        keyboard.append([InlineKeyboardButton("🗑️ Clear Proxy", callback_data="proxy_clear")])
+    keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="menu_main")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_checking_keyboard(paused: bool = False):
+    """Build checking control keyboard"""
+    if paused:
+        keyboard = [
+            [
+                InlineKeyboardButton("▶️ Resume", callback_data="chk_resume"),
+                InlineKeyboardButton("⏹️ Stop", callback_data="chk_stop")
+            ]
+        ]
+    else:
+        keyboard = [
+            [
+                InlineKeyboardButton("⏸️ Pause", callback_data="chk_pause"),
+                InlineKeyboardButton("⏹️ Stop", callback_data="chk_stop")
+            ]
+        ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 # Telegram Bot Handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
@@ -394,7 +474,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/removeproduct <url>` - Remove product URL\n"
         "`/products` - View your product list\n"
         "`/clearproducts` - Clear all products\n"
-        "`/settings` - View your current settings\n\n"
+        "`/settings` - View your current settings\n"
+        "`/menu` - Interactive menu\n\n"
         "*Checking Commands:*\n"
         "`/chk <card>` - Check single card\n"
         "📎 *Send .txt file* - Mass check cards from file\n\n"
@@ -402,6 +483,156 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`4111111111111111|12|2025|123`"
     )
     await update.message.reply_text(welcome_msg, parse_mode="Markdown")
+
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /menu command - show interactive menu"""
+    await update.message.reply_text(
+        "🔥 *CC Checker Bot - Menu*\n\n"
+        "Select an option below:",
+        parse_mode="Markdown",
+        reply_markup=get_main_menu_keyboard()
+    )
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all callback queries from inline keyboards"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    data = query.data
+
+    # Main menu
+    if data == "menu_main":
+        await query.edit_message_text(
+            "🔥 *CC Checker Bot - Menu*\n\n"
+            "Select an option below:",
+            parse_mode="Markdown",
+            reply_markup=get_main_menu_keyboard()
+        )
+
+    # Products menu
+    elif data == "menu_products":
+        settings = get_user_settings(user_id)
+        products = settings.get("products", [])
+
+        if products:
+            text = f"📦 *Your Products* ({len(products)})\n\n"
+            for i, url in enumerate(products):
+                text += f"{i+1}. `{url}`\n"
+            text += "\nClick 🗑️ to remove a product."
+        else:
+            text = "📦 *Your Products*\n\nNo products added yet.\n\nUse `/addproduct <url>` to add one."
+
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=get_products_keyboard(user_id)
+        )
+
+    # View single product
+    elif data.startswith("prod_view_"):
+        idx = int(data.split("_")[-1])
+        settings = get_user_settings(user_id)
+        products = settings.get("products", [])
+
+        if idx < len(products):
+            url = products[idx]
+            await query.edit_message_text(
+                f"📦 *Product #{idx + 1}*\n\n`{url}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗑️ Remove", callback_data=f"prod_del_{idx}")],
+                    [InlineKeyboardButton("◀️ Back", callback_data="menu_products")]
+                ])
+            )
+
+    # Delete product
+    elif data.startswith("prod_del_"):
+        idx = int(data.split("_")[-1])
+        settings = get_user_settings(user_id)
+        products = settings.get("products", [])
+
+        if idx < len(products):
+            removed = products.pop(idx)
+            update_user_setting(user_id, "products", products)
+
+            await query.edit_message_text(
+                f"✅ *Product Removed*\n\n`{removed}`\n\n📦 Remaining: {len(products)}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back to Products", callback_data="menu_products")]
+                ])
+            )
+
+    # Proxy menu
+    elif data == "menu_proxy":
+        settings = get_user_settings(user_id)
+        proxy = settings.get("proxy")
+
+        if proxy:
+            text = f"🌐 *Your Proxy*\n\n`{proxy}`"
+        else:
+            text = "🌐 *Your Proxy*\n\nNo proxy set.\n\nUse `/setproxy host:port:user:pass` to set one."
+
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=get_proxy_keyboard(user_id)
+        )
+
+    # Clear proxy
+    elif data == "proxy_clear":
+        update_user_setting(user_id, "proxy", None)
+        await query.edit_message_text(
+            "✅ *Proxy Cleared*\n\nYour proxy has been removed.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Back", callback_data="menu_main")]
+            ])
+        )
+
+    # Settings menu
+    elif data == "menu_settings":
+        settings = get_user_settings(user_id)
+        proxy = settings.get("proxy", "Not set")
+        products = settings.get("products", [])
+
+        text = (
+            "⚙️ *Your Settings*\n\n"
+            f"🌐 *Proxy*: `{proxy or 'Not set'}`\n"
+            f"📦 *Products*: {len(products)}\n"
+        )
+
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Back", callback_data="menu_main")]
+            ])
+        )
+
+    # Checking controls
+    elif data == "chk_pause":
+        session = get_user_session(user_id)
+        session["paused"] = True
+        await query.edit_message_reply_markup(reply_markup=get_checking_keyboard(paused=True))
+
+    elif data == "chk_resume":
+        session = get_user_session(user_id)
+        session["paused"] = False
+        await query.edit_message_reply_markup(reply_markup=get_checking_keyboard(paused=False))
+
+    elif data == "chk_stop":
+        session = get_user_session(user_id)
+        session["stopped"] = True
+        session["paused"] = False
+        # Remove keyboard since checking will stop
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except:
+            pass
 
 
 async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -658,11 +889,17 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No valid cards found in the file.")
         return
 
+    # Reset session state
+    reset_user_session(user_id)
+    session = get_user_session(user_id)
+    session["checking"] = True
+
     status_msg = await update.message.reply_text(
         f"📂 *File Received*\n\n"
         f"💳 Cards found: {len(cards)}\n"
         f"⏳ Starting check...",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=get_checking_keyboard(paused=False)
     )
 
     charged = []
@@ -670,14 +907,30 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     three_ds = []
     all_results = []
     last_response = ""
+    checked_count = 0
+    was_stopped = False
 
     tasks = [process_single_card(card, user_id) for card in cards]
 
     for i, future in enumerate(asyncio.as_completed(tasks)):
+        # Check for stop
+        if session["stopped"]:
+            was_stopped = True
+            break
+
+        # Check for pause - wait until resumed
+        while session["paused"] and not session["stopped"]:
+            await asyncio.sleep(0.1)
+
+        if session["stopped"]:
+            was_stopped = True
+            break
+
         try:
             result = await future
             response = result["response"]
             card = result["card"]
+            checked_count += 1
 
             # Build full response with all error details
             response_parts = []
@@ -713,19 +966,21 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 declined.append(result)
                 all_results.append(f"DECLINED | {result_line}")
 
-            # Update progress every 5 cards to reduce API calls
-            if (i + 1) % 5 == 0 or i + 1 == len(cards):
+            # Update progress every 10 cards for speed
+            if checked_count % 10 == 0 or checked_count == len(cards):
                 try:
-                    progress_bar = create_progress_bar(i + 1, len(cards))
+                    progress_bar = create_progress_bar(checked_count, len(cards))
+                    pause_status = "⏸️ *PAUSED*\n\n" if session["paused"] else ""
                     await status_msg.edit_text(
-                        f"⏳ *Checking Cards...*\n\n"
+                        f"{pause_status}⏳ *Checking Cards...*\n\n"
                         f"{progress_bar}\n"
-                        f"📊 {i + 1}/{len(cards)} checked\n\n"
+                        f"📊 {checked_count}/{len(cards)} checked\n\n"
                         f"✅ Charged: {len(charged)}\n"
                         f"🔐 3DS: {len(three_ds)}\n"
                         f"❌ Declined: {len(declined)}\n\n"
                         f"💬 *Last*: `{last_response}`",
-                        parse_mode="Markdown"
+                        parse_mode="Markdown",
+                        reply_markup=get_checking_keyboard(paused=session["paused"])
                     )
                 except Exception:
                     pass
@@ -734,13 +989,17 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Mass check error: {e}")
             last_response = f"Error: {str(e)[:30]}"
 
+    # Reset session
+    session["checking"] = False
+
     # Final summary
+    stop_text = "⏹️ *STOPPED* - " if was_stopped else ""
     summary = (
-        f"📊 *FINAL RESULTS*\n\n"
+        f"{stop_text}📊 *FINAL RESULTS*\n\n"
         f"✅ Charged: {len(charged)}\n"
         f"🔐 3DS: {len(three_ds)}\n"
         f"❌ Declined: {len(declined)}\n"
-        f"📝 Total: {len(cards)}"
+        f"📝 Checked: {checked_count}/{len(cards)}"
     )
     await status_msg.edit_text(summary, parse_mode="Markdown")
 
@@ -751,7 +1010,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_buffer.name = "results.txt"
         await update.message.reply_document(
             document=file_buffer,
-            caption=f"📊 Full Results: {len(charged)} Charged | {len(three_ds)} 3DS | {len(declined)} Declined"
+            caption=f"📊 Results: {len(charged)} Charged | {len(three_ds)} 3DS | {len(declined)} Declined | {checked_count}/{len(cards)} checked"
         )
 
     # Send charged cards separately
@@ -797,21 +1056,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text(f"❌ Error: {str(e)}")
     else:
         # Multiple cards - process them all (no limit)
-        status_msg = await update.message.reply_text(f"⏳ Checking {len(cards)} cards...")
+        # Reset session state
+        reset_user_session(user_id)
+        session = get_user_session(user_id)
+        session["checking"] = True
+
+        status_msg = await update.message.reply_text(
+            f"⏳ Checking {len(cards)} cards...",
+            reply_markup=get_checking_keyboard(paused=False)
+        )
 
         charged = []
         declined = []
         three_ds = []
         all_results = []
         last_response = ""
+        checked_count = 0
+        was_stopped = False
 
         tasks = [process_single_card(card, user_id) for card in cards]
 
         for i, future in enumerate(asyncio.as_completed(tasks)):
+            # Check for stop
+            if session["stopped"]:
+                was_stopped = True
+                break
+
+            # Check for pause - wait until resumed
+            while session["paused"] and not session["stopped"]:
+                await asyncio.sleep(0.1)
+
+            if session["stopped"]:
+                was_stopped = True
+                break
+
             try:
                 result = await future
                 response = result["response"]
                 card = result["card"]
+                checked_count += 1
 
                 # Build full response with all error details
                 response_parts = []
@@ -845,19 +1128,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     declined.append(result)
                     all_results.append(f"DECLINED | {result_line}")
 
-                # Update progress every 5 cards
-                if (i + 1) % 5 == 0 or i + 1 == len(cards):
+                # Update progress every 10 cards for speed
+                if checked_count % 10 == 0 or checked_count == len(cards):
                     try:
-                        progress_bar = create_progress_bar(i + 1, len(cards))
+                        progress_bar = create_progress_bar(checked_count, len(cards))
+                        pause_status = "⏸️ *PAUSED*\n\n" if session["paused"] else ""
                         await status_msg.edit_text(
-                            f"⏳ *Checking Cards...*\n\n"
+                            f"{pause_status}⏳ *Checking Cards...*\n\n"
                             f"{progress_bar}\n"
-                            f"📊 {i + 1}/{len(cards)} checked\n\n"
+                            f"📊 {checked_count}/{len(cards)} checked\n\n"
                             f"✅ Charged: {len(charged)}\n"
                             f"🔐 3DS: {len(three_ds)}\n"
                             f"❌ Declined: {len(declined)}\n\n"
                             f"💬 *Last*: `{last_response}`",
-                            parse_mode="Markdown"
+                            parse_mode="Markdown",
+                            reply_markup=get_checking_keyboard(paused=session["paused"])
                         )
                     except Exception:
                         pass
@@ -865,7 +1150,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Mass check error: {e}")
                 last_response = f"Error: {str(e)[:30]}"
 
-        summary = f"📊 *FINAL RESULTS*\n\n✅ Charged: {len(charged)}\n🔐 3DS: {len(three_ds)}\n❌ Declined: {len(declined)}\n📝 Total: {len(cards)}"
+        # Reset session
+        session["checking"] = False
+
+        stop_text = "⏹️ *STOPPED* - " if was_stopped else ""
+        summary = f"{stop_text}📊 *FINAL RESULTS*\n\n✅ Charged: {len(charged)}\n🔐 3DS: {len(three_ds)}\n❌ Declined: {len(declined)}\n📝 Checked: {checked_count}/{len(cards)}"
         await status_msg.edit_text(summary, parse_mode="Markdown")
 
         # Send full results file
@@ -875,7 +1164,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_buffer.name = "results.txt"
             await update.message.reply_document(
                 document=file_buffer,
-                caption=f"📊 Full Results: {len(charged)} Charged | {len(three_ds)} 3DS | {len(declined)} Declined"
+                caption=f"📊 Results: {len(charged)} Charged | {len(three_ds)} 3DS | {len(declined)} Declined | {checked_count}/{len(cards)} checked"
             )
 
         # Send charged cards separately
@@ -908,6 +1197,7 @@ def main():
 
     # Add handlers
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("setproxy", setproxy_command))
     app.add_handler(CommandHandler("addproduct", addproduct_command))
     app.add_handler(CommandHandler("removeproduct", removeproduct_command))
@@ -915,6 +1205,7 @@ def main():
     app.add_handler(CommandHandler("clearproducts", clearproducts_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("chk", check_command))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

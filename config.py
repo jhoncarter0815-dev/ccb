@@ -9,6 +9,6 @@ class CheckerConfig:
 
         self.DEFAULT_EMAIL = os.getenv("DEFAULT_EMAIL", None)
 
-        self.CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "5"))
+        self.CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "15"))
 
         self.BOT_TOKEN = os.getenv("BOT_TOKEN", "")

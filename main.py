@@ -2648,27 +2648,69 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Error: {str(e)}")
 
 
-# Errors that should trigger retry
-RETRIABLE_ERRORS = [
-    "captcha",
-    "timeout",
-    "proxy",
-    "network",
-    "connection",
-    "curl",
-    "client",
-    "failed to connect",
-    "failed to initialize",
-    "processing error",
+# Declined error patterns - these are FINAL rejections from the bank
+# Cards with these errors should NOT be retried
+DECLINED_ERRORS = [
+    "declined",
+    "decline",
+    "insufficient funds",
+    "insufficient_funds",
+    "card_declined",
+    "do not honor",
+    "do_not_honor",
+    "stolen card",
+    "lost card",
+    "pickup card",
+    "expired card",
+    "invalid card",
+    "invalid_card",
+    "card not supported",
+    "incorrect cvc",
+    "incorrect_cvc",
+    "incorrect cvv",
+    "incorrect_cvv",
+    "invalid cvc",
+    "invalid cvv",
+    "invalid_cvc",
+    "invalid_cvv",
+    "cvc check failed",
+    "cvv check failed",
+    "security code",
+    "card number incorrect",
+    "incorrect_number",
+    "invalid_number",
+    "invalid number",
+    "fraudulent",
+    "fraud",
+    "restricted card",
+    "transaction not allowed",
+    "not permitted",
+    "card blocked",
+    "account closed",
+    "limit exceeded",
+    "withdrawal limit",
+    "exceeds limit",
+    "authentication required",
+    "issuer not available",
+    "issuer unavailable",
+    "card not active",
+    "inactive card",
+    "revoked card",
+    "suspected fraud",
+    "risk",
+    "blocked",
 ]
 
 
-def is_retriable_error(error_msg: str) -> bool:
-    """Check if an error is retriable (captcha, network, timeout, etc.)"""
+def is_declined_error(error_msg: str) -> bool:
+    """
+    Check if an error is a FINAL declined response from the bank.
+    These cards should NOT be retried - they are definitively rejected.
+    """
     if not error_msg:
         return False
     error_lower = error_msg.lower()
-    return any(err in error_lower for err in RETRIABLE_ERRORS)
+    return any(err in error_lower for err in DECLINED_ERRORS)
 
 
 async def run_batch_check(cards: list, user_id: int, user_settings: dict, session: dict, status_msg, update: Update):
@@ -2807,14 +2849,15 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                         asyncio.create_task(
                             update.message.reply_text(format_result(result), parse_mode="Markdown")
                         )
-                    elif is_retriable_error(full_response):
-                        # Captcha, timeout, network errors - save for retry
-                        retriable.append(card)
-                        all_results.append(f"RETRY | {result_line}")
-                    else:
+                    elif is_declined_error(full_response):
+                        # Declined by bank - final rejection, don't retry
                         declined.append(result)
                         all_results.append(f"DECLINED | {result_line}")
                         increment_stat("total_declined")
+                    else:
+                        # All other errors (captcha, timeout, network, etc.) - save for retry
+                        retriable.append(card)
+                        all_results.append(f"RETRY | {result_line}")
 
                     # Update progress every 5 cards (non-blocking)
                     if checked_count % 5 == 0 or checked_count == total_cards:

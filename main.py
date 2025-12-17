@@ -1319,24 +1319,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_users":
         if not is_admin(user_id):
             return
-        users = await get_all_users_from_db()
+        try:
+            users = await get_all_users_from_db()
 
-        if users:
-            text = f"👥 *All Users* ({len(users)})\n\n"
-            for i, (uid, prod_count, has_proxy, created_at) in enumerate(users[:20]):
-                proxy_icon = "🌐" if has_proxy else "➖"
-                banned_icon = "🚫" if is_user_banned(uid) else ""
-                text += f"`{uid}` \\- {prod_count} products {proxy_icon} {banned_icon}\n"
-            if len(users) > 20:
-                text += f"\n_...and {len(users) - 20} more users_"
-        else:
-            text = "👥 *All Users*\n\nNo users found."
+            if users:
+                text = f"👥 *All Users* ({len(users)})\n\n"
+                for i, (uid, prod_count, has_proxy, created_at) in enumerate(users[:20]):
+                    proxy_icon = "🌐" if has_proxy else "➖"
+                    banned_icon = "🚫" if is_user_banned(uid) else ""
+                    text += f"`{uid}` - {prod_count} products {proxy_icon} {banned_icon}\n"
+                if len(users) > 20:
+                    text += f"\n_...and {len(users) - 20} more users_"
+            else:
+                text = "👥 *All Users*\n\nNo users found."
 
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔍 View User Details", callback_data="admin_user_lookup")],
-            [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
-        ])
-        await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=keyboard)
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔍 View User Details", callback_data="admin_user_lookup")],
+                [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
+            ])
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        except Exception as e:
+            logger.error(f"Error in admin_users: {e}")
+            await query.edit_message_text(
+                f"❌ Error loading users:\n`{str(e)}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
+                ])
+            )
 
     elif data == "admin_user_lookup":
         if not is_admin(user_id):
@@ -1354,31 +1364,41 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_stats":
         if not is_admin(user_id):
             return
-        users = await get_all_users_from_db()
+        try:
+            users = await get_all_users_from_db()
 
-        text = (
-            f"📊 *System Statistics*\n\n"
-            f"⏱️ *Uptime*: {get_uptime()}\n\n"
-            f"👥 *Users*: {len(users)}\n"
-            f"🚫 *Banned*: {len(bot_stats['banned_users'])}\n\n"
-            f"💳 *Cards Checked*: {bot_stats['total_cards_checked']}\n"
-            f"✅ *Charged*: {bot_stats['total_charged']}\n"
-            f"❌ *Declined*: {bot_stats['total_declined']}\n"
-            f"🔐 *3DS*: {bot_stats['total_3ds']}\n\n"
-            f"⚡ *Concurrency*:\n"
-            f"• Global: {config.GLOBAL_CONCURRENCY_LIMIT}\n"
-            f"• Per\\-user: {config.CONCURRENCY_LIMIT}\n"
-            f"• Card delay: {config.CARD_DELAY}s"
-        )
+            text = (
+                f"📊 *System Statistics*\n\n"
+                f"⏱️ *Uptime*: {get_uptime()}\n\n"
+                f"👥 *Users*: {len(users)}\n"
+                f"🚫 *Banned*: {len(bot_stats['banned_users'])}\n\n"
+                f"💳 *Cards Checked*: {bot_stats['total_cards_checked']}\n"
+                f"✅ *Charged*: {bot_stats['total_charged']}\n"
+                f"❌ *Declined*: {bot_stats['total_declined']}\n"
+                f"🔐 *3DS*: {bot_stats['total_3ds']}\n\n"
+                f"⚡ *Concurrency*:\n"
+                f"  • Global: {config.GLOBAL_CONCURRENCY_LIMIT}\n"
+                f"  • Per-user: {config.CONCURRENCY_LIMIT}\n"
+                f"  • Card delay: {config.CARD_DELAY}s"
+            )
 
-        await query.edit_message_text(
-            text,
-            parse_mode="MarkdownV2",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Refresh", callback_data="admin_stats")],
-                [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
-            ])
-        )
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Refresh", callback_data="admin_stats")],
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
+                ])
+            )
+        except Exception as e:
+            logger.error(f"Error in admin_stats: {e}")
+            await query.edit_message_text(
+                f"❌ Error loading stats:\n`{str(e)}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
+                ])
+            )
 
     elif data == "admin_broadcast":
         if not is_admin(user_id):

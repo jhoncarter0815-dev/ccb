@@ -1132,6 +1132,7 @@ def is_product_error(error_msg: str) -> bool:
     error_lower = error_msg.lower()
     # Common product/store errors that indicate the URL is invalid
     invalid_indicators = [
+        # Product not found errors
         "product not found",
         "404",
         "product does not exist",
@@ -1148,6 +1149,26 @@ def is_product_error(error_msg: str) -> bool:
         "failed to fetch product",
         "invalid url",
         "not a valid shopify",
+        # Stock/inventory errors
+        "product out of stock",
+        "out of stock",
+        "item is out of stock",
+        "sold out",
+        "no stock available",
+        "currently unavailable",
+        "not in stock",
+        "inventory not available",
+        # Delivery/shipping errors
+        "no available delivery strategy found",
+        "no delivery options available",
+        "delivery not available",
+        "no shipping options",
+        "cannot ship to",
+        "shipping not available",
+        "no delivery method",
+        "delivery unavailable",
+        "no shipping methods available",
+        "unable to ship",
     ]
     return any(indicator in error_lower for indicator in invalid_indicators)
 

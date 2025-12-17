@@ -982,7 +982,7 @@ async def notify_admin_charged(card: str, result: dict, user_id: int, username: 
 
 
 # Inline Keyboard Builders
-def get_main_menu_keyboard():
+def get_main_menu_keyboard(user_id: int = None):
     """Build the main menu inline keyboard"""
     keyboard = [
         [InlineKeyboardButton("📦 Products", callback_data="menu_products")],
@@ -990,6 +990,9 @@ def get_main_menu_keyboard():
         [InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")],
         [InlineKeyboardButton("💳 Check Cards", callback_data="menu_check_info")],
     ]
+    # Add admin panel button only for admins
+    if user_id and is_admin(user_id):
+        keyboard.append([InlineKeyboardButton("🔐 Admin Panel", callback_data="menu_admin")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_products_keyboard(user_id: int):
@@ -1067,7 +1070,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📎 *Send .txt file* or paste cards to check them.\n\n"
         "*Card Format:* `4111111111111111|12|2025|123`",
         parse_mode="Markdown",
-        reply_markup=get_main_menu_keyboard()
+        reply_markup=get_main_menu_keyboard(user_id)
     )
 
 
@@ -1080,7 +1083,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔥 *CC Checker Bot*\n\n"
         "Select an option below:",
         parse_mode="Markdown",
-        reply_markup=get_main_menu_keyboard()
+        reply_markup=get_main_menu_keyboard(user_id)
     )
 
 
@@ -1103,7 +1106,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔥 *CC Checker Bot*\n\n"
             "Select an option below:",
             parse_mode="Markdown",
-            reply_markup=get_main_menu_keyboard()
+            reply_markup=get_main_menu_keyboard(user_id)
+        )
+
+    # Admin menu (from main menu button)
+    elif data == "menu_admin":
+        if not is_admin(user_id):
+            await query.answer("🚫 Admin access only!", show_alert=True)
+            return
+        set_waiting_for(user_id, None)
+        await query.edit_message_text(
+            "🔐 *Admin Panel*\n\n"
+            "Select an option below:",
+            parse_mode="Markdown",
+            reply_markup=get_admin_keyboard()
         )
 
     # Products menu
@@ -2422,7 +2438,7 @@ def get_admin_keyboard():
         [InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_broadcast")],
         [InlineKeyboardButton("🚫 Banned Users", callback_data="admin_banned")],
         [InlineKeyboardButton("⚙️ Bot Settings", callback_data="admin_settings")],
-        [InlineKeyboardButton("❌ Close", callback_data="admin_close")]
+        [InlineKeyboardButton("◀️ Back to Menu", callback_data="menu_main")]
     ])
 
 
@@ -2492,7 +2508,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ *No product set!*\n\n"
             "Use the menu to add a product first.",
             parse_mode="Markdown",
-            reply_markup=get_main_menu_keyboard()
+            reply_markup=get_main_menu_keyboard(user_id)
         )
         return
 
@@ -2757,7 +2773,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ *No product set!*\n\n"
             "Use the menu to add a product first.",
             parse_mode="Markdown",
-            reply_markup=get_main_menu_keyboard()
+            reply_markup=get_main_menu_keyboard(user_id)
         )
         return
 
@@ -3364,7 +3380,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ *No product set!*\n\n"
             "Use /menu → Products → Add Product",
             parse_mode="Markdown",
-            reply_markup=get_main_menu_keyboard()
+            reply_markup=get_main_menu_keyboard(user_id)
         )
         return
 

@@ -1883,51 +1883,36 @@ async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def is_product_error(error_msg: str) -> bool:
-    """Check if an error indicates an invalid product URL that should be removed"""
+    """
+    Check if an error indicates a PERMANENTLY invalid product URL that should be removed.
+
+    IMPORTANT: Be conservative! Only remove products that are definitely broken.
+    Temporary issues (out of stock, shipping) should NOT trigger removal.
+    """
     if not error_msg:
         return False
     error_lower = error_msg.lower()
-    # Common product/store errors that indicate the URL is invalid
-    invalid_indicators = [
-        # Product not found errors
-        "product not found",
-        "404",
+
+    # Only these PERMANENT errors should trigger product removal:
+    # These indicate the product/store URL itself is invalid or deleted
+    permanent_invalid_indicators = [
+        # Product permanently deleted/removed
+        "product has been removed",
         "product does not exist",
+        "product not found",
+        "couldn't find product",
+        # Store/shop permanently gone
         "store not found",
         "shop not found",
-        "invalid product",
-        "product is unavailable",
-        "product has been removed",
-        "this product is not available",
-        "no longer available",
-        "page not found",
-        "couldn't find product",
-        "failed to get product",
-        "failed to fetch product",
-        "invalid url",
+        "store does not exist",
+        "shop does not exist",
+        # Invalid URL structure
         "not a valid shopify",
-        # Stock/inventory errors
-        "product out of stock",
-        "out of stock",
-        "item is out of stock",
-        "sold out",
-        "no stock available",
-        "currently unavailable",
-        "not in stock",
-        "inventory not available",
-        # Delivery/shipping errors
-        "no available delivery strategy found",
-        "no delivery options available",
-        "delivery not available",
-        "no shipping options",
-        "cannot ship to",
-        "shipping not available",
-        "no delivery method",
-        "delivery unavailable",
-        "no shipping methods available",
-        "unable to ship",
+        "invalid product url",
+        "invalid store url",
     ]
-    return any(indicator in error_lower for indicator in invalid_indicators)
+
+    return any(indicator in error_lower for indicator in permanent_invalid_indicators)
 
 
 async def remove_invalid_product(user_id: int, product_url: str, reason: str = ""):

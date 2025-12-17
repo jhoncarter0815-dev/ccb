@@ -531,6 +531,9 @@ async def check_subscription_expiry_notifications():
 # Session state management for pause/stop and input waiting
 user_sessions = {}
 
+# Product scraper session state - stores scraped products and selections
+scraper_sessions = {}
+
 def get_user_session(user_id: int) -> dict:
     """Get or create a user's checking session state"""
     if user_id not in user_sessions:
@@ -560,6 +563,29 @@ def get_waiting_for(user_id: int) -> str:
     """Get what input the bot is waiting for"""
     session = get_user_session(user_id)
     return session.get("waiting_for")
+
+
+def get_scraper_session(user_id: int) -> dict:
+    """Get or create a user's product scraper session"""
+    if user_id not in scraper_sessions:
+        scraper_sessions[user_id] = {
+            "products": [],      # List of scraped products
+            "selected": set(),   # Set of selected indices
+            "page": 0,           # Current page
+            "message_id": None,  # Message ID to edit
+            "store_url": None    # Store being scraped
+        }
+    return scraper_sessions[user_id]
+
+def reset_scraper_session(user_id: int):
+    """Reset a user's scraper session"""
+    scraper_sessions[user_id] = {
+        "products": [],
+        "selected": set(),
+        "page": 0,
+        "message_id": None,
+        "store_url": None
+    }
 
 
 # =============================================================================
@@ -972,8 +998,9 @@ def get_products_keyboard(user_id: int):
     products = settings.get("products", [])
 
     keyboard = []
-    # Add product button at top
+    # Add product buttons at top
     keyboard.append([InlineKeyboardButton("➕ Add Product", callback_data="prod_add")])
+    keyboard.append([InlineKeyboardButton("🔍 Find Products ($1-$5)", callback_data="prod_find")])
 
     for i, url in enumerate(products):
         # Shorten URL for display
@@ -1105,6 +1132,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📦 *Add Product*\n\n"
             "Send me a Shopify product URL:\n\n"
             "Example: `https://store.com/products/item`",
+            parse_mode="Markdown",
+            reply_markup=get_cancel_keyboard()
+        )
+
+    # Find products - ask for store URL
+    elif data == "prod_find":
+        set_waiting_for(user_id, "store_url")
+        await query.edit_message_text(
+            "🔍 *Find Low-Price Products*\n\n"
+            "Send me a Shopify store URL:\n\n"
+            "Example: `https://example-store.com`\n\n"
+            "I'll find products priced $1-$5",
             parse_mode="Markdown",
             reply_markup=get_cancel_keyboard()
         )
@@ -1562,6 +1601,124 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await query.edit_message_text(text_msg, parse_mode="Markdown", reply_markup=keyboard)
 
+    # =============================================================================
+    # PRODUCT SCRAPER CALLBACKS
+    # =============================================================================
+
+    elif data.startswith("scrape_toggle_"):
+        # Toggle product selection
+        scraper = get_scraper_session(user_id)
+        if not scraper["products"]:
+            await query.answer("Session expired. Please start again.", show_alert=True)
+            return
+
+        idx = int(data.replace("scrape_toggle_", ""))
+        if idx in scraper["selected"]:
+            scraper["selected"].remove(idx)
+        else:
+            scraper["selected"].add(idx)
+
+        await query.edit_message_reply_markup(
+            reply_markup=get_product_scraper_keyboard(
+                scraper["products"],
+                scraper["selected"],
+                scraper["page"]
+            )
+        )
+
+    elif data.startswith("scrape_page_"):
+        # Change page
+        scraper = get_scraper_session(user_id)
+        if not scraper["products"]:
+            await query.answer("Session expired. Please start again.", show_alert=True)
+            return
+
+        page = int(data.replace("scrape_page_", ""))
+        scraper["page"] = page
+
+        await query.edit_message_reply_markup(
+            reply_markup=get_product_scraper_keyboard(
+                scraper["products"],
+                scraper["selected"],
+                page
+            )
+        )
+
+    elif data == "scrape_toggle_all":
+        # Toggle all products
+        scraper = get_scraper_session(user_id)
+        if not scraper["products"]:
+            await query.answer("Session expired. Please start again.", show_alert=True)
+            return
+
+        if len(scraper["selected"]) == len(scraper["products"]):
+            # Deselect all
+            scraper["selected"] = set()
+        else:
+            # Select all
+            scraper["selected"] = set(range(len(scraper["products"])))
+
+        await query.edit_message_reply_markup(
+            reply_markup=get_product_scraper_keyboard(
+                scraper["products"],
+                scraper["selected"],
+                scraper["page"]
+            )
+        )
+
+    elif data == "scrape_add":
+        # Add selected products
+        scraper = get_scraper_session(user_id)
+        if not scraper["products"]:
+            await query.answer("Session expired. Please start again.", show_alert=True)
+            return
+
+        if not scraper["selected"]:
+            await query.answer("No products selected!", show_alert=True)
+            return
+
+        # Get current user products
+        settings = get_user_settings(user_id)
+        products = settings.get("products", [])
+        added_count = 0
+        already_exists = 0
+
+        for idx in scraper["selected"]:
+            if idx < len(scraper["products"]):
+                product_url = scraper["products"][idx]["url"]
+                if product_url not in products:
+                    products.append(product_url)
+                    added_count += 1
+                else:
+                    already_exists += 1
+
+        update_user_setting(user_id, "products", products)
+        reset_scraper_session(user_id)
+
+        result_msg = f"✅ *Added {added_count} products!*\n\n"
+        if already_exists > 0:
+            result_msg += f"⚠️ {already_exists} products were already in your list\n"
+        result_msg += f"📦 Total products: {len(products)}"
+
+        await query.edit_message_text(
+            result_msg,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📦 View Products", callback_data="menu_products")],
+                [InlineKeyboardButton("◀️ Main Menu", callback_data="menu_main")]
+            ])
+        )
+
+    elif data == "scrape_cancel":
+        # Cancel scraping
+        reset_scraper_session(user_id)
+        await query.edit_message_text(
+            "❌ Product search cancelled.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Main Menu", callback_data="menu_main")]
+            ])
+        )
+
 
 async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /setproxy command"""
@@ -1690,6 +1847,158 @@ async def validate_shopify_product(url: str) -> tuple[bool, str]:
         return False, f"Error: {str(e)[:50]}"
 
 
+# =============================================================================
+# PRODUCT SCRAPER - Auto-fetch low-price products from store
+# =============================================================================
+
+def is_store_url(url: str) -> bool:
+    """
+    Check if URL is a store URL (not a product URL).
+    Valid: https://store.com, https://store.com/collections/all
+    Invalid: https://store.com/products/item
+    """
+    if not url:
+        return False
+    url = url.strip().lower()
+
+    # Must be a valid URL
+    if not url.startswith(('http://', 'https://')):
+        return False
+
+    # Not a product URL
+    if '/products/' in url:
+        return False
+
+    # Check if it looks like a domain
+    import urllib.parse
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.netloc:
+        return False
+
+    # Accept root domain or collections
+    path = parsed.path.strip('/')
+    if path == '' or path.startswith('collections'):
+        return True
+
+    return False
+
+
+def extract_store_domain(url: str) -> str:
+    """Extract the base store domain from a URL"""
+    import urllib.parse
+    parsed = urllib.parse.urlparse(url.strip())
+    scheme = parsed.scheme or 'https'
+    return f"{scheme}://{parsed.netloc}"
+
+
+async def fetch_shopify_products(store_url: str, min_price: float = 1.0, max_price: float = 5.0, max_products: int = 15) -> tuple[list, str]:
+    """
+    Fetch products from a Shopify store within a price range.
+    Returns (list of products, error message or empty string)
+    """
+    base_url = extract_store_domain(store_url)
+    products_found = []
+    page = 1
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            while len(products_found) < max_products and page <= 5:  # Max 5 pages
+                url = f"{base_url}/products.json?limit=250&page={page}"
+
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status == 404:
+                            return [], "Not a Shopify store or store not found"
+                        elif resp.status == 401 or resp.status == 403:
+                            return [], "Store blocked access to product data"
+                        elif resp.status != 200:
+                            return [], f"Failed to access store (HTTP {resp.status})"
+
+                        data = await resp.json()
+                        store_products = data.get("products", [])
+
+                        if not store_products:
+                            break  # No more products
+
+                        for product in store_products:
+                            if len(products_found) >= max_products:
+                                break
+
+                            # Get first variant price
+                            variants = product.get("variants", [])
+                            if not variants:
+                                continue
+
+                            try:
+                                price = float(variants[0].get("price", "0"))
+                            except (ValueError, TypeError):
+                                continue
+
+                            # Filter by price range
+                            if min_price <= price <= max_price:
+                                product_handle = product.get("handle", "")
+                                product_url = f"{base_url}/products/{product_handle}"
+
+                                products_found.append({
+                                    "title": product.get("title", "Unknown"),
+                                    "price": price,
+                                    "url": product_url,
+                                    "handle": product_handle,
+                                    "id": product.get("id", 0)
+                                })
+
+                        page += 1
+
+                except asyncio.TimeoutError:
+                    return [], "Request timed out - store may be slow"
+                except json.JSONDecodeError:
+                    return [], "Invalid response from store"
+
+        return products_found, ""
+
+    except Exception as e:
+        logger.error(f"Error fetching products from {store_url}: {e}")
+        return [], f"Error: {str(e)[:50]}"
+
+
+def get_product_scraper_keyboard(products: list, selected: set, page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
+    """Generate keyboard for product selection with pagination"""
+    buttons = []
+    start = page * per_page
+    end = min(start + per_page, len(products))
+    total_pages = (len(products) + per_page - 1) // per_page
+
+    for i, product in enumerate(products[start:end]):
+        idx = start + i
+        is_selected = idx in selected
+        checkbox = "☑️" if is_selected else "☐"
+        price_str = f"${product['price']:.2f}"
+        # Truncate title if too long
+        title = product['title'][:30] + "..." if len(product['title']) > 30 else product['title']
+        button_text = f"{checkbox} {title} - {price_str}"
+        buttons.append([InlineKeyboardButton(button_text, callback_data=f"scrape_toggle_{idx}")])
+
+    # Navigation and action buttons
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("◀️ Prev", callback_data=f"scrape_page_{page-1}"))
+    if page < total_pages - 1:
+        nav_buttons.append(InlineKeyboardButton("Next ▶️", callback_data=f"scrape_page_{page+1}"))
+
+    if nav_buttons:
+        buttons.append(nav_buttons)
+
+    # Action buttons
+    select_text = "Deselect All" if len(selected) == len(products) else "Select All"
+    buttons.append([
+        InlineKeyboardButton(f"🔘 {select_text}", callback_data="scrape_toggle_all"),
+        InlineKeyboardButton(f"✅ Add ({len(selected)})", callback_data="scrape_add")
+    ])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="scrape_cancel")])
+
+    return InlineKeyboardMarkup(buttons)
+
+
 async def addproduct_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /addproduct command"""
     user_id = update.effective_user.id
@@ -1792,6 +2101,91 @@ async def clearproducts_command(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id
     update_user_setting(user_id, "products", [])
     await update.message.reply_text("✅ All products cleared!")
+
+
+async def findproducts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /findproducts command - search for low-price products in a Shopify store"""
+    user_id = update.effective_user.id
+
+    if is_user_banned(user_id):
+        await update.message.reply_text("🚫 You are banned from using this bot.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "🔍 *Find Low-Price Products*\n\n"
+            "Usage: `/findproducts <store_url>`\n\n"
+            "Example:\n"
+            "`/findproducts https://example-store.com`\n\n"
+            "This will search for products priced $1-$5",
+            parse_mode="Markdown"
+        )
+        return
+
+    store_url = context.args[0].strip()
+
+    # Validate URL
+    if not store_url.startswith(('http://', 'https://')):
+        store_url = 'https://' + store_url
+
+    if '/products/' in store_url:
+        await update.message.reply_text(
+            "❌ That looks like a product URL, not a store URL.\n\n"
+            "Please provide the store's main URL:\n"
+            "✅ `https://store.com`\n"
+            "❌ `https://store.com/products/item`",
+            parse_mode="Markdown"
+        )
+        return
+
+    status_msg = await update.message.reply_text(
+        "🔍 *Searching for products ($1-$5)...*\n\n"
+        "This may take a moment...",
+        parse_mode="Markdown"
+    )
+
+    # Fetch products
+    products, error = await fetch_shopify_products(store_url, min_price=1.0, max_price=5.0, max_products=15)
+
+    if error:
+        await status_msg.edit_text(
+            f"❌ *Failed to fetch products*\n\n{error}\n\n"
+            f"Make sure this is a valid Shopify store.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Main Menu", callback_data="menu_main")]
+            ])
+        )
+        return
+
+    if not products:
+        await status_msg.edit_text(
+            "⚠️ *No products found*\n\n"
+            "No products priced between $1-$5 were found in this store.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Main Menu", callback_data="menu_main")]
+            ])
+        )
+        return
+
+    # Store in session
+    scraper = get_scraper_session(user_id)
+    scraper["products"] = products
+    scraper["selected"] = set()
+    scraper["page"] = 0
+    scraper["store_url"] = store_url
+
+    # Display products
+    store_domain = extract_store_domain(store_url)
+    await status_msg.edit_text(
+        f"🛒 *Found {len(products)} products* ($1-$5)\n"
+        f"📍 Store: `{store_domain}`\n\n"
+        f"Select products to add:\n"
+        f"_(Use checkboxes then 'Add')_",
+        parse_mode="Markdown",
+        reply_markup=get_product_scraper_keyboard(products, set(), 0)
+    )
 
 
 def is_admin(user_id: int) -> bool:
@@ -2758,6 +3152,71 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # Handle store URL input for product scraping
+    if waiting_for == "store_url":
+        set_waiting_for(user_id, None)
+        store_url = text.strip()
+
+        if not store_url.startswith(('http://', 'https://')):
+            store_url = 'https://' + store_url
+
+        if '/products/' in store_url:
+            await update.message.reply_text(
+                "❌ That looks like a product URL, not a store URL.\n\n"
+                "Please provide the store's main URL:\n"
+                "✅ `https://store.com`\n"
+                "❌ `https://store.com/products/item`",
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard("menu_products")
+            )
+            return
+
+        status_msg = await update.message.reply_text(
+            "🔍 *Searching for products ($1-$5)...*\n\n"
+            "This may take a moment...",
+            parse_mode="Markdown"
+        )
+
+        # Fetch products
+        products, error = await fetch_shopify_products(store_url, min_price=1.0, max_price=5.0, max_products=15)
+
+        if error:
+            await status_msg.edit_text(
+                f"❌ *Failed to fetch products*\n\n{error}\n\n"
+                f"Make sure this is a valid Shopify store.",
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard("menu_products")
+            )
+            return
+
+        if not products:
+            await status_msg.edit_text(
+                "⚠️ *No products found*\n\n"
+                "No products priced between $1-$5 were found in this store.",
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard("menu_products")
+            )
+            return
+
+        # Store in session
+        scraper = get_scraper_session(user_id)
+        scraper["products"] = products
+        scraper["selected"] = set()
+        scraper["page"] = 0
+        scraper["store_url"] = store_url
+
+        # Display products
+        store_domain = extract_store_domain(store_url)
+        await status_msg.edit_text(
+            f"🛒 *Found {len(products)} products* ($1-$5)\n"
+            f"📍 Store: `{store_domain}`\n\n"
+            f"Select products to add:\n"
+            f"_(Use checkboxes then 'Add')_",
+            parse_mode="Markdown",
+            reply_markup=get_product_scraper_keyboard(products, set(), 0)
+        )
+        return
+
     # Handle product input
     if waiting_for == "product":
         set_waiting_for(user_id, None)
@@ -2824,6 +3283,68 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=get_back_keyboard("menu_products")
             )
+        return
+
+    # =============================================================================
+    # AUTO-DETECT STORE URLS FOR PRODUCT SCRAPING
+    # =============================================================================
+
+    # Check if text looks like a store URL (not a product URL)
+    text_stripped = text.strip()
+    if text_stripped.startswith(('http://', 'https://')) and is_store_url(text_stripped):
+        # User sent a store URL - trigger product scraping
+        if is_user_banned(user_id):
+            await update.message.reply_text("🚫 You are banned from using this bot.")
+            return
+
+        status_msg = await update.message.reply_text(
+            "🔍 *Searching for products ($1-$5)...*\n\n"
+            "This may take a moment...",
+            parse_mode="Markdown"
+        )
+
+        # Fetch products
+        products, error = await fetch_shopify_products(text_stripped, min_price=1.0, max_price=5.0, max_products=15)
+
+        if error:
+            await status_msg.edit_text(
+                f"❌ *Failed to fetch products*\n\n{error}\n\n"
+                f"Make sure this is a valid Shopify store.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Main Menu", callback_data="menu_main")]
+                ])
+            )
+            return
+
+        if not products:
+            await status_msg.edit_text(
+                "⚠️ *No products found*\n\n"
+                "No products priced between $1-$5 were found in this store.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Main Menu", callback_data="menu_main")]
+                ])
+            )
+            return
+
+        # Store in session
+        scraper = get_scraper_session(user_id)
+        scraper["products"] = products
+        scraper["selected"] = set()
+        scraper["page"] = 0
+        scraper["store_url"] = text_stripped
+
+        # Display products
+        store_domain = extract_store_domain(text_stripped)
+        await status_msg.edit_text(
+            f"🛒 *Found {len(products)} products* ($1-$5)\n"
+            f"📍 Store: `{store_domain}`\n\n"
+            f"Select products to add:\n"
+            f"_(Use checkboxes then 'Add')_",
+            parse_mode="Markdown",
+            reply_markup=get_product_scraper_keyboard(products, set(), 0)
+        )
         return
 
     # Parse cards from message
@@ -2968,6 +3489,7 @@ def main():
     app.add_handler(CommandHandler("removeproduct", removeproduct_command))
     app.add_handler(CommandHandler("products", products_command))
     app.add_handler(CommandHandler("clearproducts", clearproducts_command))
+    app.add_handler(CommandHandler("findproducts", findproducts_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("credits", credits_command))
     app.add_handler(CommandHandler("subscribe", subscribe_command))

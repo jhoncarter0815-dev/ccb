@@ -289,6 +289,18 @@ def update_user_setting(user_id: int, key: str, value) -> dict:
 
 from datetime import datetime, timedelta, date, timezone
 
+
+def make_aware(dt):
+    """Convert naive datetime to UTC aware datetime"""
+    if dt is None:
+        return None
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+    return dt
+
+
 def check_and_reset_daily_credits(user_id: int) -> dict:
     """Check if credits need to be reset (daily reset at midnight UTC) and reset if needed"""
     settings = get_user_settings(user_id)
@@ -298,7 +310,8 @@ def check_and_reset_daily_credits(user_id: int) -> dict:
 
     # Check if subscription has expired
     expires = settings.get("subscription_expires")
-    if expires and isinstance(expires, datetime) and expires < datetime.now(timezone.utc):
+    expires_aware = make_aware(expires)
+    if expires_aware and isinstance(expires_aware, datetime) and expires_aware < datetime.now(timezone.utc):
         # Subscription expired, downgrade to free
         tier = "free"
         settings["subscription_tier"] = tier
@@ -416,7 +429,8 @@ def get_subscription_info(user_id: int) -> dict:
     days_left = None
     if expires:
         if isinstance(expires, datetime):
-            delta = expires - datetime.now(timezone.utc)
+            expires_aware = make_aware(expires)
+            delta = expires_aware - datetime.now(timezone.utc)
             days_left = max(0, delta.days)
         else:
             days_left = 0
@@ -508,7 +522,8 @@ async def check_subscription_expiry_notifications():
 
         for row in expiring_users:
             user_id, tier, expires = row
-            days_left = (expires - datetime.now()).days
+            expires_aware = make_aware(expires)
+            days_left = (expires_aware - datetime.now(timezone.utc)).days
             tier_name = TIER_NAMES.get(tier, tier)
 
             try:

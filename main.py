@@ -1164,9 +1164,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "prod_add":
         set_waiting_for(user_id, "product")
         await query.edit_message_text(
-            "📦 *Add Product*\n\n"
+            "📦 *Add Digital Product*\n\n"
             "Send me a Shopify product URL:\n\n"
-            "Example: `https://store.com/products/item`",
+            "Example: `https://store.com/products/item`\n\n"
+            "⚠️ Only *digital/virtual products* are accepted\n"
+            "_(Products that require shipping will be rejected)_",
             parse_mode="Markdown",
             reply_markup=get_cancel_keyboard()
         )
@@ -1175,10 +1177,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "prod_find":
         set_waiting_for(user_id, "store_url")
         await query.edit_message_text(
-            "🔍 *Find Low-Price Products*\n\n"
+            "🔍 *Find Digital Products*\n\n"
             "Send me a Shopify store URL:\n\n"
             "Example: `https://example-store.com`\n\n"
-            "I'll find products priced $1-$5",
+            "I'll find *digital products* priced $1-$5\n"
+            "_(Only non-shippable items are shown)_",
             parse_mode="Markdown",
             reply_markup=get_cancel_keyboard()
         )
@@ -1931,8 +1934,11 @@ async def remove_invalid_product(user_id: int, product_url: str, reason: str = "
         return False
 
 
-async def validate_shopify_product(url: str) -> tuple[bool, str]:
-    """Validate if a URL is a valid Shopify product page"""
+async def validate_shopify_product(url: str, check_shipping: bool = True) -> tuple[bool, str]:
+    """
+    Validate if a URL is a valid Shopify product page.
+    If check_shipping=True, also verifies the product doesn't require shipping.
+    """
     try:
         # Check URL format
         if "/products/" not in url:
@@ -1946,23 +1952,27 @@ async def validate_shopify_product(url: str) -> tuple[bool, str]:
                 if resp.status == 200:
                     data = await resp.json()
                     if "product" in data:
-                        product_title = data["product"].get("title", "Unknown")
-                        return True, f"Product found: {product_title}"
+                        product = data["product"]
+                        product_title = product.get("title", "Unknown")
+
+                        # Check if product requires shipping
+                        if check_shipping:
+                            variants = product.get("variants", [])
+                            if variants:
+                                # Check first variant for shipping requirement
+                                requires_shipping = variants[0].get("requires_shipping", True)
+                                if requires_shipping:
+                                    return False, f"❌ Product requires shipping: {product_title}\n\nOnly digital/virtual products are accepted."
+
+                        return True, f"✅ Product found: {product_title} (No shipping required)"
                     else:
                         return False, "Not a valid Shopify product page"
                 elif resp.status == 404:
                     return False, "Product not found (404)"
                 elif resp.status == 401 or resp.status == 403:
-                    # Some stores block JSON access, try HTML
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as html_resp:
-                        if html_resp.status == 200:
-                            text = await html_resp.text()
-                            if 'Shopify' in text or 'shopify' in text or '/products/' in text:
-                                return True, "Product page accessible"
-                            else:
-                                return False, "Not a Shopify store"
-                        else:
-                            return False, f"Page not accessible (HTTP {html_resp.status})"
+                    # Some stores block JSON access - we can't verify shipping
+                    # Reject these since we can't confirm they're digital
+                    return False, "Cannot verify product - store blocks access. Only products with accessible JSON are supported."
                 else:
                     return False, f"Failed to access product (HTTP {resp.status})"
     except asyncio.TimeoutError:
@@ -2053,8 +2063,15 @@ async def fetch_shopify_products(store_url: str, min_price: float = 1.0, max_pri
                             if not variants:
                                 continue
 
+                            first_variant = variants[0]
+
+                            # FILTER: Skip products that require shipping
+                            # Only accept digital/virtual products (no shipping required)
+                            if first_variant.get("requires_shipping", True):
+                                continue
+
                             try:
-                                price = float(variants[0].get("price", "0"))
+                                price = float(first_variant.get("price", "0"))
                             except (ValueError, TypeError):
                                 continue
 
@@ -2068,7 +2085,8 @@ async def fetch_shopify_products(store_url: str, min_price: float = 1.0, max_pri
                                     "price": price,
                                     "url": product_url,
                                     "handle": product_handle,
-                                    "id": product.get("id", 0)
+                                    "id": product.get("id", 0),
+                                    "requires_shipping": False
                                 })
 
                         page += 1
@@ -2130,7 +2148,8 @@ async def addproduct_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not context.args:
         await update.message.reply_text(
             "❌ Usage: `/addproduct <shopify_product_url>`\n"
-            "Example: `/addproduct https://store.com/products/item`",
+            "Example: `/addproduct https://store.com/products/item`\n\n"
+            "⚠️ Only digital/virtual products are accepted (no shipping required).",
             parse_mode="Markdown"
         )
         return
@@ -2143,10 +2162,14 @@ async def addproduct_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("⚠️ This product URL is already in your list.")
         return
 
-    # Validate the product URL
-    status_msg = await update.message.reply_text("⏳ Validating product URL...")
+    # Validate the product URL and check shipping requirements
+    status_msg = await update.message.reply_text(
+        "⏳ Validating product...\n\n"
+        "_Checking if product is digital (no shipping)..._",
+        parse_mode="Markdown"
+    )
 
-    is_valid, message = await validate_shopify_product(url)
+    is_valid, message = await validate_shopify_product(url, check_shipping=True)
 
     if is_valid:
         products.append(url)
@@ -2159,9 +2182,9 @@ async def addproduct_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     else:
         await status_msg.edit_text(
-            f"❌ *Failed to add product*\n\n"
+            f"❌ *Cannot add product*\n\n"
             f"📝 {message}\n\n"
-            f"Make sure the URL is a valid Shopify product page.",
+            f"_Only digital/virtual products are supported._",
             parse_mode="Markdown"
         )
 
@@ -2284,8 +2307,9 @@ async def findproducts_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not products:
         await status_msg.edit_text(
-            "⚠️ *No products found*\n\n"
-            "No products priced between $1-$5 were found in this store.",
+            "⚠️ *No digital products found*\n\n"
+            "No digital products priced $1-$5 were found in this store.\n"
+            "_(Only products that don't require shipping are shown)_",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("◀️ Main Menu", callback_data="menu_main")]
@@ -2303,10 +2327,10 @@ async def findproducts_command(update: Update, context: ContextTypes.DEFAULT_TYP
     # Display products
     store_domain = extract_store_domain(store_url)
     await status_msg.edit_text(
-        f"🛒 *Found {len(products)} products* ($1-$5)\n"
+        f"🛒 *Found {len(products)} digital products* ($1-$5)\n"
         f"📍 Store: `{store_domain}`\n\n"
         f"Select products to add:\n"
-        f"_(Use checkboxes then 'Add')_",
+        f"_(Digital products only - no shipping required)_",
         parse_mode="Markdown",
         reply_markup=get_product_scraper_keyboard(products, set(), 0)
     )
@@ -3443,8 +3467,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not products:
             await status_msg.edit_text(
-                "⚠️ *No products found*\n\n"
-                "No products priced between $1-$5 were found in this store.",
+                "⚠️ *No digital products found*\n\n"
+                "No digital products priced $1-$5 were found in this store.\n"
+                "_(Only products that don't require shipping are shown)_",
                 parse_mode="Markdown",
                 reply_markup=get_back_keyboard("menu_products")
             )
@@ -3460,10 +3485,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Display products
         store_domain = extract_store_domain(store_url)
         await status_msg.edit_text(
-            f"🛒 *Found {len(products)} products* ($1-$5)\n"
+            f"🛒 *Found {len(products)} digital products* ($1-$5)\n"
             f"📍 Store: `{store_domain}`\n\n"
             f"Select products to add:\n"
-            f"_(Use checkboxes then 'Add')_",
+            f"_(Digital products only - no shipping required)_",
             parse_mode="Markdown",
             reply_markup=get_product_scraper_keyboard(products, set(), 0)
         )
@@ -3485,53 +3510,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Validate product exists
-        status_msg = await update.message.reply_text("⏳ Validating product URL...")
+        # Validate product exists and doesn't require shipping
+        status_msg = await update.message.reply_text(
+            "⏳ Validating product...\n\n"
+            "_Checking if product is digital (no shipping)..._",
+            parse_mode="Markdown"
+        )
 
-        try:
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{url}.json", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        product_title = data.get("product", {}).get("title", "Unknown")
+        # Use validate_shopify_product which checks for shipping requirements
+        is_valid, message = await validate_shopify_product(url, check_shipping=True)
 
-                        settings = get_user_settings(user_id)
-                        products = settings.get("products", [])
+        if is_valid:
+            settings = get_user_settings(user_id)
+            products = settings.get("products", [])
 
-                        if url in products:
-                            await status_msg.edit_text(
-                                "⚠️ *Product already in your list!*",
-                                parse_mode="Markdown",
-                                reply_markup=get_back_keyboard("menu_products")
-                            )
-                            return
+            if url in products:
+                await status_msg.edit_text(
+                    "⚠️ *Product already in your list!*",
+                    parse_mode="Markdown",
+                    reply_markup=get_back_keyboard("menu_products")
+                )
+                return
 
-                        products.append(url)
-                        update_user_setting(user_id, "products", products)
+            products.append(url)
+            update_user_setting(user_id, "products", products)
 
-                        await status_msg.edit_text(
-                            f"✅ *Product Added!*\n\n"
-                            f"📝 *{product_title}*\n"
-                            f"📦 Total products: {len(products)}",
-                            parse_mode="Markdown",
-                            reply_markup=get_back_keyboard("menu_products")
-                        )
-                    elif resp.status == 404:
-                        await status_msg.edit_text(
-                            "❌ *Product not found!*\n\nCheck the URL and try again.",
-                            parse_mode="Markdown",
-                            reply_markup=get_back_keyboard("menu_products")
-                        )
-                    else:
-                        await status_msg.edit_text(
-                            f"❌ *Error: HTTP {resp.status}*",
-                            parse_mode="Markdown",
-                            reply_markup=get_back_keyboard("menu_products")
-                        )
-        except Exception as e:
             await status_msg.edit_text(
-                f"❌ *Failed to validate URL*\n\n{str(e)}",
+                f"✅ *Product Added!*\n\n"
+                f"📝 {message}\n"
+                f"📦 Total products: {len(products)}",
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard("menu_products")
+            )
+        else:
+            await status_msg.edit_text(
+                f"❌ *Cannot Add Product*\n\n{message}\n\n"
+                f"_Only digital/virtual products are supported._",
                 parse_mode="Markdown",
                 reply_markup=get_back_keyboard("menu_products")
             )
@@ -3571,8 +3585,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not products:
             await status_msg.edit_text(
-                "⚠️ *No products found*\n\n"
-                "No products priced between $1-$5 were found in this store.",
+                "⚠️ *No digital products found*\n\n"
+                "No digital products priced $1-$5 were found in this store.\n"
+                "_(Only products that don't require shipping are shown)_",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("◀️ Main Menu", callback_data="menu_main")]
@@ -3590,10 +3605,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Display products
         store_domain = extract_store_domain(text_stripped)
         await status_msg.edit_text(
-            f"🛒 *Found {len(products)} products* ($1-$5)\n"
+            f"🛒 *Found {len(products)} digital products* ($1-$5)\n"
             f"📍 Store: `{store_domain}`\n\n"
             f"Select products to add:\n"
-            f"_(Use checkboxes then 'Add')_",
+            f"_(Digital products only - no shipping required)_",
             parse_mode="Markdown",
             reply_markup=get_product_scraper_keyboard(products, set(), 0)
         )

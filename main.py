@@ -2779,93 +2779,115 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle .txt file uploads for mass checking"""
-    user_id = update.effective_user.id
-    document = update.message.document
-
-    # Check if user is banned
-    if is_user_banned(user_id):
-        await update.message.reply_text("🚫 You are banned from using this bot.")
-        return
-
-    # Check if user has products set
-    if not user_has_products(user_id):
-        await update.message.reply_text(
-            "❌ *No product set!*\n\n"
-            "Use the menu to add a product first.",
-            parse_mode="Markdown",
-            reply_markup=get_main_menu_keyboard(user_id)
-        )
-        return
-
-    if not document.file_name.endswith('.txt'):
-        await update.message.reply_text("❌ Please send a .txt file containing cards.")
-        return
-
-    # Download file
-    file = await context.bot.get_file(document.file_id)
-    file_bytes = await file.download_as_bytearray()
-
     try:
-        card_text = file_bytes.decode('utf-8')
-    except UnicodeDecodeError:
-        card_text = file_bytes.decode('latin-1')
+        user_id = update.effective_user.id
+        document = update.message.document
 
-    cards = create_lista_(card_text)
+        # Safety check
+        if not document:
+            logger.warning(f"handle_file called but no document found for user {user_id}")
+            return
 
-    if not cards:
-        await update.message.reply_text("❌ No valid cards found in the file.")
-        return
+        logger.info(f"File received from user {user_id}: {document.file_name}")
 
-    # Check credits BEFORE processing
-    user_credits = get_user_credits(user_id)
-    cards_to_check = len(cards)
+        # Check if user is banned
+        if is_user_banned(user_id):
+            await update.message.reply_text("🚫 You are banned from using this bot.")
+            return
 
-    if user_credits != -1 and user_credits < cards_to_check:
-        # Not enough credits for all cards
-        if user_credits == 0:
+        # Check if user has products set
+        if not user_has_products(user_id):
             await update.message.reply_text(
-                get_no_credits_message(),
+                "❌ *No product set!*\n\n"
+                "Use the menu to add a product first.",
                 parse_mode="Markdown",
-                reply_markup=get_subscribe_keyboard()
+                reply_markup=get_main_menu_keyboard(user_id)
             )
             return
-        else:
-            # Warn user and only check what they can afford
+
+        # Check file extension
+        file_name = document.file_name or ""
+        if not file_name.lower().endswith('.txt'):
+            await update.message.reply_text("❌ Please send a .txt file containing cards.")
+            return
+
+        # Download file
+        file = await context.bot.get_file(document.file_id)
+        file_bytes = await file.download_as_bytearray()
+
+        try:
+            card_text = file_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            card_text = file_bytes.decode('latin-1')
+
+        cards = create_lista_(card_text)
+
+        if not cards:
+            await update.message.reply_text("❌ No valid cards found in the file.")
+            return
+
+        logger.info(f"User {user_id}: Found {len(cards)} cards in file")
+
+        # Check credits BEFORE processing
+        user_credits = get_user_credits(user_id)
+        cards_to_check = len(cards)
+
+        if user_credits != -1 and user_credits < cards_to_check:
+            # Not enough credits for all cards
+            if user_credits == 0:
+                await update.message.reply_text(
+                    get_no_credits_message(),
+                    parse_mode="Markdown",
+                    reply_markup=get_subscribe_keyboard()
+                )
+                return
+            else:
+                # Warn user and only check what they can afford
+                await update.message.reply_text(
+                    f"⚠️ *Limited Credits!*\n\n"
+                    f"You have {user_credits} credits but {cards_to_check} cards.\n"
+                    f"Only the first {user_credits} cards will be checked.\n\n"
+                    f"_Upgrade to check more cards!_",
+                    parse_mode="Markdown"
+                )
+                cards = cards[:user_credits]
+                cards_to_check = len(cards)
+
+        # Reset session state
+        reset_user_session(user_id)
+        session = get_user_session(user_id)
+        session["checking"] = True
+
+        # Pre-fetch user settings ONCE before starting (optimization)
+        user_settings = get_user_settings(user_id)
+
+        # Show credits in status
+        credits_text = f"💰 Credits: {user_credits}" if user_credits != -1 else "💰 Credits: ♾️ Unlimited"
+
+        status_msg = await update.message.reply_text(
+            f"📂 *File Received*\n\n"
+            f"💳 Cards found: {len(cards)}\n"
+            f"{credits_text}\n"
+            f"⏳ Starting check...",
+            parse_mode="Markdown",
+            reply_markup=get_checking_keyboard(paused=False)
+        )
+
+        # Run the checking loop as a BACKGROUND TASK so the handler returns immediately
+        # This allows other users to interact with the bot while checking is in progress
+        asyncio.create_task(
+            run_batch_check(cards, user_id, user_settings, session, status_msg, update)
+        )
+
+    except Exception as e:
+        logger.error(f"Error in handle_file: {e}", exc_info=True)
+        try:
             await update.message.reply_text(
-                f"⚠️ *Limited Credits!*\n\n"
-                f"You have {user_credits} credits but {cards_to_check} cards.\n"
-                f"Only the first {user_credits} cards will be checked.\n\n"
-                f"_Upgrade to check more cards!_",
-                parse_mode="Markdown"
+                f"❌ Error processing file: {str(e)[:100]}",
+                parse_mode=None
             )
-            cards = cards[:user_credits]
-            cards_to_check = len(cards)
-
-    # Reset session state
-    reset_user_session(user_id)
-    session = get_user_session(user_id)
-    session["checking"] = True
-
-    # Pre-fetch user settings ONCE before starting (optimization)
-    user_settings = get_user_settings(user_id)
-
-    # Show credits in status
-    credits_text = f"💰 Credits: {user_credits}" if user_credits != -1 else "💰 Credits: ♾️ Unlimited"
-
-    status_msg = await update.message.reply_text(
-        f"📂 *File Received*\n\n"
-        f"💳 Cards found: {len(cards)}\n"
-        f"{credits_text}\n"
-        f"⏳ Starting check...",
-        parse_mode="Markdown",
-        reply_markup=get_checking_keyboard(paused=False)
-    )
-
-    # Run the checking loop as a BACKGROUND TASK so the handler returns immediately
-    # This allows other users to interact with the bot while checking is in progress
-    asyncio.create_task(
-        run_batch_check(cards, user_id, user_settings, session, status_msg, update)
-    )
+        except:
+            pass
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):

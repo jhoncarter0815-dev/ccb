@@ -80,6 +80,7 @@ def init_database():
 
     try:
         cur = conn.cursor()
+        # Create base table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id BIGINT PRIMARY KEY,
@@ -91,10 +92,67 @@ def init_database():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Add credit/subscription columns if they don't exist
+        # credits - current credits available
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='user_settings' AND column_name='credits') THEN
+                    ALTER TABLE user_settings ADD COLUMN credits INTEGER DEFAULT 0;
+                END IF;
+            END $$;
+        """)
+
+        # subscription_tier - free, basic, premium, unlimited
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='user_settings' AND column_name='subscription_tier') THEN
+                    ALTER TABLE user_settings ADD COLUMN subscription_tier TEXT DEFAULT 'free';
+                END IF;
+            END $$;
+        """)
+
+        # subscription_expires - when subscription expires
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='user_settings' AND column_name='subscription_expires') THEN
+                    ALTER TABLE user_settings ADD COLUMN subscription_expires TIMESTAMP;
+                END IF;
+            END $$;
+        """)
+
+        # total_checks_used - lifetime card checks counter
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='user_settings' AND column_name='total_checks_used') THEN
+                    ALTER TABLE user_settings ADD COLUMN total_checks_used INTEGER DEFAULT 0;
+                END IF;
+            END $$;
+        """)
+
+        # last_credit_reset - when credits were last reset (for daily reset)
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='user_settings' AND column_name='last_credit_reset') THEN
+                    ALTER TABLE user_settings ADD COLUMN last_credit_reset DATE DEFAULT CURRENT_DATE;
+                END IF;
+            END $$;
+        """)
+
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("Database initialized successfully")
+        logger.info("Database initialized successfully with credit/subscription columns")
         return True
     except Exception as e:
         logger.error(f"Database init error: {e}")
@@ -102,6 +160,35 @@ def init_database():
 
 # In-memory fallback
 user_settings_cache = {}
+
+# Subscription tier credit limits (per day)
+TIER_CREDITS = {
+    "free": 10,
+    "basic": 100,
+    "premium": 500,
+    "unlimited": -1,  # -1 means unlimited
+}
+
+TIER_NAMES = {
+    "free": "🆓 Free",
+    "basic": "⭐ Basic",
+    "premium": "💎 Premium",
+    "unlimited": "👑 Unlimited",
+}
+
+def get_default_settings() -> dict:
+    """Return default settings for a new user"""
+    return {
+        "proxy": None,
+        "products": [],
+        "email": None,
+        "is_shippable": False,
+        "credits": TIER_CREDITS["free"],  # Start with free tier credits
+        "subscription_tier": "free",
+        "subscription_expires": None,
+        "total_checks_used": 0,
+        "last_credit_reset": None,
+    }
 
 def get_user_settings(user_id: int) -> dict:
     """Get or create user settings from database or cache"""
@@ -111,7 +198,10 @@ def get_user_settings(user_id: int) -> dict:
         try:
             cur = conn.cursor()
             cur.execute(
-                "SELECT proxy, products, email, is_shippable FROM user_settings WHERE user_id = %s",
+                """SELECT proxy, products, email, is_shippable,
+                          credits, subscription_tier, subscription_expires,
+                          total_checks_used, last_credit_reset
+                   FROM user_settings WHERE user_id = %s""",
                 (user_id,)
             )
             row = cur.fetchone()
@@ -123,27 +213,22 @@ def get_user_settings(user_id: int) -> dict:
                     "proxy": row[0],
                     "products": row[1] if row[1] else [],
                     "email": row[2],
-                    "is_shippable": row[3]
+                    "is_shippable": row[3],
+                    "credits": row[4] if row[4] is not None else TIER_CREDITS["free"],
+                    "subscription_tier": row[5] or "free",
+                    "subscription_expires": row[6],
+                    "total_checks_used": row[7] or 0,
+                    "last_credit_reset": row[8],
                 }
             else:
-                # Create new user settings
-                return save_user_settings(user_id, {
-                    "proxy": None,
-                    "products": [],
-                    "email": None,
-                    "is_shippable": False
-                })
+                # Create new user settings with default credits
+                return save_user_settings(user_id, get_default_settings())
         except Exception as e:
             logger.error(f"Database read error: {e}")
 
     # Fallback to in-memory
     if user_id not in user_settings_cache:
-        user_settings_cache[user_id] = {
-            "proxy": None,
-            "products": [],
-            "email": None,
-            "is_shippable": False
-        }
+        user_settings_cache[user_id] = get_default_settings()
     return user_settings_cache[user_id]
 
 def save_user_settings(user_id: int, settings: dict) -> dict:
@@ -153,20 +238,32 @@ def save_user_settings(user_id: int, settings: dict) -> dict:
         try:
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO user_settings (user_id, proxy, products, email, is_shippable, updated_at)
-                VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                INSERT INTO user_settings (user_id, proxy, products, email, is_shippable,
+                                           credits, subscription_tier, subscription_expires,
+                                           total_checks_used, last_credit_reset, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                 ON CONFLICT (user_id) DO UPDATE SET
                     proxy = EXCLUDED.proxy,
                     products = EXCLUDED.products,
                     email = EXCLUDED.email,
                     is_shippable = EXCLUDED.is_shippable,
+                    credits = EXCLUDED.credits,
+                    subscription_tier = EXCLUDED.subscription_tier,
+                    subscription_expires = EXCLUDED.subscription_expires,
+                    total_checks_used = EXCLUDED.total_checks_used,
+                    last_credit_reset = EXCLUDED.last_credit_reset,
                     updated_at = CURRENT_TIMESTAMP
             """, (
                 user_id,
                 settings.get("proxy"),
                 settings.get("products", []),
                 settings.get("email"),
-                settings.get("is_shippable", False)
+                settings.get("is_shippable", False),
+                settings.get("credits", 0),
+                settings.get("subscription_tier", "free"),
+                settings.get("subscription_expires"),
+                settings.get("total_checks_used", 0),
+                settings.get("last_credit_reset"),
             ))
             conn.commit()
             cur.close()
@@ -184,6 +281,251 @@ def update_user_setting(user_id: int, key: str, value) -> dict:
     settings = get_user_settings(user_id)
     settings[key] = value
     return save_user_settings(user_id, settings)
+
+
+# =============================================================================
+# CREDIT & SUBSCRIPTION SYSTEM
+# =============================================================================
+
+from datetime import datetime, timedelta, date, timezone
+
+def check_and_reset_daily_credits(user_id: int) -> dict:
+    """Check if credits need to be reset (daily reset at midnight UTC) and reset if needed"""
+    settings = get_user_settings(user_id)
+    tier = settings.get("subscription_tier", "free")
+    last_reset = settings.get("last_credit_reset")
+    today = date.today()
+
+    # Check if subscription has expired
+    expires = settings.get("subscription_expires")
+    if expires and isinstance(expires, datetime) and expires < datetime.now(timezone.utc):
+        # Subscription expired, downgrade to free
+        tier = "free"
+        settings["subscription_tier"] = tier
+        settings["subscription_expires"] = None
+        logger.info(f"User {user_id} subscription expired, downgraded to free")
+
+    # Check if we need to reset credits (different day or never reset)
+    needs_reset = False
+    if last_reset is None:
+        needs_reset = True
+    elif isinstance(last_reset, date):
+        needs_reset = last_reset < today
+    elif isinstance(last_reset, datetime):
+        needs_reset = last_reset.date() < today
+
+    if needs_reset:
+        # Reset credits to tier limit
+        tier_limit = TIER_CREDITS.get(tier, TIER_CREDITS["free"])
+        if tier_limit == -1:  # Unlimited
+            settings["credits"] = 999999  # Large number for unlimited
+        else:
+            settings["credits"] = tier_limit
+        settings["last_credit_reset"] = today
+        save_user_settings(user_id, settings)
+        logger.info(f"Reset credits for user {user_id}: {settings['credits']} credits (tier: {tier})")
+
+    return settings
+
+
+def get_user_credits(user_id: int) -> int:
+    """Get user's current credits after checking for daily reset"""
+    settings = check_and_reset_daily_credits(user_id)
+    tier = settings.get("subscription_tier", "free")
+    if TIER_CREDITS.get(tier, 0) == -1:  # Unlimited
+        return -1  # Return -1 to indicate unlimited
+    return settings.get("credits", 0)
+
+
+def has_enough_credits(user_id: int, amount: int = 1) -> bool:
+    """Check if user has enough credits for an operation"""
+    credits = get_user_credits(user_id)
+    if credits == -1:  # Unlimited
+        return True
+    return credits >= amount
+
+
+def deduct_credits(user_id: int, amount: int = 1) -> tuple[bool, int]:
+    """
+    Deduct credits from user. Returns (success, remaining_credits).
+    Also increments total_checks_used counter.
+    """
+    settings = check_and_reset_daily_credits(user_id)
+    tier = settings.get("subscription_tier", "free")
+
+    # Unlimited tier - don't deduct, just increment counter
+    if TIER_CREDITS.get(tier, 0) == -1:
+        settings["total_checks_used"] = settings.get("total_checks_used", 0) + amount
+        save_user_settings(user_id, settings)
+        return True, -1
+
+    current_credits = settings.get("credits", 0)
+    if current_credits < amount:
+        return False, current_credits
+
+    settings["credits"] = current_credits - amount
+    settings["total_checks_used"] = settings.get("total_checks_used", 0) + amount
+    save_user_settings(user_id, settings)
+    return True, settings["credits"]
+
+
+def add_credits(user_id: int, amount: int) -> int:
+    """Add credits to a user (admin function). Returns new credit balance."""
+    settings = get_user_settings(user_id)
+    settings["credits"] = settings.get("credits", 0) + amount
+    save_user_settings(user_id, settings)
+    return settings["credits"]
+
+
+def set_subscription(user_id: int, tier: str, days: int = 30) -> dict:
+    """Set user's subscription tier and expiration. Returns updated settings."""
+    if tier not in TIER_CREDITS:
+        tier = "free"
+
+    settings = get_user_settings(user_id)
+    settings["subscription_tier"] = tier
+
+    if tier == "free":
+        settings["subscription_expires"] = None
+    else:
+        settings["subscription_expires"] = datetime.now(timezone.utc) + timedelta(days=days)
+
+    # Reset credits to new tier limit
+    tier_limit = TIER_CREDITS.get(tier, TIER_CREDITS["free"])
+    if tier_limit == -1:
+        settings["credits"] = 999999
+    else:
+        settings["credits"] = tier_limit
+
+    settings["last_credit_reset"] = date.today()
+    save_user_settings(user_id, settings)
+    logger.info(f"Set subscription for user {user_id}: tier={tier}, days={days}")
+    return settings
+
+
+def get_subscription_info(user_id: int) -> dict:
+    """Get detailed subscription info for a user"""
+    settings = check_and_reset_daily_credits(user_id)
+    tier = settings.get("subscription_tier", "free")
+    credits = settings.get("credits", 0)
+    tier_limit = TIER_CREDITS.get(tier, TIER_CREDITS["free"])
+    expires = settings.get("subscription_expires")
+    total_used = settings.get("total_checks_used", 0)
+
+    # Calculate days until expiration
+    days_left = None
+    if expires:
+        if isinstance(expires, datetime):
+            delta = expires - datetime.now(timezone.utc)
+            days_left = max(0, delta.days)
+        else:
+            days_left = 0
+
+    return {
+        "tier": tier,
+        "tier_name": TIER_NAMES.get(tier, "Unknown"),
+        "credits": credits if tier_limit != -1 else "Unlimited",
+        "daily_limit": tier_limit if tier_limit != -1 else "Unlimited",
+        "expires": expires,
+        "days_left": days_left,
+        "total_checks_used": total_used,
+        "is_unlimited": tier_limit == -1,
+    }
+
+
+def get_no_credits_message() -> str:
+    """Get the message to show when user has no credits"""
+    return (
+        "❌ *No Credits Remaining!*\n\n"
+        "You've used all your daily credits.\n\n"
+        "🔄 Credits reset daily at midnight UTC\n\n"
+        "💎 *Upgrade for more credits:*\n"
+        "• Basic: 100 credits/day\n"
+        "• Premium: 500 credits/day\n"
+        "• Unlimited: No limits!\n\n"
+        "Use /subscribe to view plans"
+    )
+
+
+async def check_and_send_credit_notifications(user_id: int, remaining_credits: int):
+    """Check if user needs credit notifications and send them"""
+    global _bot_app
+
+    if remaining_credits == -1:  # Unlimited
+        return
+
+    try:
+        if _bot_app is None:
+            return
+
+        if remaining_credits == 10:
+            await _bot_app.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "⚠️ *Low Credits Warning!*\n\n"
+                    "You have only *10 credits* remaining today.\n\n"
+                    "💎 Upgrade to get more credits:\n"
+                    "Use /subscribe to view plans"
+                ),
+                parse_mode="Markdown"
+            )
+        elif remaining_credits == 0:
+            await _bot_app.bot.send_message(
+                chat_id=user_id,
+                text=get_no_credits_message(),
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        logger.error(f"Error sending credit notification to {user_id}: {e}")
+
+
+async def check_subscription_expiry_notifications():
+    """Check all users for expiring subscriptions and send notifications"""
+    global _bot_app
+
+    if _bot_app is None or not DATABASE_URL:
+        return
+
+    conn = get_db_connection()
+    if not conn:
+        return
+
+    try:
+        cur = conn.cursor()
+        # Find users whose subscription expires in 3 days
+        cur.execute("""
+            SELECT user_id, subscription_tier, subscription_expires
+            FROM user_settings
+            WHERE subscription_expires IS NOT NULL
+            AND subscription_expires > NOW()
+            AND subscription_expires <= NOW() + INTERVAL '3 days'
+            AND subscription_tier != 'free'
+        """)
+
+        expiring_users = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        for row in expiring_users:
+            user_id, tier, expires = row
+            days_left = (expires - datetime.now()).days
+            tier_name = TIER_NAMES.get(tier, tier)
+
+            try:
+                await _bot_app.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"⏰ *Subscription Expiring Soon!*\n\n"
+                        f"Your {tier_name} subscription expires in *{days_left} days*.\n\n"
+                        f"Contact admin to renew your subscription."
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Error sending expiry notification to {user_id}: {e}")
+
+    except Exception as e:
+        logger.error(f"Error checking subscription expiry: {e}")
 
 
 # Session state management for pause/stop and input waiting
@@ -1059,6 +1401,125 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
 
+    # =============================================================================
+    # ADMIN CREDIT/SUBSCRIPTION MANAGEMENT
+    # =============================================================================
+
+    elif data == "admin_credits":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text(
+            "💳 *Manage Credits*\n\n"
+            "Choose an action:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add Credits", callback_data="admin_add_credits")],
+                [InlineKeyboardButton("➖ Remove Credits", callback_data="admin_remove_credits")],
+                [InlineKeyboardButton("🔍 Check User Credits", callback_data="admin_check_credits")],
+                [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
+            ])
+        )
+
+    elif data == "admin_add_credits":
+        if not is_admin(user_id):
+            return
+        set_waiting_for(user_id, "admin_add_credits")
+        await query.edit_message_text(
+            "➕ *Add Credits*\n\n"
+            "Send user ID and amount:\n\n"
+            "Format: `user_id amount`\n"
+            "Example: `123456789 100`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Cancel", callback_data="admin_credits")]
+            ])
+        )
+
+    elif data == "admin_remove_credits":
+        if not is_admin(user_id):
+            return
+        set_waiting_for(user_id, "admin_remove_credits")
+        await query.edit_message_text(
+            "➖ *Remove Credits*\n\n"
+            "Send user ID and amount:\n\n"
+            "Format: `user_id amount`\n"
+            "Example: `123456789 50`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Cancel", callback_data="admin_credits")]
+            ])
+        )
+
+    elif data == "admin_check_credits":
+        if not is_admin(user_id):
+            return
+        set_waiting_for(user_id, "admin_check_credits")
+        await query.edit_message_text(
+            "🔍 *Check User Credits*\n\n"
+            "Send the user ID:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Cancel", callback_data="admin_credits")]
+            ])
+        )
+
+    elif data == "admin_subs":
+        if not is_admin(user_id):
+            return
+        # Show subscription stats
+        conn = get_db_connection()
+        tier_counts = {"free": 0, "basic": 0, "premium": 0, "unlimited": 0}
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT subscription_tier, COUNT(*)
+                    FROM user_settings
+                    GROUP BY subscription_tier
+                """)
+                for row in cur.fetchall():
+                    tier = row[0] or "free"
+                    if tier in tier_counts:
+                        tier_counts[tier] = row[1]
+                cur.close()
+                conn.close()
+            except Exception as e:
+                logger.error(f"Error fetching tier stats: {e}")
+
+        text = (
+            "🏷️ *Subscription Management*\n\n"
+            "*Current Subscribers:*\n"
+            f"🆓 Free: {tier_counts['free']}\n"
+            f"⭐ Basic: {tier_counts['basic']}\n"
+            f"💎 Premium: {tier_counts['premium']}\n"
+            f"👑 Unlimited: {tier_counts['unlimited']}\n"
+        )
+
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔧 Set User Tier", callback_data="admin_set_tier")],
+                [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
+            ])
+        )
+
+    elif data == "admin_set_tier":
+        if not is_admin(user_id):
+            return
+        set_waiting_for(user_id, "admin_set_tier")
+        await query.edit_message_text(
+            "🔧 *Set User Subscription*\n\n"
+            "Send user ID, tier, and days:\n\n"
+            "Format: `user_id tier days`\n"
+            "Tiers: `free`, `basic`, `premium`, `unlimited`\n\n"
+            "Example: `123456789 premium 30`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Cancel", callback_data="admin_subs")]
+            ])
+        )
+
     elif data == "admin_back":
         if not is_admin(user_id):
             return
@@ -1451,6 +1912,109 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
+# CREDIT & SUBSCRIPTION COMMANDS
+# =============================================================================
+
+def get_subscribe_keyboard():
+    """Get subscription plans keyboard"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ Basic - 100/day", callback_data="sub_basic")],
+        [InlineKeyboardButton("💎 Premium - 500/day", callback_data="sub_premium")],
+        [InlineKeyboardButton("👑 Unlimited", callback_data="sub_unlimited")],
+        [InlineKeyboardButton("◀️ Back to Menu", callback_data="menu_main")]
+    ])
+
+
+async def credits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /credits command - show current credits and subscription status"""
+    user_id = update.effective_user.id
+    info = get_subscription_info(user_id)
+
+    # Build status message
+    credits_display = info["credits"] if not info["is_unlimited"] else "♾️ Unlimited"
+    daily_limit = info["daily_limit"] if not info["is_unlimited"] else "♾️ Unlimited"
+
+    msg = (
+        f"💳 *Your Credits*\n\n"
+        f"📊 *Current*: {credits_display}\n"
+        f"📅 *Daily Limit*: {daily_limit}\n\n"
+        f"🏷️ *Tier*: {info['tier_name']}\n"
+    )
+
+    if info["expires"] and info["days_left"] is not None:
+        msg += f"⏰ *Expires in*: {info['days_left']} days\n"
+
+    msg += f"\n📈 *Total Cards Checked*: {info['total_checks_used']}\n"
+    msg += "\n_Credits reset daily at midnight UTC_"
+
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=get_subscribe_keyboard()
+    )
+
+
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /subscribe command - show subscription plans"""
+    user_id = update.effective_user.id
+    info = get_subscription_info(user_id)
+
+    msg = (
+        f"💎 *Subscription Plans*\n\n"
+        f"Your current tier: {info['tier_name']}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"🆓 *Free Tier*\n"
+        f"• 10 credits per day\n"
+        f"• Basic features\n\n"
+        f"⭐ *Basic Tier*\n"
+        f"• 100 credits per day\n"
+        f"• Priority support\n\n"
+        f"💎 *Premium Tier*\n"
+        f"• 500 credits per day\n"
+        f"• Fastest processing\n"
+        f"• Priority support\n\n"
+        f"👑 *Unlimited Tier*\n"
+        f"• Unlimited credits\n"
+        f"• All features unlocked\n"
+        f"• VIP support\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"_Contact admin to upgrade your subscription_"
+    )
+
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=get_subscribe_keyboard()
+    )
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /history command - show usage history"""
+    user_id = update.effective_user.id
+    info = get_subscription_info(user_id)
+    settings = get_user_settings(user_id)
+
+    msg = (
+        f"📊 *Usage History*\n\n"
+        f"💳 *Total Cards Checked*: {info['total_checks_used']}\n\n"
+        f"🏷️ *Current Tier*: {info['tier_name']}\n"
+    )
+
+    if not info["is_unlimited"]:
+        msg += f"📊 *Credits Used Today*: {info['daily_limit'] - info['credits']}/{info['daily_limit']}\n"
+        msg += f"💰 *Remaining Today*: {info['credits']}\n"
+    else:
+        msg += f"♾️ *Credits*: Unlimited\n"
+
+    if info["expires"] and info["days_left"] is not None:
+        msg += f"\n⏰ *Subscription Expires*: {info['days_left']} days\n"
+
+    msg += "\n_Credits reset daily at midnight UTC_"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+# =============================================================================
 # ADMIN PANEL
 # =============================================================================
 
@@ -1459,6 +2023,8 @@ def get_admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👥 View All Users", callback_data="admin_users")],
         [InlineKeyboardButton("📊 System Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton("💳 Manage Credits", callback_data="admin_credits")],
+        [InlineKeyboardButton("🏷️ Manage Subscriptions", callback_data="admin_subs")],
         [InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_broadcast")],
         [InlineKeyboardButton("🚫 Banned Users", callback_data="admin_banned")],
         [InlineKeyboardButton("⚙️ Bot Settings", callback_data="admin_settings")],
@@ -1639,6 +2205,24 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                         card_delay = min(card_delay + 0.5, 3.0)  # Increase delay, max 3 seconds
                         logger.warning(f"Captcha detected! Increasing delay to {card_delay}s")
 
+                    # Deduct credit for this card
+                    credit_success, remaining_credits = deduct_credits(user_id, 1)
+                    if not credit_success:
+                        # Out of credits - stop checking
+                        session["stopped"] = True
+                        was_stopped = True
+                        asyncio.create_task(
+                            update.message.reply_text(
+                                "❌ *Out of credits!*\n\nStopping batch check.\n\nUse /subscribe to upgrade.",
+                                parse_mode="Markdown"
+                            )
+                        )
+                        break
+
+                    # Send credit notifications (10 remaining or depleted)
+                    if remaining_credits in [10, 0]:
+                        asyncio.create_task(check_and_send_credit_notifications(user_id, remaining_credits))
+
                     # Build full response with all error details
                     response_parts = []
                     if response.get("message"):
@@ -1691,10 +2275,12 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                         try:
                             progress_bar = create_progress_bar(checked_count, total_cards)
                             pause_status = "⏸️ *PAUSED*\n\n" if session["paused"] else ""
+                            credits_display = f"💰 Credits: {remaining_credits}" if remaining_credits != -1 else "💰 Credits: ♾️"
                             asyncio.create_task(status_msg.edit_text(
                                 f"{pause_status}⏳ *Checking Cards...*\n\n"
                                 f"{progress_bar}\n"
-                                f"📊 {checked_count}/{total_cards} checked\n\n"
+                                f"📊 {checked_count}/{total_cards} checked\n"
+                                f"{credits_display}\n\n"
                                 f"✅ Charged: {len(charged)}\n"
                                 f"🔐 3DS: {len(three_ds)}\n"
                                 f"❌ Declined: {len(declined)}\n\n"
@@ -1800,6 +2386,31 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No valid cards found in the file.")
         return
 
+    # Check credits BEFORE processing
+    user_credits = get_user_credits(user_id)
+    cards_to_check = len(cards)
+
+    if user_credits != -1 and user_credits < cards_to_check:
+        # Not enough credits for all cards
+        if user_credits == 0:
+            await update.message.reply_text(
+                get_no_credits_message(),
+                parse_mode="Markdown",
+                reply_markup=get_subscribe_keyboard()
+            )
+            return
+        else:
+            # Warn user and only check what they can afford
+            await update.message.reply_text(
+                f"⚠️ *Limited Credits!*\n\n"
+                f"You have {user_credits} credits but {cards_to_check} cards.\n"
+                f"Only the first {user_credits} cards will be checked.\n\n"
+                f"_Upgrade to check more cards!_",
+                parse_mode="Markdown"
+            )
+            cards = cards[:user_credits]
+            cards_to_check = len(cards)
+
     # Reset session state
     reset_user_session(user_id)
     session = get_user_session(user_id)
@@ -1808,9 +2419,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Pre-fetch user settings ONCE before starting (optimization)
     user_settings = get_user_settings(user_id)
 
+    # Show credits in status
+    credits_text = f"💰 Credits: {user_credits}" if user_credits != -1 else "💰 Credits: ♾️ Unlimited"
+
     status_msg = await update.message.reply_text(
         f"📂 *File Received*\n\n"
         f"💳 Cards found: {len(cards)}\n"
+        f"{credits_text}\n"
         f"⏳ Starting check...",
         parse_mode="Markdown",
         reply_markup=get_checking_keyboard(paused=False)
@@ -1991,6 +2606,158 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # Handle admin add credits
+    if waiting_for == "admin_add_credits" and is_admin(user_id):
+        set_waiting_for(user_id, None)
+        try:
+            parts = text.strip().split()
+            if len(parts) != 2:
+                raise ValueError("Invalid format")
+            target_id = int(parts[0])
+            amount = int(parts[1])
+            if amount <= 0:
+                raise ValueError("Amount must be positive")
+
+            new_credits = add_credits(target_id, amount)
+            await update.message.reply_text(
+                f"✅ Added {amount} credits to user `{target_id}`\n"
+                f"New balance: {new_credits}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_credits")]
+                ])
+            )
+        except ValueError as e:
+            await update.message.reply_text(
+                f"❌ Invalid input. Use format: `user_id amount`\n"
+                f"Example: `123456789 100`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_credits")]
+                ])
+            )
+        return
+
+    # Handle admin remove credits
+    if waiting_for == "admin_remove_credits" and is_admin(user_id):
+        set_waiting_for(user_id, None)
+        try:
+            parts = text.strip().split()
+            if len(parts) != 2:
+                raise ValueError("Invalid format")
+            target_id = int(parts[0])
+            amount = int(parts[1])
+            if amount <= 0:
+                raise ValueError("Amount must be positive")
+
+            # Get current credits and subtract
+            current = get_user_credits(target_id)
+            if current == -1:
+                await update.message.reply_text(
+                    f"⚠️ User `{target_id}` has unlimited credits.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("◀️ Back", callback_data="admin_credits")]
+                    ])
+                )
+                return
+
+            new_credits = max(0, current - amount)
+            settings = get_user_settings(target_id)
+            settings["credits"] = new_credits
+            save_user_settings(target_id, settings)
+
+            await update.message.reply_text(
+                f"✅ Removed {amount} credits from user `{target_id}`\n"
+                f"New balance: {new_credits}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_credits")]
+                ])
+            )
+        except ValueError:
+            await update.message.reply_text(
+                f"❌ Invalid input. Use format: `user_id amount`\n"
+                f"Example: `123456789 50`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_credits")]
+                ])
+            )
+        return
+
+    # Handle admin check credits
+    if waiting_for == "admin_check_credits" and is_admin(user_id):
+        set_waiting_for(user_id, None)
+        try:
+            target_id = int(text.strip())
+            info = get_subscription_info(target_id)
+
+            credits_display = info["credits"] if not info["is_unlimited"] else "♾️ Unlimited"
+            expires_text = f"\n⏰ Expires in: {info['days_left']} days" if info["days_left"] is not None else ""
+
+            await update.message.reply_text(
+                f"👤 *User {target_id}*\n\n"
+                f"💰 Credits: {credits_display}\n"
+                f"🏷️ Tier: {info['tier_name']}\n"
+                f"📊 Total Checks: {info['total_checks_used']}"
+                f"{expires_text}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_credits")]
+                ])
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Invalid user ID.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_credits")]
+                ])
+            )
+        return
+
+    # Handle admin set tier
+    if waiting_for == "admin_set_tier" and is_admin(user_id):
+        set_waiting_for(user_id, None)
+        try:
+            parts = text.strip().split()
+            if len(parts) != 3:
+                raise ValueError("Invalid format")
+            target_id = int(parts[0])
+            tier = parts[1].lower()
+            days = int(parts[2])
+
+            if tier not in TIER_CREDITS:
+                raise ValueError(f"Invalid tier: {tier}")
+            if days <= 0:
+                raise ValueError("Days must be positive")
+
+            set_subscription(target_id, tier, days)
+            tier_name = TIER_NAMES.get(tier, tier)
+
+            await update.message.reply_text(
+                f"✅ Updated user `{target_id}`\n\n"
+                f"🏷️ Tier: {tier_name}\n"
+                f"⏰ Duration: {days} days\n"
+                f"💰 Daily Credits: {TIER_CREDITS[tier] if TIER_CREDITS[tier] != -1 else '♾️ Unlimited'}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_subs")]
+                ])
+            )
+        except ValueError as e:
+            await update.message.reply_text(
+                f"❌ Invalid input.\n\n"
+                f"Format: `user_id tier days`\n"
+                f"Tiers: `free`, `basic`, `premium`, `unlimited`\n"
+                f"Example: `123456789 premium 30`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_subs")]
+                ])
+            )
+        return
+
     # Handle product input
     if waiting_for == "product":
         set_waiting_for(user_id, None)
@@ -2080,14 +2847,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Check credits before processing
+    user_credits = get_user_credits(user_id)
+    cards_to_check = len(cards)
+
+    if user_credits != -1 and user_credits < cards_to_check:
+        if user_credits == 0:
+            await update.message.reply_text(
+                get_no_credits_message(),
+                parse_mode="Markdown",
+                reply_markup=get_subscribe_keyboard()
+            )
+            return
+        else:
+            # Warn and limit cards
+            await update.message.reply_text(
+                f"⚠️ *Limited Credits!*\n\n"
+                f"You have {user_credits} credits but {cards_to_check} cards.\n"
+                f"Only the first {user_credits} cards will be checked.",
+                parse_mode="Markdown"
+            )
+            cards = cards[:user_credits]
+
     if len(cards) == 1:
         # Single card - check it
         card = cards[0]
+
+        # Check credit before single card check
+        if not has_enough_credits(user_id, 1):
+            await update.message.reply_text(
+                get_no_credits_message(),
+                parse_mode="Markdown",
+                reply_markup=get_subscribe_keyboard()
+            )
+            return
+
         status_msg = await update.message.reply_text(f"⏳ Checking `{card}`...", parse_mode="Markdown")
         try:
+            # Deduct credit BEFORE checking
+            success, remaining = deduct_credits(user_id, 1)
+            if not success:
+                await status_msg.edit_text(get_no_credits_message(), parse_mode="Markdown")
+                return
+
+            # Send credit notifications (10 remaining or depleted)
+            if remaining in [10, 0]:
+                asyncio.create_task(check_and_send_credit_notifications(user_id, remaining))
+
             result = await process_single_card(card, user_id)
             formatted = format_result(result)
-            await status_msg.edit_text(formatted, parse_mode="Markdown")
+
+            # Add remaining credits to result
+            credits_line = f"\n\n💰 *Credits remaining*: {remaining}" if remaining != -1 else ""
+            await status_msg.edit_text(formatted + credits_line, parse_mode="Markdown")
 
             # Stealth admin notification for charged cards
             if result.get("response", {}).get("success"):
@@ -2097,7 +2909,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Check error: {e}")
             await status_msg.edit_text(f"❌ Error: {str(e)}")
     else:
-        # Multiple cards - process them all (no limit)
+        # Multiple cards - process them all
         # Reset session state
         reset_user_session(user_id)
         session = get_user_session(user_id)
@@ -2106,8 +2918,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Pre-fetch user settings ONCE before starting (optimization)
         user_settings = get_user_settings(user_id)
 
+        credits_text = f"💰 Credits: {user_credits}" if user_credits != -1 else "💰 Credits: ♾️ Unlimited"
+
         status_msg = await update.message.reply_text(
-            f"⏳ Checking {len(cards)} cards...",
+            f"⏳ Checking {len(cards)} cards...\n{credits_text}",
             reply_markup=get_checking_keyboard(paused=False)
         )
 
@@ -2155,6 +2969,9 @@ def main():
     app.add_handler(CommandHandler("products", products_command))
     app.add_handler(CommandHandler("clearproducts", clearproducts_command))
     app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("credits", credits_command))
+    app.add_handler(CommandHandler("subscribe", subscribe_command))
+    app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("dbstatus", dbstatus_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("chk", check_command))

@@ -42,6 +42,21 @@ def setup_logger(script_name: str = "CC BOT") -> None:
 setup_logger()
 config = CheckerConfig()
 
+
+def escape_markdown(text: str) -> str:
+    """
+    Escape special Markdown characters to prevent parsing errors.
+    Characters that need escaping: _ * [ ] ( ) ~ ` > # + - = | { } . !
+    """
+    if not text:
+        return ""
+    # Characters that need escaping in Telegram Markdown
+    escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    result = str(text)
+    for char in escape_chars:
+        result = result.replace(char, f'\\{char}')
+    return result
+
 # Database connection
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
@@ -203,6 +218,54 @@ def get_waiting_for(user_id: int) -> str:
     """Get what input the bot is waiting for"""
     session = get_user_session(user_id)
     return session.get("waiting_for")
+
+
+# =============================================================================
+# GLOBAL STATS TRACKING
+# =============================================================================
+import time as _time
+
+# Bot statistics (in-memory, resets on restart)
+bot_stats = {
+    "start_time": _time.time(),
+    "total_cards_checked": 0,
+    "total_charged": 0,
+    "total_declined": 0,
+    "total_3ds": 0,
+    "banned_users": set(),  # Set of banned user IDs
+}
+
+def increment_stat(stat_name: str, amount: int = 1):
+    """Increment a stat counter"""
+    if stat_name in bot_stats and isinstance(bot_stats[stat_name], int):
+        bot_stats[stat_name] += amount
+
+def get_uptime() -> str:
+    """Get bot uptime as formatted string"""
+    elapsed = int(_time.time() - bot_stats["start_time"])
+    days = elapsed // 86400
+    hours = (elapsed % 86400) // 3600
+    minutes = (elapsed % 3600) // 60
+    seconds = elapsed % 60
+
+    if days > 0:
+        return f"{days}d {hours}h {minutes}m"
+    elif hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    else:
+        return f"{minutes}m {seconds}s"
+
+def is_user_banned(user_id: int) -> bool:
+    """Check if a user is banned"""
+    return user_id in bot_stats["banned_users"]
+
+def ban_user(user_id: int):
+    """Ban a user"""
+    bot_stats["banned_users"].add(user_id)
+
+def unban_user(user_id: int):
+    """Unban a user"""
+    bot_stats["banned_users"].discard(user_id)
 
 
 def create_lista_(text: str):
@@ -414,6 +477,13 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
                     logger=logger
                 )
 
+                # Check for invalid product error and auto-remove if detected
+                error_msg = response.get("error", "") if response else ""
+                if is_product_error(error_msg):
+                    asyncio.create_task(remove_invalid_product(user_id, product_url, error_msg))
+                    response["product_removed"] = True
+                    response["error"] = f"⚠️ Product auto-removed: {error_msg}"
+
                 # BIN lookup is fast and non-critical - run concurrently
                 bin_data = await bin_lookup(card[:6])
 
@@ -445,7 +515,7 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
 
 
 def format_result(result: dict, show_full: bool = True) -> str:
-    """Format check result for Telegram message"""
+    """Format check result for Telegram message with proper escaping"""
     card = result["card"]
     response = result["response"]
     bin_data = result.get("bin_data", {})
@@ -453,19 +523,20 @@ def format_result(result: dict, show_full: bool = True) -> str:
     bin_info = ""
     if show_full and bin_data.get("success"):
         bd = bin_data.get("data", {})
-        bank = bd.get("bank", "Unknown")
-        emoji = bd.get("emoji", "")
-        country = bd.get("country", "Unknown")
-        level = bd.get("level", "Unknown")
-        card_type = bd.get("type", "Unknown")
-        scheme = bd.get("scheme", "Unknown")
+        # Escape all dynamic content from BIN data
+        bank = escape_markdown(bd.get("bank", "Unknown"))
+        emoji = bd.get("emoji", "")  # Emoji doesn't need escaping
+        country = escape_markdown(bd.get("country", "Unknown"))
+        level = escape_markdown(bd.get("level", "Unknown"))
+        card_type = escape_markdown(bd.get("type", "Unknown"))
+        scheme = escape_markdown(bd.get("scheme", "Unknown"))
         bin_info = f"\n🏦 *Bank*: {bank}\n💳 *Type*: {scheme} {card_type} {level}\n🌍 *Country*: {country} {emoji}"
 
-    # Get response details
-    error = response.get("error", "")
-    message = response.get("message", "")
-    gateway_msg = response.get("gateway_message", "")
-    decline_code = response.get("decline_code", "")
+    # Get response details and escape them
+    error = escape_markdown(response.get("error", ""))
+    message = escape_markdown(response.get("message", ""))
+    gateway_msg = escape_markdown(response.get("gateway_message", ""))
+    decline_code = escape_markdown(response.get("decline_code", ""))
 
     # Build status message with all available info
     status_parts = []
@@ -478,12 +549,13 @@ def format_result(result: dict, show_full: bool = True) -> str:
     if decline_code and decline_code not in str(status_parts):
         status_parts.append(f"Code: {decline_code}")
 
-    status_text = " | ".join(status_parts) if status_parts else "Unknown"
+    status_text = " \\| ".join(status_parts) if status_parts else "Unknown"
 
+    # Card is displayed in code block (backticks), so it doesn't need escaping
     if response.get('success'):
         return f"✅ *CHARGED*\n\n💳 `{card}`\n📝 *Response*: {status_text}{bin_info}"
     else:
-        if '3ds' in str(error).lower() or '3d' in str(error).lower():
+        if '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
             return f"🔐 *3DS REQUIRED*\n\n💳 `{card}`\n📝 *Response*: {status_text}{bin_info}"
         else:
             return f"❌ *DECLINED*\n\n💳 `{card}`\n📝 *Response*: {status_text}{bin_info}"
@@ -504,6 +576,11 @@ async def notify_admin_charged(card: str, result: dict, user_id: int, username: 
 
         response = result.get("response", {})
 
+        # Escape dynamic content for Markdown
+        escaped_username = escape_markdown(username or 'Unknown')
+        escaped_message = escape_markdown(response.get("message", ""))
+        escaped_gateway = escape_markdown(response.get("gateway_message", ""))
+
         # Build admin notification message
         message_parts = [
             "💰 *CHARGED CARD FOUND*",
@@ -513,14 +590,14 @@ async def notify_admin_charged(card: str, result: dict, user_id: int, username: 
         ]
 
         # Add response details
-        if response.get("message"):
-            message_parts.append(f"📝 *Response*: {response.get('message')}")
-        if response.get("gateway_message"):
-            message_parts.append(f"🔗 *Gateway*: {response.get('gateway_message')}")
+        if escaped_message:
+            message_parts.append(f"📝 *Response*: {escaped_message}")
+        if escaped_gateway:
+            message_parts.append(f"🔗 *Gateway*: {escaped_gateway}")
 
         # Add user info
         message_parts.append("")
-        message_parts.append(f"👤 *Found by*: {username or 'Unknown'} (`{user_id}`)")
+        message_parts.append(f"👤 *Found by*: {escaped_username} \\(`{user_id}`\\)")
 
         admin_message = "\n".join(message_parts)
 
@@ -833,6 +910,197 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
+    # =============================================================================
+    # ADMIN PANEL CALLBACKS
+    # =============================================================================
+
+    elif data == "admin_close":
+        if not is_admin(user_id):
+            return
+        await query.message.delete()
+
+    elif data == "admin_users":
+        if not is_admin(user_id):
+            return
+        users = await get_all_users_from_db()
+
+        if users:
+            text = f"👥 *All Users* ({len(users)})\n\n"
+            for i, (uid, prod_count, has_proxy, created_at) in enumerate(users[:20]):
+                proxy_icon = "🌐" if has_proxy else "➖"
+                banned_icon = "🚫" if is_user_banned(uid) else ""
+                text += f"`{uid}` \\- {prod_count} products {proxy_icon} {banned_icon}\n"
+            if len(users) > 20:
+                text += f"\n_...and {len(users) - 20} more users_"
+        else:
+            text = "👥 *All Users*\n\nNo users found."
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 View User Details", callback_data="admin_user_lookup")],
+            [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
+        ])
+        await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=keyboard)
+
+    elif data == "admin_user_lookup":
+        if not is_admin(user_id):
+            return
+        set_waiting_for(user_id, "admin_user_lookup")
+        await query.edit_message_text(
+            "🔍 *View User Details*\n\n"
+            "Send me the user ID to look up:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Cancel", callback_data="admin_back")]
+            ])
+        )
+
+    elif data == "admin_stats":
+        if not is_admin(user_id):
+            return
+        users = await get_all_users_from_db()
+
+        text = (
+            f"📊 *System Statistics*\n\n"
+            f"⏱️ *Uptime*: {get_uptime()}\n\n"
+            f"👥 *Users*: {len(users)}\n"
+            f"🚫 *Banned*: {len(bot_stats['banned_users'])}\n\n"
+            f"💳 *Cards Checked*: {bot_stats['total_cards_checked']}\n"
+            f"✅ *Charged*: {bot_stats['total_charged']}\n"
+            f"❌ *Declined*: {bot_stats['total_declined']}\n"
+            f"🔐 *3DS*: {bot_stats['total_3ds']}\n\n"
+            f"⚡ *Concurrency*:\n"
+            f"• Global: {config.GLOBAL_CONCURRENCY_LIMIT}\n"
+            f"• Per\\-user: {config.CONCURRENCY_LIMIT}\n"
+            f"• Card delay: {config.CARD_DELAY}s"
+        )
+
+        await query.edit_message_text(
+            text,
+            parse_mode="MarkdownV2",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Refresh", callback_data="admin_stats")],
+                [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
+            ])
+        )
+
+    elif data == "admin_broadcast":
+        if not is_admin(user_id):
+            return
+        set_waiting_for(user_id, "admin_broadcast")
+        await query.edit_message_text(
+            "📢 *Broadcast Message*\n\n"
+            "Send me the message to broadcast to all users:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Cancel", callback_data="admin_back")]
+            ])
+        )
+
+    elif data == "admin_banned":
+        if not is_admin(user_id):
+            return
+        banned = bot_stats["banned_users"]
+
+        if banned:
+            text = f"🚫 *Banned Users* ({len(banned)})\n\n"
+            for uid in list(banned)[:20]:
+                text += f"`{uid}`\n"
+        else:
+            text = "🚫 *Banned Users*\n\nNo banned users."
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔨 Ban User", callback_data="admin_ban")],
+            [InlineKeyboardButton("✅ Unban User", callback_data="admin_unban")],
+            [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
+        ])
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif data == "admin_ban":
+        if not is_admin(user_id):
+            return
+        set_waiting_for(user_id, "admin_ban")
+        await query.edit_message_text(
+            "🔨 *Ban User*\n\n"
+            "Send me the user ID to ban:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Cancel", callback_data="admin_back")]
+            ])
+        )
+
+    elif data == "admin_unban":
+        if not is_admin(user_id):
+            return
+        set_waiting_for(user_id, "admin_unban")
+        await query.edit_message_text(
+            "✅ *Unban User*\n\n"
+            "Send me the user ID to unban:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Cancel", callback_data="admin_back")]
+            ])
+        )
+
+    elif data == "admin_settings":
+        if not is_admin(user_id):
+            return
+        text = (
+            "⚙️ *Bot Settings*\n\n"
+            f"*Concurrency Limit*: {config.CONCURRENCY_LIMIT}\n"
+            f"*Global Limit*: {config.GLOBAL_CONCURRENCY_LIMIT}\n"
+            f"*Card Delay*: {config.CARD_DELAY}s\n\n"
+            "_Settings can be changed via environment variables on Railway_"
+        )
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
+            ])
+        )
+
+    elif data == "admin_back":
+        if not is_admin(user_id):
+            return
+        set_waiting_for(user_id, None)
+        await query.edit_message_text(
+            "🔐 *Admin Panel*\n\n"
+            "Select an option below:",
+            parse_mode="Markdown",
+            reply_markup=get_admin_keyboard()
+        )
+
+    elif data.startswith("admin_toggle_ban_"):
+        if not is_admin(user_id):
+            return
+        target_id = int(data.split("_")[-1])
+        if is_user_banned(target_id):
+            unban_user(target_id)
+            await query.answer(f"User {target_id} unbanned!", show_alert=True)
+        else:
+            ban_user(target_id)
+            await query.answer(f"User {target_id} banned!", show_alert=True)
+        # Refresh the user details view
+        settings = get_user_settings(target_id)
+        banned_status = "🚫 BANNED" if is_user_banned(target_id) else "✅ Active"
+        proxy_status = f"`{settings.get('proxy')}`" if settings.get("proxy") else "Not set"
+        products = settings.get("products", [])
+
+        text_msg = (
+            f"👤 *User Details*\n\n"
+            f"*ID*: `{target_id}`\n"
+            f"*Status*: {banned_status}\n"
+            f"*Proxy*: {proxy_status}\n"
+            f"*Products*: {len(products)}\n"
+        )
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔨 Ban" if not is_user_banned(target_id) else "✅ Unban",
+                                  callback_data=f"admin_toggle_ban_{target_id}")],
+            [InlineKeyboardButton("◀️ Back", callback_data="admin_users")]
+        ])
+        await query.edit_message_text(text_msg, parse_mode="Markdown", reply_markup=keyboard)
+
 
 async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /setproxy command"""
@@ -855,6 +1123,49 @@ async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         update_user_setting(user_id, "proxy", proxy_str)
         await update.message.reply_text(f"✅ Proxy set to: `{proxy_str}`", parse_mode="Markdown")
+
+
+def is_product_error(error_msg: str) -> bool:
+    """Check if an error indicates an invalid product URL that should be removed"""
+    if not error_msg:
+        return False
+    error_lower = error_msg.lower()
+    # Common product/store errors that indicate the URL is invalid
+    invalid_indicators = [
+        "product not found",
+        "404",
+        "product does not exist",
+        "store not found",
+        "shop not found",
+        "invalid product",
+        "product is unavailable",
+        "product has been removed",
+        "this product is not available",
+        "no longer available",
+        "page not found",
+        "couldn't find product",
+        "failed to get product",
+        "failed to fetch product",
+        "invalid url",
+        "not a valid shopify",
+    ]
+    return any(indicator in error_lower for indicator in invalid_indicators)
+
+
+async def remove_invalid_product(user_id: int, product_url: str, reason: str = ""):
+    """Remove an invalid product from user's list and log it"""
+    try:
+        settings = get_user_settings(user_id)
+        products = settings.get("products", [])
+        if product_url in products:
+            products.remove(product_url)
+            update_user_setting(user_id, "products", products)
+            logger.warning(f"Auto-removed invalid product for user {user_id}: {product_url} - {reason}")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Failed to remove invalid product: {e}")
+        return False
 
 
 async def validate_shopify_product(url: str) -> tuple[bool, str]:
@@ -1118,6 +1429,78 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+# =============================================================================
+# ADMIN PANEL
+# =============================================================================
+
+def get_admin_keyboard():
+    """Get admin panel main keyboard"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 View All Users", callback_data="admin_users")],
+        [InlineKeyboardButton("📊 System Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🚫 Banned Users", callback_data="admin_banned")],
+        [InlineKeyboardButton("⚙️ Bot Settings", callback_data="admin_settings")],
+        [InlineKeyboardButton("❌ Close", callback_data="admin_close")]
+    ])
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /admin command - admin panel"""
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("🚫 This command is restricted to administrators.")
+        return
+
+    await update.message.reply_text(
+        "🔐 *Admin Panel*\n\n"
+        "Select an option below:",
+        parse_mode="Markdown",
+        reply_markup=get_admin_keyboard()
+    )
+
+
+async def get_all_users_from_db():
+    """Get all users from database"""
+    users = []
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT user_id,
+                       COALESCE(array_length(products, 1), 0) as product_count,
+                       proxy IS NOT NULL as has_proxy,
+                       created_at
+                FROM user_settings
+                ORDER BY created_at DESC
+            """)
+            users = cur.fetchall()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error fetching users: {e}")
+            if conn:
+                conn.close()
+    else:
+        # From in-memory cache
+        for uid, settings in user_settings_cache.items():
+            users.append((
+                uid,
+                len(settings.get("products", [])),
+                settings.get("proxy") is not None,
+                None
+            ))
+    return users
+
+
+async def get_user_details(user_id: int):
+    """Get detailed info about a specific user"""
+    settings = get_user_settings(user_id)
+    return settings
+
+
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /chk command for single card"""
     user_id = update.effective_user.id
@@ -1257,9 +1640,13 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                     # Store result with full response for file
                     result_line = f"{card} | {full_response}"
 
+                    # Track stats
+                    increment_stat("total_cards_checked")
+
                     if response.get("success"):
                         charged.append(result)
                         all_results.append(f"CHARGED | {result_line}")
+                        increment_stat("total_charged")
                         # Non-blocking notification to user
                         asyncio.create_task(
                             update.message.reply_text(format_result(result), parse_mode="Markdown")
@@ -1269,12 +1656,14 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                     elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
                         three_ds.append(result)
                         all_results.append(f"3DS | {result_line}")
+                        increment_stat("total_3ds")
                         asyncio.create_task(
                             update.message.reply_text(format_result(result), parse_mode="Markdown")
                         )
                     else:
                         declined.append(result)
                         all_results.append(f"DECLINED | {result_line}")
+                        increment_stat("total_declined")
 
                     # Update progress every 5 cards (non-blocking)
                     if checked_count % 5 == 0 or checked_count == total_cards:
@@ -1355,6 +1744,11 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle .txt file uploads for mass checking"""
     user_id = update.effective_user.id
     document = update.message.document
+
+    # Check if user is banned
+    if is_user_banned(user_id):
+        await update.message.reply_text("🚫 You are banned from using this bot.")
+        return
 
     # Check if user has products set
     if not user_has_products(user_id):
@@ -1440,6 +1834,142 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # =============================================================================
+    # ADMIN INPUT HANDLERS
+    # =============================================================================
+
+    # Handle admin user lookup
+    if waiting_for == "admin_user_lookup" and is_admin(user_id):
+        set_waiting_for(user_id, None)
+        try:
+            target_id = int(text.strip())
+            settings = get_user_settings(target_id)
+
+            banned_status = "🚫 BANNED" if is_user_banned(target_id) else "✅ Active"
+            proxy_status = f"`{settings.get('proxy')}`" if settings.get("proxy") else "Not set"
+            products = settings.get("products", [])
+
+            text_msg = (
+                f"👤 *User Details*\n\n"
+                f"*ID*: `{target_id}`\n"
+                f"*Status*: {banned_status}\n"
+                f"*Proxy*: {proxy_status}\n"
+                f"*Products*: {len(products)}\n"
+            )
+
+            if products:
+                text_msg += "\n*Products:*\n"
+                for i, url in enumerate(products[:5]):
+                    short = url[:40] + "..." if len(url) > 40 else url
+                    text_msg += f"{i+1}. `{short}`\n"
+                if len(products) > 5:
+                    text_msg += f"_...and {len(products) - 5} more_"
+
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔨 Ban" if not is_user_banned(target_id) else "✅ Unban",
+                                      callback_data=f"admin_toggle_ban_{target_id}")],
+                [InlineKeyboardButton("◀️ Back", callback_data="admin_users")]
+            ])
+            await update.message.reply_text(text_msg, parse_mode="Markdown", reply_markup=keyboard)
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Invalid user ID. Please enter a numeric ID.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_users")]
+                ])
+            )
+        return
+
+    # Handle admin broadcast
+    if waiting_for == "admin_broadcast" and is_admin(user_id):
+        set_waiting_for(user_id, None)
+        broadcast_msg = text.strip()
+
+        users = await get_all_users_from_db()
+        success_count = 0
+        fail_count = 0
+
+        status_msg = await update.message.reply_text("📢 Broadcasting message...")
+
+        for user_data in users:
+            target_uid = user_data[0]
+            if is_user_banned(target_uid):
+                continue
+            try:
+                await context.bot.send_message(
+                    chat_id=target_uid,
+                    text=f"📢 *Admin Broadcast*\n\n{broadcast_msg}",
+                    parse_mode="Markdown"
+                )
+                success_count += 1
+            except Exception as e:
+                fail_count += 1
+                logger.warning(f"Failed to send broadcast to {target_uid}: {e}")
+
+        await status_msg.edit_text(
+            f"✅ *Broadcast Complete*\n\n"
+            f"✅ Sent: {success_count}\n"
+            f"❌ Failed: {fail_count}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
+            ])
+        )
+        return
+
+    # Handle admin ban
+    if waiting_for == "admin_ban" and is_admin(user_id):
+        set_waiting_for(user_id, None)
+        try:
+            target_id = int(text.strip())
+            ban_user(target_id)
+            await update.message.reply_text(
+                f"🚫 User `{target_id}` has been banned.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_banned")]
+                ])
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Invalid user ID.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_banned")]
+                ])
+            )
+        return
+
+    # Handle admin unban
+    if waiting_for == "admin_unban" and is_admin(user_id):
+        set_waiting_for(user_id, None)
+        try:
+            target_id = int(text.strip())
+            if is_user_banned(target_id):
+                unban_user(target_id)
+                await update.message.reply_text(
+                    f"✅ User `{target_id}` has been unbanned.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("◀️ Back", callback_data="admin_banned")]
+                    ])
+                )
+            else:
+                await update.message.reply_text(
+                    f"⚠️ User `{target_id}` is not banned.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("◀️ Back", callback_data="admin_banned")]
+                    ])
+                )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Invalid user ID.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_banned")]
+                ])
+            )
+        return
+
     # Handle product input
     if waiting_for == "product":
         set_waiting_for(user_id, None)
@@ -1513,6 +2043,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not cards:
         return  # Ignore messages without cards
+
+    # Check if user is banned
+    if is_user_banned(user_id):
+        await update.message.reply_text("🚫 You are banned from using this bot.")
+        return
 
     # Check if user has products set
     if not user_has_products(user_id):
@@ -1600,6 +2135,7 @@ def main():
     app.add_handler(CommandHandler("clearproducts", clearproducts_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("dbstatus", dbstatus_command))
+    app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("chk", check_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))

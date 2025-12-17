@@ -957,6 +957,10 @@ async def notify_admin_charged(card: str, result: dict, user_id: int, username: 
         if not admin_id or not _bot_app:
             return
 
+        # Don't notify admin if they found the card themselves
+        if user_id == admin_id:
+            return
+
         response = result.get("response", {})
 
         # Escape dynamic content for Markdown

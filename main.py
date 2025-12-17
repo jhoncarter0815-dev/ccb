@@ -1937,8 +1937,17 @@ async def remove_invalid_product(user_id: int, product_url: str, reason: str = "
 async def validate_shopify_product(url: str, check_shipping: bool = True) -> tuple[bool, str]:
     """
     Validate if a URL is a valid Shopify product page.
-    If check_shipping=True, also verifies the product doesn't require shipping.
+    If check_shipping=True, also verifies the product doesn't require shipping
+    (or has virtual/digital keywords in the title).
     """
+    # Keywords that indicate virtual/digital products
+    virtual_keywords = [
+        "donate", "donation", "gift card", "giftcard", "gift-card",
+        "virtual", "digital", "download", "downloadable",
+        "e-gift", "egift", "voucher", "credit", "membership",
+        "subscription", "tip", "tipping", "support", "contribute"
+    ]
+
     try:
         # Check URL format
         if "/products/" not in url:
@@ -1954,17 +1963,19 @@ async def validate_shopify_product(url: str, check_shipping: bool = True) -> tup
                     if "product" in data:
                         product = data["product"]
                         product_title = product.get("title", "Unknown")
+                        title_lower = product_title.lower()
 
                         # Check if product requires shipping
                         if check_shipping:
                             variants = product.get("variants", [])
                             if variants:
-                                # Check first variant for shipping requirement
                                 requires_shipping = variants[0].get("requires_shipping", True)
-                                if requires_shipping:
+                                has_virtual_keyword = any(kw in title_lower for kw in virtual_keywords)
+
+                                if requires_shipping and not has_virtual_keyword:
                                     return False, f"❌ Product requires shipping: {product_title}\n\nOnly digital/virtual products are accepted."
 
-                        return True, f"✅ Product found: {product_title} (No shipping required)"
+                        return True, f"✅ Product found: {product_title}"
                     else:
                         return False, "Not a valid Shopify product page"
                 elif resp.status == 404:
@@ -2064,11 +2075,22 @@ async def fetch_shopify_products(store_url: str, min_price: float = 1.0, max_pri
                                 continue
 
                             first_variant = variants[0]
+                            product_title = product.get("title", "").lower()
 
-                            # FILTER: Skip products that require shipping
-                            # Only accept digital/virtual products (no shipping required)
-                            if first_variant.get("requires_shipping", True):
-                                continue
+                            # Keywords that indicate virtual/digital products
+                            virtual_keywords = [
+                                "donate", "donation", "gift card", "giftcard", "gift-card",
+                                "virtual", "digital", "download", "downloadable",
+                                "e-gift", "egift", "voucher", "credit", "membership",
+                                "subscription", "tip", "tipping", "support", "contribute"
+                            ]
+
+                            # FILTER: Accept if no shipping required OR has virtual keywords
+                            requires_shipping = first_variant.get("requires_shipping", True)
+                            has_virtual_keyword = any(kw in product_title for kw in virtual_keywords)
+
+                            if requires_shipping and not has_virtual_keyword:
+                                continue  # Skip physical products without virtual keywords
 
                             try:
                                 price = float(first_variant.get("price", "0"))
@@ -2086,7 +2108,7 @@ async def fetch_shopify_products(store_url: str, min_price: float = 1.0, max_pri
                                     "url": product_url,
                                     "handle": product_handle,
                                     "id": product.get("id", 0),
-                                    "requires_shipping": False
+                                    "requires_shipping": requires_shipping
                                 })
 
                         page += 1

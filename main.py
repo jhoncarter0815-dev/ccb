@@ -1322,6 +1322,90 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
+    # Retry failed cards (captcha/network errors)
+    elif data == "retry_failed":
+        session = get_user_session(user_id)
+        retriable_cards = session.get("retriable_cards", [])
+
+        if not retriable_cards:
+            await query.edit_message_text(
+                "❌ No cards to retry.",
+                parse_mode="Markdown",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+
+        # Check if user is currently checking
+        if session.get("checking"):
+            await query.answer("⏳ Already checking cards!", show_alert=True)
+            return
+
+        # Check if user has products set
+        if not user_has_products(user_id):
+            await query.edit_message_text(
+                "❌ *No product set!*\n\n"
+                "Use the menu to add a product first.",
+                parse_mode="Markdown",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+
+        # Check credits
+        user_credits = get_user_credits(user_id)
+        cards_to_check = len(retriable_cards)
+
+        if user_credits != -1 and user_credits < cards_to_check:
+            if user_credits == 0:
+                await query.edit_message_text(
+                    get_no_credits_message(),
+                    parse_mode="Markdown",
+                    reply_markup=get_subscribe_keyboard()
+                )
+                return
+            else:
+                # Limit to available credits
+                retriable_cards = retriable_cards[:user_credits]
+                cards_to_check = len(retriable_cards)
+
+        # Clear the retriable cards from session
+        session["retriable_cards"] = []
+
+        # Reset session for new check
+        reset_user_session(user_id)
+        session = get_user_session(user_id)
+        session["checking"] = True
+
+        # Pre-fetch user settings
+        user_settings = get_user_settings(user_id)
+
+        # Show credits in status
+        credits_text = f"💰 Credits: {user_credits}" if user_credits != -1 else "💰 Credits: ♾️ Unlimited"
+
+        await query.edit_message_text(
+            f"🔄 *Retrying Failed Cards*\n\n"
+            f"💳 Cards to retry: {cards_to_check}\n"
+            f"{credits_text}\n"
+            f"⏳ Starting retry...",
+            parse_mode="Markdown",
+            reply_markup=get_checking_keyboard(paused=False)
+        )
+
+        # Use the query message for status updates
+        status_msg = query.message
+
+        # Create a fake update object for run_batch_check
+        class FakeUpdate:
+            def __init__(self, message, user):
+                self.message = message
+                self.effective_user = user
+
+        fake_update = FakeUpdate(query.message, query.from_user)
+
+        # Run the retry as a background task
+        asyncio.create_task(
+            run_batch_check(retriable_cards, user_id, user_settings, session, status_msg, fake_update)
+        )
+
     # =============================================================================
     # ADMIN PANEL CALLBACKS
     # =============================================================================
@@ -2575,6 +2659,29 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Error: {str(e)}")
 
 
+# Errors that should trigger retry
+RETRIABLE_ERRORS = [
+    "captcha",
+    "timeout",
+    "proxy",
+    "network",
+    "connection",
+    "curl",
+    "client",
+    "failed to connect",
+    "failed to initialize",
+    "processing error",
+]
+
+
+def is_retriable_error(error_msg: str) -> bool:
+    """Check if an error is retriable (captcha, network, timeout, etc.)"""
+    if not error_msg:
+        return False
+    error_lower = error_msg.lower()
+    return any(err in error_lower for err in RETRIABLE_ERRORS)
+
+
 async def run_batch_check(cards: list, user_id: int, user_settings: dict, session: dict, status_msg, update: Update):
     """
     Run batch card checking as a background task.
@@ -2583,6 +2690,7 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
     charged = []
     declined = []
     three_ds = []
+    retriable = []  # Cards that failed due to captcha/network/timeout
     all_results = []
     last_response = ""
     checked_count = 0
@@ -2710,6 +2818,10 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                         asyncio.create_task(
                             update.message.reply_text(format_result(result), parse_mode="Markdown")
                         )
+                    elif is_retriable_error(full_response):
+                        # Captcha, timeout, network errors - save for retry
+                        retriable.append(card)
+                        all_results.append(f"RETRY | {result_line}")
                     else:
                         declined.append(result)
                         all_results.append(f"DECLINED | {result_line}")
@@ -2721,6 +2833,7 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                             progress_bar = create_progress_bar(checked_count, total_cards)
                             pause_status = "⏸️ *PAUSED*\n\n" if session["paused"] else ""
                             credits_display = f"💰 Credits: {remaining_credits}" if remaining_credits != -1 else "💰 Credits: ♾️"
+                            retry_text = f"🔄 Retry: {len(retriable)}\n" if retriable else ""
                             asyncio.create_task(status_msg.edit_text(
                                 f"{pause_status}⏳ *Checking Cards...*\n\n"
                                 f"{progress_bar}\n"
@@ -2728,7 +2841,8 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                                 f"{credits_display}\n\n"
                                 f"✅ Charged: {len(charged)}\n"
                                 f"🔐 3DS: {len(three_ds)}\n"
-                                f"❌ Declined: {len(declined)}\n\n"
+                                f"❌ Declined: {len(declined)}\n"
+                                f"{retry_text}\n"
                                 f"💬 *Last*: `{last_response}`",
                                 parse_mode="Markdown",
                                 reply_markup=get_checking_keyboard(paused=session["paused"])
@@ -2750,18 +2864,38 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
         # Reset session
         session["checking"] = False
 
+        # Store retriable cards in session for retry
+        if retriable:
+            session["retriable_cards"] = retriable
+        else:
+            session["retriable_cards"] = []
+
         # Final summary
         stop_text = "⏹️ *STOPPED* - " if was_stopped else ""
+        retry_text = f"🔄 Retry Available: {len(retriable)}\n" if retriable else ""
         summary = (
             f"{stop_text}📊 *FINAL RESULTS*\n\n"
             f"✅ Charged: {len(charged)}\n"
             f"🔐 3DS: {len(three_ds)}\n"
             f"❌ Declined: {len(declined)}\n"
+            f"{retry_text}"
             f"📝 Checked: {checked_count}/{total_cards}"
         )
 
+        # Build keyboard with retry button if there are retriable cards
+        final_keyboard = None
+        if retriable:
+            final_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🔄 Retry {len(retriable)} Failed Cards", callback_data="retry_failed")],
+                [InlineKeyboardButton("🏠 Menu", callback_data="menu_main")]
+            ])
+        else:
+            final_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 Menu", callback_data="menu_main")]
+            ])
+
         try:
-            await status_msg.edit_text(summary, parse_mode="Markdown")
+            await status_msg.edit_text(summary, parse_mode="Markdown", reply_markup=final_keyboard)
         except Exception:
             pass
 
@@ -2773,7 +2907,7 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                 file_buffer.name = "results.txt"
                 await update.message.reply_document(
                     document=file_buffer,
-                    caption=f"📊 Results: {len(charged)} Charged | {len(three_ds)} 3DS | {len(declined)} Declined | {checked_count}/{total_cards} checked"
+                    caption=f"📊 Results: {len(charged)} Charged | {len(three_ds)} 3DS | {len(declined)} Declined | {len(retriable)} Retry | {checked_count}/{total_cards} checked"
                 )
             except Exception as e:
                 logger.error(f"Failed to send results file: {e}")
@@ -2790,6 +2924,19 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                 )
             except Exception as e:
                 logger.error(f"Failed to send charged cards file: {e}")
+
+        # Send retriable cards separately if any
+        if retriable:
+            try:
+                retriable_text = "\n".join(retriable)
+                file_buffer = io.BytesIO(retriable_text.encode('utf-8'))
+                file_buffer.name = "retry_cards.txt"
+                await update.message.reply_document(
+                    document=file_buffer,
+                    caption=f"🔄 {len(retriable)} Cards to Retry (Captcha/Network errors)"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send retry cards file: {e}")
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):

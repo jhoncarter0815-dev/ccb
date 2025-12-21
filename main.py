@@ -242,8 +242,29 @@ def get_user_settings(user_id: int) -> dict:
             conn.close()
 
             if row:
+                # Parse proxy - handle JSON list, string list representation, or single string
+                proxy_raw = row[0]
+                if proxy_raw:
+                    if isinstance(proxy_raw, list):
+                        proxy = proxy_raw
+                    elif proxy_raw.startswith('['):
+                        # JSON or string representation of list
+                        try:
+                            proxy = json.loads(proxy_raw)
+                        except:
+                            # Try ast.literal_eval for Python list string repr
+                            import ast
+                            try:
+                                proxy = ast.literal_eval(proxy_raw)
+                            except:
+                                proxy = proxy_raw  # fallback to string
+                    else:
+                        proxy = proxy_raw  # Single proxy string
+                else:
+                    proxy = None
+
                 return {
-                    "proxy": row[0],
+                    "proxy": proxy,
                     "products": row[1] if row[1] else [],
                     "email": row[2],
                     "is_shippable": row[3],
@@ -270,6 +291,11 @@ def save_user_settings(user_id: int, settings: dict) -> dict:
     conn = get_db_connection()
     if conn:
         try:
+            # Serialize proxy to JSON if it's a list
+            proxy_value = settings.get("proxy")
+            if isinstance(proxy_value, list):
+                proxy_value = json.dumps(proxy_value)
+
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO user_settings (user_id, proxy, products, email, is_shippable,
@@ -290,7 +316,7 @@ def save_user_settings(user_id: int, settings: dict) -> dict:
                     updated_at = CURRENT_TIMESTAMP
             """, (
                 user_id,
-                settings.get("proxy"),
+                proxy_value,
                 settings.get("products", []),
                 settings.get("email"),
                 settings.get("is_shippable", False),

@@ -2176,7 +2176,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📦 *Add Product*\n\n"
             "Send a Shopify product URL:\n"
             "`https://store.com/products/item`\n\n"
-            "Or send *multiple URLs* (one per line)\n\n"
+            "Or *paste text* containing product URLs:\n"
+            "```\nProduct URL: https://store.com/products/item\n"
+            "Response: CARD_DECLINED\n```\n\n"
+            "✅ Auto-extracts URLs from pasted text\n"
             "✅ Product must exist (404 = rejected)\n"
             "_🔄 Delivery errors auto-remove during checking_",
             parse_mode="Markdown",
@@ -5225,22 +5228,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if waiting_for == "product":
         set_waiting_for(user_id, None)
 
-        # Support multiple products - split by newline
-        raw_urls = [u.strip() for u in text.strip().split('\n') if u.strip()]
+        # Extract URLs from text - support both direct URLs and formatted text
+        # Pattern matches URLs containing /products/
+        import re
+        url_pattern = r'https?://[^\s<>"\']+/products/[^\s<>"\']*'
+        extracted_urls = re.findall(url_pattern, text)
 
-        if not raw_urls:
+        # Clean extracted URLs (remove trailing punctuation)
+        cleaned_urls = []
+        for url in extracted_urls:
+            # Remove trailing punctuation that might have been captured
+            url = url.rstrip('.,;:!?)>\'"')
+            if url and "/products/" in url:
+                cleaned_urls.append(url)
+
+        # If no URLs found via regex, fall back to line-by-line parsing
+        if not cleaned_urls:
+            raw_urls = [u.strip() for u in text.strip().split('\n') if u.strip()]
+            cleaned_urls = [u for u in raw_urls if "/products/" in u]
+
+        # Remove duplicates while preserving order
+        seen = set()
+        product_urls = []
+        for url in cleaned_urls:
+            if url not in seen:
+                seen.add(url)
+                product_urls.append(url)
+
+        if not product_urls:
             await update.message.reply_text(
-                "❌ *No product URL provided!*\n\n"
+                "❌ *No product URLs found!*\n\n"
                 "Send a product URL containing `/products/`\n"
-                "Or send multiple URLs (one per line)",
+                "Or paste text containing product URLs\n\n"
+                "Example:\n"
+                "`https://store.com/products/item`\n\n"
+                "Or paste formatted text like:\n"
+                "`Product URL: https://store.com/products/item`",
                 parse_mode="Markdown",
                 reply_markup=get_back_keyboard("menu_products")
             )
             return
-
-        # Filter to only valid-looking product URLs (must contain /products/)
-        product_urls = [u for u in raw_urls if "/products/" in u]
-        invalid_format = [u for u in raw_urls if "/products/" not in u]
 
         if not product_urls:
             await update.message.reply_text(

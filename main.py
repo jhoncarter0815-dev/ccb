@@ -1142,6 +1142,10 @@ def get_main_menu_keyboard(user_id: int = None):
         [InlineKeyboardButton("🌐 Proxy", callback_data="menu_proxy")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")],
         [InlineKeyboardButton("💳 Check Cards", callback_data="menu_check_info")],
+        [
+            InlineKeyboardButton("💰 Charged", callback_data="menu_charged_history"),
+            InlineKeyboardButton("🔐 3DS", callback_data="menu_3ds_history")
+        ],
     ]
     # Add admin panel button only for admins
     if user_id and is_admin(user_id):
@@ -1273,6 +1277,54 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Select an option below:",
             parse_mode="Markdown",
             reply_markup=get_admin_keyboard()
+        )
+
+    # Charged cards history (from menu button)
+    elif data == "menu_charged_history":
+        await query.edit_message_text(
+            "⏳ Fetching your charged cards history...",
+            parse_mode="Markdown"
+        )
+        # Send card history as a new message (file can't replace text message)
+        await send_card_history(
+            chat_id=query.message.chat_id,
+            bot=context.bot,
+            target_user_id=user_id,
+            card_type="charged"
+        )
+        # Update the original message with result info
+        total_count = get_card_history_count(user_id=user_id, card_type="charged")
+        await query.edit_message_text(
+            f"💰 *Charged Cards History*\n\n"
+            f"📊 Total: {total_count} cards\n\n"
+            f"_Check the file above for all cards._" if total_count > 0 else
+            f"💰 *Charged Cards History*\n\n_No charged cards found._",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu_main")]])
+        )
+
+    # 3DS cards history (from menu button)
+    elif data == "menu_3ds_history":
+        await query.edit_message_text(
+            "⏳ Fetching your 3DS cards history...",
+            parse_mode="Markdown"
+        )
+        # Send card history as a new message (file can't replace text message)
+        await send_card_history(
+            chat_id=query.message.chat_id,
+            bot=context.bot,
+            target_user_id=user_id,
+            card_type="3ds"
+        )
+        # Update the original message with result info
+        total_count = get_card_history_count(user_id=user_id, card_type="3ds")
+        await query.edit_message_text(
+            f"🔐 *3DS Cards History*\n\n"
+            f"📊 Total: {total_count} cards\n\n"
+            f"_Check the file above for all cards._" if total_count > 0 else
+            f"🔐 *3DS Cards History*\n\n_No 3DS cards found._",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu_main")]])
         )
 
     # Products menu
@@ -2406,6 +2458,52 @@ async def clearproducts_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("✅ All products cleared!")
 
 
+async def send_card_history(chat_id, bot, target_user_id: int, card_type: str, reply_to_message_id=None):
+    """
+    Helper function to send card history as a file.
+    Used by both commands and callback handlers.
+    card_type should be 'charged' or '3ds'
+    """
+    cards = get_card_history(user_id=target_user_id, card_type=card_type, limit=1000)
+    total_count = get_card_history_count(user_id=target_user_id, card_type=card_type)
+
+    emoji = "💰" if card_type == "charged" else "🔐"
+    type_label = "Charged" if card_type == "charged" else "3DS"
+
+    if not cards:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"📋 *{type_label} Cards History*\n\n"
+                 f"👤 User: `{target_user_id}`\n"
+                 f"{emoji} Total: 0 cards\n\n"
+                 f"_No {type_label.lower()} cards found._",
+            parse_mode="Markdown",
+            reply_to_message_id=reply_to_message_id
+        )
+        return
+
+    # Always send as file for all cards
+    results_text = []
+    for c in cards:
+        timestamp = c['found_at'].strftime('%Y-%m-%d %H:%M:%S') if c['found_at'] else 'Unknown'
+        line = f"{c['card']} | {timestamp}"
+        if c['response_message']:
+            line += f" | {c['response_message']}"
+        results_text.append(line)
+
+    file_content = "\n".join(results_text)
+    file_buffer = io.BytesIO(file_content.encode('utf-8'))
+    file_buffer.name = f"{card_type}_cards_{target_user_id}.txt"
+
+    await bot.send_document(
+        chat_id=chat_id,
+        document=file_buffer,
+        caption=f"{emoji} *{type_label} Cards History*\n\n👤 User: `{target_user_id}`\n📊 Total: {total_count} cards",
+        parse_mode="Markdown",
+        reply_to_message_id=reply_to_message_id
+    )
+
+
 async def getcharged_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handle /getcharged command - retrieve charged cards history.
@@ -2416,7 +2514,6 @@ async def getcharged_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     is_admin_user = is_admin(user_id)
 
     target_user_id = None
-    target_username = None
 
     # Parse arguments
     if context.args:
@@ -2424,7 +2521,6 @@ async def getcharged_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if arg.lower() == "me":
             target_user_id = user_id
-            target_username = update.effective_user.username or update.effective_user.first_name
         elif arg.startswith("@"):
             # Username provided - only admin can do this
             if not is_admin_user:
@@ -2445,58 +2541,15 @@ async def getcharged_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         # No args - get own cards
         target_user_id = user_id
-        target_username = update.effective_user.username or update.effective_user.first_name
 
-    # Get card history
-    status_msg = await update.message.reply_text("⏳ Fetching charged cards history...")
-
-    cards = get_card_history(user_id=target_user_id, card_type="charged", limit=500)
-    total_count = get_card_history_count(user_id=target_user_id, card_type="charged")
-
-    if not cards:
-        await status_msg.edit_text(
-            f"📋 *Charged Cards History*\n\n"
-            f"👤 User: `{target_user_id}`\n"
-            f"✅ Total: 0 cards\n\n"
-            f"_No charged cards found._",
-            parse_mode="Markdown"
-        )
-        return
-
-    # Build results
-    if len(cards) <= 10:
-        # Show inline for small results
-        card_list = "\n".join([
-            f"• `{c['card']}`\n  _{c['found_at'].strftime('%Y-%m-%d %H:%M') if c['found_at'] else 'Unknown'}_"
-            for c in cards
-        ])
-        await status_msg.edit_text(
-            f"✅ *Charged Cards History*\n\n"
-            f"👤 User: `{target_user_id}`\n"
-            f"📊 Total: {total_count} cards\n\n"
-            f"{card_list}",
-            parse_mode="Markdown"
-        )
-    else:
-        # Send as file for large results
-        results_text = []
-        for c in cards:
-            timestamp = c['found_at'].strftime('%Y-%m-%d %H:%M:%S') if c['found_at'] else 'Unknown'
-            line = f"{c['card']} | {timestamp}"
-            if c['response_message']:
-                line += f" | {c['response_message']}"
-            results_text.append(line)
-
-        file_content = "\n".join(results_text)
-        file_buffer = io.BytesIO(file_content.encode('utf-8'))
-        file_buffer.name = f"charged_cards_{target_user_id}.txt"
-
-        await status_msg.delete()
-        await update.message.reply_document(
-            document=file_buffer,
-            caption=f"✅ *Charged Cards History*\n\n👤 User: `{target_user_id}`\n📊 Total: {total_count} cards",
-            parse_mode="Markdown"
-        )
+    # Send card history
+    await send_card_history(
+        chat_id=update.effective_chat.id,
+        bot=context.bot,
+        target_user_id=target_user_id,
+        card_type="charged",
+        reply_to_message_id=update.message.message_id
+    )
 
 
 async def get3ds_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2534,54 +2587,14 @@ async def get3ds_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         target_user_id = user_id
 
-    # Get card history
-    status_msg = await update.message.reply_text("⏳ Fetching 3DS cards history...")
-
-    cards = get_card_history(user_id=target_user_id, card_type="3ds", limit=500)
-    total_count = get_card_history_count(user_id=target_user_id, card_type="3ds")
-
-    if not cards:
-        await status_msg.edit_text(
-            f"📋 *3DS Cards History*\n\n"
-            f"👤 User: `{target_user_id}`\n"
-            f"🔐 Total: 0 cards\n\n"
-            f"_No 3DS cards found._",
-            parse_mode="Markdown"
-        )
-        return
-
-    # Build results
-    if len(cards) <= 10:
-        card_list = "\n".join([
-            f"• `{c['card']}`\n  _{c['found_at'].strftime('%Y-%m-%d %H:%M') if c['found_at'] else 'Unknown'}_"
-            for c in cards
-        ])
-        await status_msg.edit_text(
-            f"🔐 *3DS Cards History*\n\n"
-            f"👤 User: `{target_user_id}`\n"
-            f"📊 Total: {total_count} cards\n\n"
-            f"{card_list}",
-            parse_mode="Markdown"
-        )
-    else:
-        results_text = []
-        for c in cards:
-            timestamp = c['found_at'].strftime('%Y-%m-%d %H:%M:%S') if c['found_at'] else 'Unknown'
-            line = f"{c['card']} | {timestamp}"
-            if c['response_message']:
-                line += f" | {c['response_message']}"
-            results_text.append(line)
-
-        file_content = "\n".join(results_text)
-        file_buffer = io.BytesIO(file_content.encode('utf-8'))
-        file_buffer.name = f"3ds_cards_{target_user_id}.txt"
-
-        await status_msg.delete()
-        await update.message.reply_document(
-            document=file_buffer,
-            caption=f"🔐 *3DS Cards History*\n\n👤 User: `{target_user_id}`\n📊 Total: {total_count} cards",
-            parse_mode="Markdown"
-        )
+    # Send card history
+    await send_card_history(
+        chat_id=update.effective_chat.id,
+        bot=context.bot,
+        target_user_id=target_user_id,
+        card_type="3ds",
+        reply_to_message_id=update.message.message_id
+    )
 
 
 async def findproducts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

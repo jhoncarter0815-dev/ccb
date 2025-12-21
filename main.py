@@ -5280,40 +5280,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Show validation status
-        if len(product_urls) == 1:
-            status_msg = await update.message.reply_text(
-                "⏳ *Validating product...*",
-                parse_mode="Markdown"
-            )
-        else:
-            status_msg = await update.message.reply_text(
-                f"⏳ *Validating {len(product_urls)} products...*",
-                parse_mode="Markdown"
-            )
+        status_msg = await update.message.reply_text(
+            f"⏳ *Validating {len(product_urls)} product(s) in parallel...*",
+            parse_mode="Markdown"
+        )
 
         # Get current products
         settings = get_user_settings(user_id)
         current_products = settings.get("products", [])
 
-        # Validate and add products
+        # Filter duplicates first (fast, no network)
+        duplicate_products = [url for url in product_urls if url in current_products]
+        urls_to_validate = [url for url in product_urls if url not in current_products]
+
+        # Validate products in PARALLEL for speed
         added_products = []
         failed_products = []
-        duplicate_products = []
 
-        for url in product_urls:
-            # Check for duplicates first
-            if url in current_products:
-                duplicate_products.append(url)
-                continue
+        if urls_to_validate:
+            # Create validation tasks
+            async def validate_one(url):
+                try:
+                    is_valid, message = await asyncio.wait_for(
+                        validate_shopify_product(url, check_shipping=False),
+                        timeout=10  # 10 second timeout per product
+                    )
+                    return (url, is_valid, message)
+                except asyncio.TimeoutError:
+                    return (url, False, "Timeout")
+                except Exception as e:
+                    return (url, False, str(e))
 
-            # Validate product exists (but allow any product type)
-            is_valid, message = await validate_shopify_product(url, check_shipping=False)
+            # Run all validations in parallel (max 10 concurrent)
+            semaphore = asyncio.Semaphore(10)
+            async def validate_with_limit(url):
+                async with semaphore:
+                    return await validate_one(url)
 
-            if is_valid:
-                added_products.append((url, message))
-                current_products.append(url)
-            else:
-                failed_products.append((url, message))
+            results = await asyncio.gather(*[validate_with_limit(url) for url in urls_to_validate])
+
+            for url, is_valid, message in results:
+                if is_valid:
+                    added_products.append((url, message))
+                    current_products.append(url)
+                else:
+                    failed_products.append((url, message))
 
         # Save updated products
         if added_products:

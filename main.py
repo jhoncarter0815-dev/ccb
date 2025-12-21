@@ -1281,50 +1281,136 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Charged cards history (from menu button)
     elif data == "menu_charged_history":
-        await query.edit_message_text(
-            "⏳ Fetching your charged cards history...",
-            parse_mode="Markdown"
-        )
-        # Send card history as a new message (file can't replace text message)
-        await send_card_history(
-            chat_id=query.message.chat_id,
-            bot=context.bot,
-            target_user_id=user_id,
-            card_type="charged"
-        )
-        # Update the original message with result info
-        total_count = get_card_history_count(user_id=user_id, card_type="charged")
-        await query.edit_message_text(
-            f"💰 *Charged Cards History*\n\n"
-            f"📊 Total: {total_count} cards\n\n"
-            f"_Check the file above for all cards._" if total_count > 0 else
-            f"💰 *Charged Cards History*\n\n_No charged cards found._",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu_main")]])
-        )
+        if is_admin(user_id):
+            # Show admin submenu with options
+            keyboard = [
+                [InlineKeyboardButton("👤 My Charged Cards", callback_data="charged_my")],
+                [InlineKeyboardButton("👥 All Users' Cards", callback_data="charged_all")],
+                [InlineKeyboardButton("🔍 Search by User ID", callback_data="charged_search")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="menu_main")]
+            ]
+            await query.edit_message_text(
+                "💰 *Charged Cards History*\n\n"
+                "Select an option:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            # Regular user - show their own cards
+            await query.edit_message_text("⏳ Fetching your charged cards history...", parse_mode="Markdown")
+            await send_card_history(chat_id=query.message.chat_id, bot=context.bot, target_user_id=user_id, card_type="charged")
+            total_count = get_card_history_count(user_id=user_id, card_type="charged")
+            await query.edit_message_text(
+                f"💰 *Charged Cards History*\n\n📊 Total: {total_count} cards\n\n_Check the file above for all cards._" if total_count > 0 else
+                f"💰 *Charged Cards History*\n\n_No charged cards found._",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu_main")]])
+            )
 
     # 3DS cards history (from menu button)
     elif data == "menu_3ds_history":
+        if is_admin(user_id):
+            # Show admin submenu with options
+            keyboard = [
+                [InlineKeyboardButton("👤 My 3DS Cards", callback_data="3ds_my")],
+                [InlineKeyboardButton("👥 All Users' Cards", callback_data="3ds_all")],
+                [InlineKeyboardButton("🔍 Search by User ID", callback_data="3ds_search")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="menu_main")]
+            ]
+            await query.edit_message_text(
+                "🔐 *3DS Cards History*\n\n"
+                "Select an option:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            # Regular user - show their own cards
+            await query.edit_message_text("⏳ Fetching your 3DS cards history...", parse_mode="Markdown")
+            await send_card_history(chat_id=query.message.chat_id, bot=context.bot, target_user_id=user_id, card_type="3ds")
+            total_count = get_card_history_count(user_id=user_id, card_type="3ds")
+            await query.edit_message_text(
+                f"🔐 *3DS Cards History*\n\n📊 Total: {total_count} cards\n\n_Check the file above for all cards._" if total_count > 0 else
+                f"🔐 *3DS Cards History*\n\n_No 3DS cards found._",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu_main")]])
+            )
+
+    # Admin: My charged cards
+    elif data == "charged_my":
+        await query.edit_message_text("⏳ Fetching your charged cards...", parse_mode="Markdown")
+        await send_card_history(chat_id=query.message.chat_id, bot=context.bot, target_user_id=user_id, card_type="charged")
+        total_count = get_card_history_count(user_id=user_id, card_type="charged")
         await query.edit_message_text(
-            "⏳ Fetching your 3DS cards history...",
-            parse_mode="Markdown"
+            f"💰 *My Charged Cards*\n\n📊 Total: {total_count} cards" + ("\n\n_Check the file above._" if total_count > 0 else "\n\n_No cards found._"),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu_charged_history")]])
         )
-        # Send card history as a new message (file can't replace text message)
-        await send_card_history(
-            chat_id=query.message.chat_id,
-            bot=context.bot,
-            target_user_id=user_id,
-            card_type="3ds"
+
+    # Admin: All users' charged cards
+    elif data == "charged_all":
+        if not is_admin(user_id):
+            await query.answer("🚫 Admin only!", show_alert=True)
+            return
+        await query.edit_message_text("⏳ Fetching ALL charged cards...", parse_mode="Markdown")
+        await send_card_history(chat_id=query.message.chat_id, bot=context.bot, target_user_id=None, card_type="charged")
+        total_count = get_card_history_count(user_id=None, card_type="charged")
+        await query.edit_message_text(
+            f"💰 *All Charged Cards*\n\n📊 Total: {total_count} cards from all users" + ("\n\n_Check the file above._" if total_count > 0 else "\n\n_No cards found._"),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu_charged_history")]])
         )
-        # Update the original message with result info
+
+    # Admin: Search charged cards by user ID
+    elif data == "charged_search":
+        if not is_admin(user_id):
+            await query.answer("🚫 Admin only!", show_alert=True)
+            return
+        set_waiting_for(user_id, "charged_user_search")
+        await query.edit_message_text(
+            "🔍 *Search Charged Cards*\n\n"
+            "Enter the user ID to search:\n\n"
+            "Example: `123456789`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="menu_charged_history")]])
+        )
+
+    # Admin: My 3DS cards
+    elif data == "3ds_my":
+        await query.edit_message_text("⏳ Fetching your 3DS cards...", parse_mode="Markdown")
+        await send_card_history(chat_id=query.message.chat_id, bot=context.bot, target_user_id=user_id, card_type="3ds")
         total_count = get_card_history_count(user_id=user_id, card_type="3ds")
         await query.edit_message_text(
-            f"🔐 *3DS Cards History*\n\n"
-            f"📊 Total: {total_count} cards\n\n"
-            f"_Check the file above for all cards._" if total_count > 0 else
-            f"🔐 *3DS Cards History*\n\n_No 3DS cards found._",
+            f"🔐 *My 3DS Cards*\n\n📊 Total: {total_count} cards" + ("\n\n_Check the file above._" if total_count > 0 else "\n\n_No cards found._"),
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu_main")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu_3ds_history")]])
+        )
+
+    # Admin: All users' 3DS cards
+    elif data == "3ds_all":
+        if not is_admin(user_id):
+            await query.answer("🚫 Admin only!", show_alert=True)
+            return
+        await query.edit_message_text("⏳ Fetching ALL 3DS cards...", parse_mode="Markdown")
+        await send_card_history(chat_id=query.message.chat_id, bot=context.bot, target_user_id=None, card_type="3ds")
+        total_count = get_card_history_count(user_id=None, card_type="3ds")
+        await query.edit_message_text(
+            f"🔐 *All 3DS Cards*\n\n📊 Total: {total_count} cards from all users" + ("\n\n_Check the file above._" if total_count > 0 else "\n\n_No cards found._"),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu_3ds_history")]])
+        )
+
+    # Admin: Search 3DS cards by user ID
+    elif data == "3ds_search":
+        if not is_admin(user_id):
+            await query.answer("🚫 Admin only!", show_alert=True)
+            return
+        set_waiting_for(user_id, "3ds_user_search")
+        await query.edit_message_text(
+            "🔍 *Search 3DS Cards*\n\n"
+            "Enter the user ID to search:\n\n"
+            "Example: `123456789`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="menu_3ds_history")]])
         )
 
     # Products menu
@@ -3861,6 +3947,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"_(Digital products only - no shipping required)_",
             parse_mode="Markdown",
             reply_markup=get_product_scraper_keyboard(products, set(), 0)
+        )
+        return
+
+    # Handle admin search for charged cards by user ID
+    if waiting_for == "charged_user_search":
+        set_waiting_for(user_id, None)
+        if not is_admin(user_id):
+            await update.message.reply_text("🚫 Admin only!")
+            return
+        try:
+            target_user_id = int(text.strip())
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Invalid user ID. Must be a number.\n\nTry again with `/getcharged <user_id>`",
+                parse_mode="Markdown"
+            )
+            return
+        await send_card_history(
+            chat_id=update.effective_chat.id,
+            bot=context.bot,
+            target_user_id=target_user_id,
+            card_type="charged",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+
+    # Handle admin search for 3DS cards by user ID
+    if waiting_for == "3ds_user_search":
+        set_waiting_for(user_id, None)
+        if not is_admin(user_id):
+            await update.message.reply_text("🚫 Admin only!")
+            return
+        try:
+            target_user_id = int(text.strip())
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Invalid user ID. Must be a number.\n\nTry again with `/get3ds <user_id>`",
+                parse_mode="Markdown"
+            )
+            return
+        await send_card_history(
+            chat_id=update.effective_chat.id,
+            bot=context.bot,
+            target_user_id=target_user_id,
+            card_type="3ds",
+            reply_to_message_id=update.message.message_id
         )
         return
 

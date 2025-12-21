@@ -1877,28 +1877,40 @@ def get_gateway_keyboard(user_id: int):
     return InlineKeyboardMarkup(keyboard)
 
 def get_products_keyboard(user_id: int):
-    """Build products management keyboard"""
+    """Build products management keyboard - 4 main submenus"""
+    settings = get_user_settings(user_id)
+    products = settings.get("products", [])
+
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Products", callback_data="prod_add")],
+        [InlineKeyboardButton("🧹 Clean Products", callback_data="prod_clean")],
+        [InlineKeyboardButton("🔍 Find Products", callback_data="prod_find")],
+        [InlineKeyboardButton("✏️ Edit Products", callback_data="prod_edit")],
+        [InlineKeyboardButton("◀️ Back", callback_data="menu_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_edit_products_keyboard(user_id: int):
+    """Build edit products keyboard with delete options"""
     settings = get_user_settings(user_id)
     products = settings.get("products", [])
 
     keyboard = []
-    # Add product buttons at top
-    keyboard.append([InlineKeyboardButton("➕ Add Product", callback_data="prod_add")])
-    keyboard.append([InlineKeyboardButton("🔍 Find Products ($1-$5)", callback_data="prod_find")])
-
-    for i, url in enumerate(products):
-        # Shorten URL for display
-        display = url.split("/products/")[-1][:20] if "/products/" in url else url[:20]
-        keyboard.append([
-            InlineKeyboardButton(f"📦 {display}", callback_data=f"prod_view_{i}"),
-            InlineKeyboardButton("🗑️", callback_data=f"prod_del_{i}")
-        ])
 
     if products:
-        keyboard.append([InlineKeyboardButton("🧹 Clean Products", callback_data="prod_clean")])
+        for i, url in enumerate(products):
+            # Shorten URL for display
+            display = url.split("/products/")[-1][:20] if "/products/" in url else url[:20]
+            keyboard.append([
+                InlineKeyboardButton(f"📦 {display}", callback_data=f"prod_view_{i}"),
+                InlineKeyboardButton("🗑️", callback_data=f"prod_del_{i}")
+            ])
         keyboard.append([InlineKeyboardButton("🗑️ Clear All", callback_data="prod_clear_all")])
+    else:
+        keyboard.append([InlineKeyboardButton("➕ Add Products", callback_data="prod_add")])
 
-    keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="menu_main")])
+    keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="menu_products")])
     return InlineKeyboardMarkup(keyboard)
 
 def format_proxy_status(proxy) -> str:
@@ -2155,13 +2167,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settings = get_user_settings(user_id)
         products = settings.get("products", [])
 
-        if products:
-            text = f"📦 *Your Products* ({len(products)})\n\n"
-            for i, url in enumerate(products):
-                short_url = url[:50] + "..." if len(url) > 50 else url
-                text += f"{i+1}. `{short_url}`\n"
-        else:
-            text = "📦 *Your Products*\n\nNo products added yet.\n\nClick ➕ Add Product to add one."
+        text = f"📦 *Products* ({len(products)} saved)\n\n"
+        text += "➕ *Add Products* - Add new product URLs\n"
+        text += "🧹 *Clean Products* - Test & remove broken ones\n"
+        text += "🔍 *Find Products* - Auto-find $1-$5 products\n"
+        text += "✏️ *Edit Products* - View, delete products"
 
         await query.edit_message_text(
             text,
@@ -2212,7 +2222,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🗑️ Remove", callback_data=f"prod_del_{idx}")],
-                    [InlineKeyboardButton("◀️ Back", callback_data="menu_products")]
+                    [InlineKeyboardButton("◀️ Back", callback_data="prod_edit")]
                 ])
             )
 
@@ -2227,9 +2237,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_user_setting(user_id, "products", products)
 
             await query.edit_message_text(
-                f"✅ *Product Removed*\n\n`{removed}`\n\n📦 Remaining: {len(products)}",
+                f"✅ *Product Removed*\n\n`{removed[:50]}`\n\n📦 Remaining: {len(products)}",
                 parse_mode="Markdown",
-                reply_markup=get_back_keyboard("menu_products")
+                reply_markup=get_back_keyboard("prod_edit")
             )
 
     # Clear all products
@@ -2238,7 +2248,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "✅ *All Products Cleared*",
             parse_mode="Markdown",
-            reply_markup=get_back_keyboard("menu_products")
+            reply_markup=get_back_keyboard("prod_edit")
         )
 
     # Clean products - validate all products with a test card
@@ -2259,6 +2269,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "I'll test this card against each product and remove any that fail with delivery/product errors\\.",
             parse_mode="MarkdownV2",
             reply_markup=get_cancel_keyboard()
+        )
+
+    # Edit products - view/delete products
+    elif data == "prod_edit":
+        settings = get_user_settings(user_id)
+        products = settings.get("products", [])
+
+        if products:
+            text = f"✏️ *Edit Products* ({len(products)})\n\n"
+            for i, url in enumerate(products[:10]):
+                short_url = url.split('/products/')[-1][:25] if '/products/' in url else url[:25]
+                text += f"{i+1}. `{short_url}`\n"
+            if len(products) > 10:
+                text += f"_...and {len(products) - 10} more_\n"
+            text += "\nTap 🗑️ to delete a product."
+        else:
+            text = "✏️ *Edit Products*\n\nNo products added yet."
+
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=get_edit_products_keyboard(user_id)
         )
 
     # Proxy menu

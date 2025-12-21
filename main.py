@@ -1354,9 +1354,15 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
 
                 product_url = random.choice(user_products)
 
-                # Use user's proxy or fall back to config
+                # Use user's proxies or fall back to config
+                # Support both old format (string) and new format (list)
                 user_proxy = settings.get("proxy")
-                proxies = [user_proxy] if user_proxy else config.PROXY_LIST
+                if isinstance(user_proxy, list):
+                    proxies = user_proxy if user_proxy else config.PROXY_LIST
+                elif user_proxy:
+                    proxies = [user_proxy]
+                else:
+                    proxies = config.PROXY_LIST
 
                 # Get a healthy proxy if available
                 healthy_proxy = await get_healthy_proxy(proxies) if proxies else None
@@ -1549,6 +1555,18 @@ def get_products_keyboard(user_id: int):
 
     keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="menu_main")])
     return InlineKeyboardMarkup(keyboard)
+
+def format_proxy_status(proxy) -> str:
+    """Format proxy for display, handling both single and multiple proxies."""
+    if not proxy:
+        return "Not set"
+    if isinstance(proxy, list):
+        if len(proxy) == 1:
+            return f"`{proxy[0]}`"
+        else:
+            return f"{len(proxy)} proxies"
+    return f"`{proxy}`"
+
 
 def get_proxy_keyboard(user_id: int):
     """Build proxy management keyboard"""
@@ -1880,7 +1898,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         proxy = settings.get("proxy")
 
         if proxy:
-            text = f"🌐 *Your Proxy*\n\n`{proxy}`"
+            # Handle both old (string) and new (list) format
+            if isinstance(proxy, list):
+                if len(proxy) == 1:
+                    text = f"🌐 *Your Proxy*\n\n`{proxy[0]}`"
+                else:
+                    text = f"🌐 *Your Proxies* ({len(proxy)})\n\n"
+                    for i, p in enumerate(proxy[:5], 1):
+                        short_p = p[:35] + "..." if len(p) > 35 else p
+                        text += f"{i}. `{short_p}`\n"
+                    if len(proxy) > 5:
+                        text += f"_...and {len(proxy) - 5} more_\n"
+                    text += "\n🔄 _Bot rotates between these proxies_"
+            else:
+                text = f"🌐 *Your Proxy*\n\n`{proxy}`"
         else:
             text = "🌐 *Your Proxy*\n\nNo proxy set.\n\nClick ➕ Set Proxy to add one."
 
@@ -1921,7 +1952,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = (
             "⚙️ *Your Settings*\n\n"
-            f"🌐 *Proxy*: `{proxy or 'Not set'}`\n"
+            f"🌐 *Proxy*: {format_proxy_status(proxy)}\n"
             f"📦 *Products*: {len(products)}\n"
         )
 
@@ -2373,7 +2404,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Refresh the user details view
         settings = get_user_settings(target_id)
         banned_status = "🚫 BANNED" if is_user_banned(target_id) else "✅ Active"
-        proxy_status = f"`{settings.get('proxy')}`" if settings.get("proxy") else "Not set"
+        proxy_status = format_proxy_status(settings.get("proxy"))
         products = settings.get("products", [])
 
         text_msg = (
@@ -4193,14 +4224,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Build response
         if valid_proxies:
-            # Save the first valid proxy (or all if we want to support multiple later)
-            # For now, save the first one
-            update_user_setting(user_id, "proxy", valid_proxies[0])
+            # Save ALL valid proxies as a list (bot will rotate between them)
+            update_user_setting(user_id, "proxy", valid_proxies)
 
-            result_text = f"✅ *Proxy Set!*\n\n`{valid_proxies[0]}`"
-
-            if len(valid_proxies) > 1:
-                result_text += f"\n\n_Note: {len(valid_proxies)} proxies passed. First one saved._"
+            if len(valid_proxies) == 1:
+                result_text = f"✅ *Proxy Set!*\n\n`{valid_proxies[0]}`"
+            else:
+                result_text = f"✅ *{len(valid_proxies)} Proxies Added!*\n\n"
+                for i, proxy in enumerate(valid_proxies[:5], 1):
+                    short_proxy = proxy[:35] + "..." if len(proxy) > 35 else proxy
+                    result_text += f"{i}. `{short_proxy}`\n"
+                if len(valid_proxies) > 5:
+                    result_text += f"_...and {len(valid_proxies) - 5} more_\n"
+                result_text += f"\n🔄 _Bot will rotate between proxies automatically_"
 
             if failed_proxies:
                 result_text += f"\n\n⚠️ *{len(failed_proxies)} proxy/proxies failed:*"
@@ -4245,7 +4281,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             settings = get_user_settings(target_id)
 
             banned_status = "🚫 BANNED" if is_user_banned(target_id) else "✅ Active"
-            proxy_status = f"`{settings.get('proxy')}`" if settings.get("proxy") else "Not set"
+            proxy_status = format_proxy_status(settings.get("proxy"))
             products = settings.get("products", [])
 
             text_msg = (

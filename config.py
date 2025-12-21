@@ -18,8 +18,9 @@ class CheckerConfig:
         self.GLOBAL_CONCURRENCY_LIMIT = int(os.getenv("GLOBAL_CONCURRENCY_LIMIT", "20"))
 
         # Delay between starting each card check (in seconds)
-        # Helps avoid captcha by spacing out requests (default 0.5)
-        self.CARD_DELAY = float(os.getenv("CARD_DELAY", "0.5"))
+        # Helps avoid captcha by spacing out requests (default 1.5)
+        # Higher values = less captcha but slower checking
+        self.CARD_DELAY = float(os.getenv("CARD_DELAY", "1.5"))
 
         self.BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 

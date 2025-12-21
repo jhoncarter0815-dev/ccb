@@ -832,17 +832,23 @@ def luhn_check(card_number: str) -> bool:
 
 def validate_expiry(month: str, year: str) -> tuple:
     """
-    Validate card expiry date.
+    Validate card expiry date using REAL-TIME system date.
     Returns (is_valid: bool, error_message: str or None)
+
+    Note: Uses UTC time for consistency across timezones.
+    Cards are valid through the END of their expiry month.
     """
     try:
+        from datetime import datetime, timezone
+
         month_int = int(month)
 
         # Handle 2-digit or 4-digit year
-        if len(year) == 2:
-            year_int = 2000 + int(year)
-        elif len(year) == 4:
-            year_int = int(year)
+        year_str = year.strip()
+        if len(year_str) == 2:
+            year_int = 2000 + int(year_str)
+        elif len(year_str) == 4:
+            year_int = int(year_str)
         else:
             return False, "Invalid year format"
 
@@ -850,15 +856,19 @@ def validate_expiry(month: str, year: str) -> tuple:
         if month_int < 1 or month_int > 12:
             return False, f"Invalid month: {month}"
 
-        # Get current date
-        from datetime import datetime
-        now = datetime.now()
+        # Get REAL-TIME current date in UTC for consistency
+        # Using UTC avoids timezone issues across different server locations
+        now = datetime.now(timezone.utc)
         current_year = now.year
         current_month = now.month
 
         # Check if expired
-        if year_int < current_year or (year_int == current_year and month_int < current_month):
-            return False, "Card expired"
+        # Card is valid through the END of the expiry month
+        # So a card expiring 12/2024 is valid until Dec 31, 2024
+        if year_int < current_year:
+            return False, f"Card expired ({month_int:02d}/{year_int})"
+        elif year_int == current_year and month_int < current_month:
+            return False, f"Card expired ({month_int:02d}/{year_int})"
 
         # Check if too far in future (more than 20 years)
         if year_int > current_year + 20:
@@ -1211,7 +1221,7 @@ def create_progress_bar(current: int, total: int, length: int = 10) -> str:
     return f"[{bar}] {percent}%"
 
 
-async def process_single_card(card: str, user_id: int = None, user_settings: dict = None) -> dict:
+async def process_single_card(card: str, user_id: int = None, user_settings: dict = None, bot=None) -> dict:
     """
     Process a single card and return result.
 
@@ -1225,6 +1235,7 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
         card: Card string to check
         user_id: User ID for concurrency control
         user_settings: Pre-fetched user settings (optional, avoids DB calls inside semaphore)
+        bot: Optional Telegram bot instance for sending notifications on product removal
     """
     # ==========================================================================
     # PRE-VALIDATION: Check card format/validity BEFORE using API
@@ -1295,7 +1306,7 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
                 # Check for invalid product error and auto-remove if detected
                 error_msg = response.get("error", "") if response else ""
                 if is_product_error(error_msg):
-                    asyncio.create_task(remove_invalid_product(user_id, product_url, error_msg))
+                    asyncio.create_task(remove_invalid_product(user_id, product_url, error_msg, bot))
                     response["product_removed"] = True
                     response["error"] = f"⚠️ Product auto-removed: {error_msg}"
 
@@ -1977,7 +1988,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Run the retry as a background task
         asyncio.create_task(
-            run_batch_check(retriable_cards, user_id, user_settings, session, status_msg, fake_update)
+            run_batch_check(retriable_cards, user_id, user_settings, session, status_msg, fake_update, context.bot)
         )
 
     # =============================================================================
@@ -2454,46 +2465,129 @@ async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def is_product_error(error_msg: str) -> bool:
     """
-    Check if an error indicates a PERMANENTLY invalid product URL that should be removed.
+    Check if an error indicates an invalid/broken product that should be auto-removed.
 
-    IMPORTANT: Be conservative! Only remove products that are definitely broken.
-    Temporary issues (out of stock, shipping) should NOT trigger removal.
+    This checks for:
+    1. Product permanently deleted/removed
+    2. Store/shop not found
+    3. Delivery/shipping configuration errors (product can't be used)
+    4. Checkout errors specific to the product
+
+    NOTE: These errors indicate the PRODUCT is the problem, not the card.
     """
     if not error_msg:
         return False
     error_lower = error_msg.lower()
 
-    # Only these PERMANENT errors should trigger product removal:
-    # These indicate the product/store URL itself is invalid or deleted
-    permanent_invalid_indicators = [
+    # Product errors that should trigger auto-removal
+    product_error_indicators = [
         # Product permanently deleted/removed
         "product has been removed",
         "product does not exist",
         "product not found",
         "couldn't find product",
+        "product unavailable",
+        "this product is no longer available",
+        "product is archived",
+
         # Store/shop permanently gone
         "store not found",
         "shop not found",
         "store does not exist",
         "shop does not exist",
+        "this store is unavailable",
+
         # Invalid URL structure
         "not a valid shopify",
         "invalid product url",
         "invalid store url",
+        "invalid product",
+
+        # Delivery/shipping configuration errors
+        # These mean the product is misconfigured and can't be used
+        "no delivery option available",
+        "no delivery options",
+        "no shipping method",
+        "no shipping options available",
+        "no shipping rates",
+        "can't ship to",
+        "cannot ship to",
+        "does not ship to",
+        "delivery not available",
+        "shipping not available",
+        "no rates available",
+        "unable to calculate shipping",
+        "shipping address is not valid",
+
+        # Checkout/cart errors specific to product
+        "can't add this item",
+        "cannot add to cart",
+        "item cannot be added",
+        "product cannot be purchased",
+        "not available for purchase",
+        "sold out",
+        "out of stock",
+        "inventory not available",
+        "no inventory",
+
+        # Variant/option errors
+        "variant not found",
+        "variant unavailable",
+        "no variants available",
+        "option not available",
+
+        # Price/currency errors
+        "price not available",
+        "currency not supported",
+
+        # Store blocked/restricted
+        "store blocked",
+        "access denied",
+        "store is password protected",
     ]
 
-    return any(indicator in error_lower for indicator in permanent_invalid_indicators)
+    return any(indicator in error_lower for indicator in product_error_indicators)
 
 
-async def remove_invalid_product(user_id: int, product_url: str, reason: str = ""):
-    """Remove an invalid product from user's list and log it"""
+async def remove_invalid_product(user_id: int, product_url: str, reason: str = "", bot=None):
+    """
+    Remove an invalid product from user's list and notify the user.
+
+    Args:
+        user_id: The user's Telegram ID
+        product_url: The product URL to remove
+        reason: The error message explaining why it was removed
+        bot: Optional Telegram bot instance for sending notifications
+    """
     try:
         settings = get_user_settings(user_id)
         products = settings.get("products", [])
         if product_url in products:
             products.remove(product_url)
             update_user_setting(user_id, "products", products)
+            remaining_count = len(products)
+
             logger.warning(f"Auto-removed invalid product for user {user_id}: {product_url} - {reason}")
+
+            # Try to notify the user if we have a bot instance
+            if bot:
+                try:
+                    # Truncate URL for display
+                    short_url = product_url[:50] + "..." if len(product_url) > 50 else product_url
+                    short_reason = reason[:100] if reason else "Product error"
+
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=f"⚠️ *Product Auto-Removed*\n\n"
+                             f"🔗 `{short_url}`\n\n"
+                             f"❌ *Reason:* {short_reason}\n\n"
+                             f"📦 *Remaining products:* {remaining_count}\n\n"
+                             f"_Use /addproduct to add a new product._",
+                        parse_mode="Markdown"
+                    )
+                except Exception as notify_error:
+                    logger.debug(f"Could not send product removal notification: {notify_error}")
+
             return True
         return False
     except Exception as e:
@@ -2501,20 +2595,13 @@ async def remove_invalid_product(user_id: int, product_url: str, reason: str = "
         return False
 
 
-async def validate_shopify_product(url: str, check_shipping: bool = True) -> tuple[bool, str]:
+async def validate_shopify_product(url: str, check_shipping: bool = False) -> tuple[bool, str]:
     """
     Validate if a URL is a valid Shopify product page.
-    If check_shipping=True, also verifies the product doesn't require shipping
-    (or has virtual/digital keywords in the title).
-    """
-    # Keywords that indicate virtual/digital products
-    virtual_keywords = [
-        "donate", "donation", "gift card", "giftcard", "gift-card",
-        "virtual", "digital", "download", "downloadable",
-        "e-gift", "egift", "voucher", "credit", "membership",
-        "subscription", "tip", "tipping", "support", "contribute"
-    ]
 
+    Note: Shipping filter has been REMOVED - users can add ANY product (physical or digital).
+    The check_shipping parameter is kept for backwards compatibility but defaults to False.
+    """
     try:
         # Check URL format
         if "/products/" not in url:
@@ -2530,27 +2617,20 @@ async def validate_shopify_product(url: str, check_shipping: bool = True) -> tup
                     if "product" in data:
                         product = data["product"]
                         product_title = product.get("title", "Unknown")
-                        title_lower = product_title.lower()
 
-                        # Check if product requires shipping
-                        if check_shipping:
-                            variants = product.get("variants", [])
-                            if variants:
-                                requires_shipping = variants[0].get("requires_shipping", True)
-                                has_virtual_keyword = any(kw in title_lower for kw in virtual_keywords)
+                        # Get product info for display
+                        variants = product.get("variants", [])
+                        requires_shipping = variants[0].get("requires_shipping", True) if variants else True
+                        shipping_info = "📦 Physical" if requires_shipping else "💻 Digital"
 
-                                if requires_shipping and not has_virtual_keyword:
-                                    return False, f"❌ Product requires shipping: {product_title}\n\nOnly digital/virtual products are accepted."
-
-                        return True, f"✅ Product found: {product_title}"
+                        return True, f"✅ Product found: {product_title}\n{shipping_info}"
                     else:
                         return False, "Not a valid Shopify product page"
                 elif resp.status == 404:
                     return False, "Product not found (404)"
                 elif resp.status == 401 or resp.status == 403:
-                    # Some stores block JSON access - we can't verify shipping
-                    # Reject these since we can't confirm they're digital
-                    return False, "Cannot verify product - store blocks access. Only products with accessible JSON are supported."
+                    # Some stores block JSON access - allow anyway, let API handle it
+                    return True, "✅ Product URL accepted (store blocks verification)"
                 else:
                     return False, f"Failed to access product (HTTP {resp.status})"
     except asyncio.TimeoutError:
@@ -2642,29 +2722,16 @@ async def fetch_shopify_products(store_url: str, min_price: float = 1.0, max_pri
                                 continue
 
                             first_variant = variants[0]
-                            product_title = product.get("title", "").lower()
 
-                            # Keywords that indicate virtual/digital products
-                            virtual_keywords = [
-                                "donate", "donation", "gift card", "giftcard", "gift-card",
-                                "virtual", "digital", "download", "downloadable",
-                                "e-gift", "egift", "voucher", "credit", "membership",
-                                "subscription", "tip", "tipping", "support", "contribute"
-                            ]
-
-                            # FILTER: Accept if no shipping required OR has virtual keywords
+                            # Get shipping status for display (but don't filter on it)
                             requires_shipping = first_variant.get("requires_shipping", True)
-                            has_virtual_keyword = any(kw in product_title for kw in virtual_keywords)
-
-                            if requires_shipping and not has_virtual_keyword:
-                                continue  # Skip physical products without virtual keywords
 
                             try:
                                 price = float(first_variant.get("price", "0"))
                             except (ValueError, TypeError):
                                 continue
 
-                            # Filter by price range
+                            # Filter by price range ONLY (no shipping filter)
                             if min_price <= price <= max_price:
                                 product_handle = product.get("handle", "")
                                 product_url = f"{base_url}/products/{product_handle}"
@@ -2675,7 +2742,7 @@ async def fetch_shopify_products(store_url: str, min_price: float = 1.0, max_pri
                                     "url": product_url,
                                     "handle": product_handle,
                                     "id": product.get("id", 0),
-                                    "requires_shipping": requires_shipping
+                                    "requires_shipping": requires_shipping  # Keep for info display
                                 })
 
                         page += 1
@@ -3387,7 +3454,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(f"⏳ Checking `{card}`...", parse_mode="Markdown")
 
     try:
-        result = await process_single_card(card, user_id)
+        result = await process_single_card(card, user_id, bot=context.bot)
         formatted = format_result(result)
         await status_msg.edit_text(formatted, parse_mode="Markdown")
 
@@ -3601,10 +3668,13 @@ def categorize_error(error_msg: str, response: dict = None) -> str:
     return "unknown"
 
 
-async def run_batch_check(cards: list, user_id: int, user_settings: dict, session: dict, status_msg, update: Update):
+async def run_batch_check(cards: list, user_id: int, user_settings: dict, session: dict, status_msg, update: Update, bot=None):
     """
     Run batch card checking as a background task.
     This function runs independently of the update handler, allowing other users to interact with the bot.
+
+    Args:
+        bot: Optional Telegram bot instance for notifications (e.g., product removal alerts)
     """
     charged = []
     declined = []
@@ -3647,7 +3717,7 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
             # Add new tasks if under limit and cards remain
             while len(pending_tasks) < config.CONCURRENCY_LIMIT and card_index < total_cards:
                 card = cards[card_index]
-                task = asyncio.create_task(process_single_card(card, user_id, user_settings))
+                task = asyncio.create_task(process_single_card(card, user_id, user_settings, bot))
                 pending_tasks.add(task)
                 card_index += 1
                 # Small delay between starting each card to avoid captcha
@@ -3985,7 +4055,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Run the checking loop as a BACKGROUND TASK so the handler returns immediately
         # This allows other users to interact with the bot while checking is in progress
         asyncio.create_task(
-            run_batch_check(cards, user_id, user_settings, session, status_msg, update)
+            run_batch_check(cards, user_id, user_settings, session, status_msg, update, context.bot)
         )
 
     except Exception as e:
@@ -4619,7 +4689,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if remaining in [10, 0]:
                 asyncio.create_task(check_and_send_credit_notifications(user_id, remaining))
 
-            result = await process_single_card(card, user_id)
+            result = await process_single_card(card, user_id, bot=context.bot)
             formatted = format_result(result)
 
             # Add remaining credits to result
@@ -4653,7 +4723,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Run the checking loop as a BACKGROUND TASK so the handler returns immediately
         # This allows other users to interact with the bot while checking is in progress
         asyncio.create_task(
-            run_batch_check(cards, user_id, user_settings, session, status_msg, update)
+            run_batch_check(cards, user_id, user_settings, session, status_msg, update, context.bot)
         )
 
 

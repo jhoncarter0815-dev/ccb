@@ -4771,9 +4771,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Show progress message
         status_msg = await update.message.reply_text(
-            f"🧹 *Cleaning Products...*\n\n"
-            f"Testing card against {len(products)} product(s)...\n\n"
-            f"⏳ Progress: 0/{len(products)}",
+            f"🧹 *Cleaning {len(products)} products in parallel...*\n\n"
+            f"⏳ This may take a few seconds...",
             parse_mode="Markdown"
         )
 
@@ -4786,56 +4785,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             proxies = config.PROXY_LIST
 
-        # Get a healthy proxy
-        healthy_proxy = await get_healthy_proxy(proxies) if proxies else None
-        active_proxies = [healthy_proxy] if healthy_proxy else proxies
+        # Test products in PARALLEL for speed
+        async def test_product(product_url):
+            try:
+                response = await asyncio.wait_for(
+                    auto_shopify_client(
+                        card=card,
+                        product_url=product_url,
+                        email=settings.get("email") or config.DEFAULT_EMAIL,
+                        is_shippable=settings.get("is_shippable", config.IS_SHIPPABLE),
+                        proxies=proxies,
+                        logger=logger
+                    ),
+                    timeout=30  # 30 second timeout per product
+                )
+                error_msg = response.get("error", "") if response else ""
+                if is_product_error(error_msg):
+                    return (product_url, False, error_msg)
+                else:
+                    return (product_url, True, "")
+            except asyncio.TimeoutError:
+                return (product_url, True, "")  # Keep on timeout
+            except Exception as e:
+                return (product_url, True, "")  # Keep on error
 
-        # Test each product
+        # Run all tests in parallel (max 5 concurrent to avoid rate limits)
+        semaphore = asyncio.Semaphore(5)
+        async def test_with_limit(url):
+            async with semaphore:
+                return await test_product(url)
+
+        results = await asyncio.gather(*[test_with_limit(url) for url in products])
+
+        # Process results
         working_products = []
         failed_products = []
-
-        for i, product_url in enumerate(products):
-            try:
-                # Update progress every product
-                if i % 2 == 0 or i == len(products) - 1:
-                    try:
-                        await status_msg.edit_text(
-                            f"🧹 *Cleaning Products...*\n\n"
-                            f"Testing: `{product_url.split('/products/')[-1][:30]}...`\n\n"
-                            f"⏳ Progress: {i}/{len(products)}\n"
-                            f"✅ Working: {len(working_products)}\n"
-                            f"❌ Failed: {len(failed_products)}",
-                            parse_mode="Markdown"
-                        )
-                    except:
-                        pass
-
-                # Test the card against this product
-                response = await auto_shopify_client(
-                    card=card,
-                    product_url=product_url,
-                    email=settings.get("email") or config.DEFAULT_EMAIL,
-                    is_shippable=settings.get("is_shippable", config.IS_SHIPPABLE),
-                    proxies=active_proxies,
-                    logger=logger
-                )
-
-                error_msg = response.get("error", "") if response else ""
-
-                # Check if this is a product error
-                if is_product_error(error_msg):
-                    failed_products.append((product_url, error_msg))
-                else:
-                    # Product works (even if card declined, the product itself is fine)
-                    working_products.append(product_url)
-
-                # Small delay between requests
-                await asyncio.sleep(1)
-
-            except Exception as e:
-                # On exception, assume product might be fine (don't remove)
-                logger.error(f"Error testing product {product_url}: {e}")
+        for product_url, is_working, error_msg in results:
+            if is_working:
                 working_products.append(product_url)
+            else:
+                failed_products.append((product_url, error_msg))
 
         # Update the user's products to only keep working ones
         if working_products or not failed_products:

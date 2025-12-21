@@ -1014,24 +1014,81 @@ async def validate_bin(card_number: str) -> tuple:
 _proxy_health_cache = {}
 _proxy_health_ttl = 300  # 5 minutes cache
 
-async def check_proxy_health(proxy: str) -> bool:
+def parse_proxy_format(proxy: str) -> tuple:
+    """
+    Parse proxy string in various formats and return (is_valid, proxy_url, error_message).
+
+    Supported formats:
+    - host:port
+    - host:port:username:password
+    - http://host:port
+    - http://user:pass@host:port
+
+    Returns:
+        (is_valid: bool, proxy_url: str or None, error_message: str or None)
+    """
+    proxy = proxy.strip()
+
+    if not proxy:
+        return False, None, "Empty proxy"
+
+    # If already in URL format
+    if proxy.startswith(('http://', 'https://')):
+        return True, proxy, None
+
+    # Parse host:port or host:port:user:pass format
+    parts = proxy.split(":")
+
+    if len(parts) == 2:
+        # host:port format
+        host, port = parts
+        if not host or not port.isdigit():
+            return False, None, "Invalid format. Use: host:port or host:port:user:pass"
+        return True, f"http://{host}:{port}", None
+
+    elif len(parts) == 4:
+        # host:port:username:password format
+        host, port, username, password = parts
+        if not host or not port.isdigit() or not username or not password:
+            return False, None, "Invalid format. Use: host:port:user:pass"
+        return True, f"http://{username}:{password}@{host}:{port}", None
+
+    else:
+        return False, None, "Invalid format. Use: host:port or host:port:user:pass"
+
+
+async def check_proxy_health(proxy: str, skip_cache: bool = False) -> tuple:
     """
     Check if a proxy is working.
     Caches results for 5 minutes to avoid repeated checks.
-    Returns True if healthy, False if dead.
+
+    Args:
+        proxy: Proxy string in any format (host:port:user:pass or URL format)
+        skip_cache: If True, always perform a fresh check
+
+    Returns:
+        (is_healthy: bool, error_message: str or None)
     """
     if not proxy:
-        return True  # No proxy = direct connection
+        return True, None  # No proxy = direct connection
+
+    # Parse proxy format
+    is_valid, proxy_url, error = parse_proxy_format(proxy)
+    if not is_valid:
+        return False, error
 
     try:
         import time
         current_time = time.time()
 
-        # Check cache
-        if proxy in _proxy_health_cache:
+        # Check cache (unless skip_cache is True)
+        if not skip_cache and proxy in _proxy_health_cache:
             cached = _proxy_health_cache[proxy]
             if current_time - cached["time"] < _proxy_health_ttl:
-                return cached["healthy"]
+                if cached["healthy"]:
+                    return True, None
+                else:
+                    return False, "Proxy failed previous health check"
 
         # Test proxy with a simple request
         timeout = aiohttp.ClientTimeout(total=10)
@@ -1039,20 +1096,29 @@ async def check_proxy_health(proxy: str) -> bool:
             try:
                 async with session.get(
                     "https://httpbin.org/ip",
-                    proxy=proxy
+                    proxy=proxy_url
                 ) as response:
                     if response.status == 200:
                         _proxy_health_cache[proxy] = {"healthy": True, "time": current_time}
-                        return True
+                        return True, None
                     else:
                         _proxy_health_cache[proxy] = {"healthy": False, "time": current_time}
-                        return False
-            except Exception:
+                        return False, f"Proxy returned status {response.status}"
+            except aiohttp.ClientProxyConnectionError as e:
                 _proxy_health_cache[proxy] = {"healthy": False, "time": current_time}
-                return False
+                return False, "Failed to connect to proxy"
+            except aiohttp.ClientHttpProxyError as e:
+                _proxy_health_cache[proxy] = {"healthy": False, "time": current_time}
+                return False, f"Proxy authentication failed"
+            except asyncio.TimeoutError:
+                _proxy_health_cache[proxy] = {"healthy": False, "time": current_time}
+                return False, "Proxy connection timed out"
+            except Exception as e:
+                _proxy_health_cache[proxy] = {"healthy": False, "time": current_time}
+                return False, f"Proxy error: {str(e)[:50]}"
 
-    except Exception:
-        return False
+    except Exception as e:
+        return False, f"Error: {str(e)[:50]}"
 
 
 async def get_healthy_proxy(proxies: list) -> str:
@@ -1069,8 +1135,10 @@ async def get_healthy_proxy(proxies: list) -> str:
     random.shuffle(shuffled)
 
     for proxy in shuffled:
-        if proxy and await check_proxy_health(proxy):
-            return proxy
+        if proxy:
+            is_healthy, _ = await check_proxy_health(proxy)
+            if is_healthy:
+                return proxy
 
     # If all proxies failed, return random one anyway (might recover)
     return random.choice([p for p in proxies if p]) if any(proxies) else None
@@ -1827,10 +1895,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_waiting_for(user_id, "proxy")
         await query.edit_message_text(
             "🌐 *Set Proxy*\n\n"
-            "Send me your proxy in this format:\n\n"
+            "Send your proxy in this format:\n"
             "`host:port:username:password`\n\n"
-            "Example: `proxy.example.com:8080:user:pass`",
-            parse_mode="Markdown",
+            "Or send *multiple proxies* \\(one per line\\)\\.\n"
+            "I'll test each one and use the first working proxy\\.\n\n"
+            "_⚠️ Proxies will be validated before saving_",
+            parse_mode="MarkdownV2",
             reply_markup=get_cancel_keyboard()
         )
 
@@ -4080,25 +4150,87 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Handle proxy input
     if waiting_for == "proxy":
         set_waiting_for(user_id, None)
-        proxy = text.strip()
 
-        # Basic validation
-        parts = proxy.replace(":", ":").split(":")
-        if len(parts) < 2:
+        # Support multiple proxies - split by newline
+        raw_proxies = [p.strip() for p in text.strip().split('\n') if p.strip()]
+
+        if not raw_proxies:
             await update.message.reply_text(
-                "❌ *Invalid proxy format!*\n\n"
-                "Use: `host:port:username:password`",
+                "❌ *No proxy provided!*\n\n"
+                "Use: `host:port:username:password`\n"
+                "Or send multiple proxies (one per line)",
                 parse_mode="Markdown",
                 reply_markup=get_back_keyboard("menu_proxy")
             )
             return
 
-        update_user_setting(user_id, "proxy", proxy)
-        await update.message.reply_text(
-            f"✅ *Proxy Set!*\n\n`{proxy}`",
-            parse_mode="Markdown",
-            reply_markup=get_back_keyboard("menu_proxy")
-        )
+        # Show testing status
+        if len(raw_proxies) == 1:
+            status_msg = await update.message.reply_text("🔄 *Testing proxy...*", parse_mode="Markdown")
+        else:
+            status_msg = await update.message.reply_text(
+                f"🔄 *Testing {len(raw_proxies)} proxies...*\n\n_This may take a moment_",
+                parse_mode="Markdown"
+            )
+
+        # Validate and test each proxy
+        valid_proxies = []
+        failed_proxies = []
+
+        for proxy in raw_proxies:
+            # First validate format
+            is_valid, proxy_url, format_error = parse_proxy_format(proxy)
+            if not is_valid:
+                failed_proxies.append((proxy, format_error))
+                continue
+
+            # Then test connectivity
+            is_healthy, health_error = await check_proxy_health(proxy, skip_cache=True)
+            if is_healthy:
+                valid_proxies.append(proxy)
+            else:
+                failed_proxies.append((proxy, health_error or "Connection failed"))
+
+        # Build response
+        if valid_proxies:
+            # Save the first valid proxy (or all if we want to support multiple later)
+            # For now, save the first one
+            update_user_setting(user_id, "proxy", valid_proxies[0])
+
+            result_text = f"✅ *Proxy Set!*\n\n`{valid_proxies[0]}`"
+
+            if len(valid_proxies) > 1:
+                result_text += f"\n\n_Note: {len(valid_proxies)} proxies passed. First one saved._"
+
+            if failed_proxies:
+                result_text += f"\n\n⚠️ *{len(failed_proxies)} proxy/proxies failed:*"
+                for proxy, error in failed_proxies[:3]:  # Show first 3 failures
+                    short_proxy = proxy[:30] + "..." if len(proxy) > 30 else proxy
+                    result_text += f"\n• `{short_proxy}`: {error}"
+                if len(failed_proxies) > 3:
+                    result_text += f"\n_...and {len(failed_proxies) - 3} more_"
+
+            await status_msg.edit_text(
+                result_text,
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard("menu_proxy")
+            )
+        else:
+            # All proxies failed
+            result_text = "❌ *All proxies failed validation!*\n\n"
+            for proxy, error in failed_proxies[:5]:  # Show first 5 failures
+                short_proxy = proxy[:30] + "..." if len(proxy) > 30 else proxy
+                result_text += f"• `{short_proxy}`\n  └ _{error}_\n"
+            if len(failed_proxies) > 5:
+                result_text += f"\n_...and {len(failed_proxies) - 5} more_"
+
+            result_text += "\n\n*Format:* `host:port:username:password`"
+
+            await status_msg.edit_text(
+                result_text,
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard("menu_proxy")
+            )
         return
 
     # =============================================================================

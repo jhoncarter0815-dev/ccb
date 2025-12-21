@@ -5279,12 +5279,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Show validation status
-        status_msg = await update.message.reply_text(
-            f"⏳ *Validating {len(product_urls)} product(s) in parallel...*",
-            parse_mode="Markdown"
-        )
-
         # Get current products
         settings = get_user_settings(user_id)
         current_products = settings.get("products", [])
@@ -5293,102 +5287,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         duplicate_products = [url for url in product_urls if url in current_products]
         urls_to_validate = [url for url in product_urls if url not in current_products]
 
-        # Validate products in PARALLEL for speed
+        if not urls_to_validate:
+            await update.message.reply_text(
+                f"⚠️ *All {len(duplicate_products)} product(s) already added!*",
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard("menu_products")
+            )
+            return
+
+        # Show validation status
+        status_msg = await update.message.reply_text(
+            f"⏳ *Adding {len(urls_to_validate)} product(s)...*\n\n"
+            "_Skipping validation for speed_",
+            parse_mode="Markdown"
+        )
+
+        # SKIP validation - just add all products directly
+        # Bad products will be auto-removed during card checking via is_product_error()
         added_products = []
-        failed_products = []
-
-        if urls_to_validate:
-            # Create validation tasks
-            async def validate_one(url):
-                try:
-                    is_valid, message = await asyncio.wait_for(
-                        validate_shopify_product(url, check_shipping=False),
-                        timeout=10  # 10 second timeout per product
-                    )
-                    return (url, is_valid, message)
-                except asyncio.TimeoutError:
-                    return (url, False, "Timeout")
-                except Exception as e:
-                    return (url, False, str(e))
-
-            # Run all validations in parallel (max 10 concurrent)
-            semaphore = asyncio.Semaphore(10)
-            async def validate_with_limit(url):
-                async with semaphore:
-                    return await validate_one(url)
-
-            results = await asyncio.gather(*[validate_with_limit(url) for url in urls_to_validate])
-
-            for url, is_valid, message in results:
-                if is_valid:
-                    added_products.append((url, message))
-                    current_products.append(url)
-                else:
-                    failed_products.append((url, message))
+        for url in urls_to_validate:
+            current_products.append(url)
+            short_url = url.split('/products/')[-1][:25] if '/products/' in url else url[:25]
+            added_products.append((url, short_url))
 
         # Save updated products
-        if added_products:
-            update_user_setting(user_id, "products", current_products)
+        update_user_setting(user_id, "products", current_products)
 
         # Build response
-        if added_products:
-            if len(added_products) == 1:
-                url, msg = added_products[0]
-                result_text = f"✅ *Product Added!*\n\n📝 {msg}\n📦 Total products: {len(current_products)}"
-            else:
-                result_text = f"✅ *{len(added_products)} Products Added!*\n\n"
-                for i, (url, msg) in enumerate(added_products[:5], 1):
-                    short_url = url.split('/products/')[-1][:25]
-                    result_text += f"{i}. `{short_url}`\n"
-                if len(added_products) > 5:
-                    result_text += f"_...and {len(added_products) - 5} more_\n"
-                result_text += f"\n📦 Total products: {len(current_products)}"
-
-            # Show warnings
-            if duplicate_products:
-                result_text += f"\n\n⚠️ *{len(duplicate_products)} duplicate(s) skipped*"
-
-            if failed_products:
-                result_text += f"\n\n❌ *{len(failed_products)} not found:*"
-                for url, error in failed_products[:3]:
-                    short_url = url.split('/products/')[-1][:20] + "..."
-                    result_text += f"\n• `{short_url}`: {error}"
-                if len(failed_products) > 3:
-                    result_text += f"\n_...and {len(failed_products) - 3} more_"
-
-            if invalid_format:
-                result_text += f"\n\n⚠️ *{len(invalid_format)} invalid format* (missing /products/)"
-
-            result_text += "\n\n_🔄 Delivery errors will auto-remove products during checking_"
-
-            await status_msg.edit_text(
-                result_text,
-                parse_mode="Markdown",
-                reply_markup=get_back_keyboard("menu_products")
-            )
+        if len(added_products) == 1:
+            url, short = added_products[0]
+            result_text = f"✅ *Product Added!*\n\n📦 `{short}`\n\n📊 Total: {len(current_products)} products"
         else:
-            # All failed or duplicates
-            result_text = "❌ *No products could be added!*\n\n"
+            result_text = f"✅ *{len(added_products)} Products Added!*\n\n"
+            for i, (url, short) in enumerate(added_products[:8], 1):
+                result_text += f"{i}. `{short}`\n"
+            if len(added_products) > 8:
+                result_text += f"_...and {len(added_products) - 8} more_\n"
+            result_text += f"\n📊 Total: {len(current_products)} products"
 
-            if duplicate_products:
-                result_text += f"⚠️ *{len(duplicate_products)} already in your list*\n\n"
+        # Show warnings
+        if duplicate_products:
+            result_text += f"\n\n⚠️ *{len(duplicate_products)} duplicate(s) skipped*"
 
-            if failed_products:
-                result_text += "*Not found:*\n"
-                for url, error in failed_products[:5]:
-                    short_url = url.split('/products/')[-1][:25]
-                    result_text += f"• `{short_url}`\n  └ _{error}_\n"
-                if len(failed_products) > 5:
-                    result_text += f"_...and {len(failed_products) - 5} more_"
+        result_text += "\n\n_🧹 Use Clean Products to remove broken ones_"
 
-            if invalid_format:
-                result_text += f"\n\n⚠️ *{len(invalid_format)} URLs missing /products/*"
-
-            await status_msg.edit_text(
-                result_text,
-                parse_mode="Markdown",
-                reply_markup=get_back_keyboard("menu_products")
-            )
+        await status_msg.edit_text(
+            result_text,
+            parse_mode="Markdown",
+            reply_markup=get_back_keyboard("menu_products")
+        )
         return
 
     # =============================================================================

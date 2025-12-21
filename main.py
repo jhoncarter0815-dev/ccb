@@ -1895,6 +1895,7 @@ def get_products_keyboard(user_id: int):
         ])
 
     if products:
+        keyboard.append([InlineKeyboardButton("🧹 Clean Products", callback_data="prod_clean")])
         keyboard.append([InlineKeyboardButton("🗑️ Clear All", callback_data="prod_clear_all")])
 
     keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="menu_main")])
@@ -2235,6 +2236,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ *All Products Cleared*",
             parse_mode="Markdown",
             reply_markup=get_back_keyboard("menu_products")
+        )
+
+    # Clean products - validate all products with a test card
+    elif data == "prod_clean":
+        settings = get_user_settings(user_id)
+        products = settings.get("products", [])
+
+        if not products:
+            await query.answer("No products to clean!", show_alert=True)
+            return
+
+        set_waiting_for(user_id, "clean_products")
+        await query.edit_message_text(
+            "🧹 *Clean Products*\n\n"
+            f"You have *{len(products)}* product\\(s\\)\\.\n\n"
+            "Send a *test card* to validate all products:\n"
+            "`4111111111111111|12|2025|123`\n\n"
+            "I'll test this card against each product and remove any that fail with delivery/product errors\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=get_cancel_keyboard()
         )
 
     # Proxy menu
@@ -3001,6 +3022,7 @@ def is_product_error(error_msg: str) -> bool:
         # These mean the product is misconfigured and can't be used
         "no delivery option available",
         "no delivery options",
+        "no available delivery strategy",
         "no shipping method",
         "no shipping options available",
         "no shipping rates",
@@ -3008,6 +3030,7 @@ def is_product_error(error_msg: str) -> bool:
         "cannot ship to",
         "does not ship to",
         "delivery not available",
+        "delivery strategy found",
         "shipping not available",
         "no rates available",
         "unable to calculate shipping",
@@ -4660,6 +4683,141 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=get_back_keyboard("menu_proxy")
             )
+        return
+
+    # Handle clean products input (test card)
+    if waiting_for == "clean_products":
+        set_waiting_for(user_id, None)
+
+        # Validate the test card
+        card = text.strip()
+        is_valid, validation_error, parsed_card = validate_card_full(card)
+
+        if not is_valid:
+            await update.message.reply_text(
+                f"❌ *Invalid Test Card*\n\n{validation_error}\n\n"
+                "Please use format: `card|mm|yyyy|cvv`",
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard("menu_products")
+            )
+            return
+
+        settings = get_user_settings(user_id)
+        products = settings.get("products", [])
+
+        if not products:
+            await update.message.reply_text(
+                "❌ *No products to clean!*",
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard("menu_products")
+            )
+            return
+
+        # Show progress message
+        status_msg = await update.message.reply_text(
+            f"🧹 *Cleaning Products...*\n\n"
+            f"Testing card against {len(products)} product(s)...\n\n"
+            f"⏳ Progress: 0/{len(products)}",
+            parse_mode="Markdown"
+        )
+
+        # Get user's proxy settings
+        user_proxy = settings.get("proxy")
+        if isinstance(user_proxy, list):
+            proxies = user_proxy if user_proxy else config.PROXY_LIST
+        elif user_proxy:
+            proxies = [user_proxy]
+        else:
+            proxies = config.PROXY_LIST
+
+        # Get a healthy proxy
+        healthy_proxy = await get_healthy_proxy(proxies) if proxies else None
+        active_proxies = [healthy_proxy] if healthy_proxy else proxies
+
+        # Test each product
+        working_products = []
+        failed_products = []
+
+        for i, product_url in enumerate(products):
+            try:
+                # Update progress every product
+                if i % 2 == 0 or i == len(products) - 1:
+                    try:
+                        await status_msg.edit_text(
+                            f"🧹 *Cleaning Products...*\n\n"
+                            f"Testing: `{product_url.split('/products/')[-1][:30]}...`\n\n"
+                            f"⏳ Progress: {i}/{len(products)}\n"
+                            f"✅ Working: {len(working_products)}\n"
+                            f"❌ Failed: {len(failed_products)}",
+                            parse_mode="Markdown"
+                        )
+                    except:
+                        pass
+
+                # Test the card against this product
+                response = await auto_shopify_client(
+                    card=card,
+                    product_url=product_url,
+                    email=settings.get("email") or config.DEFAULT_EMAIL,
+                    is_shippable=settings.get("is_shippable", config.IS_SHIPPABLE),
+                    proxies=active_proxies,
+                    logger=logger
+                )
+
+                error_msg = response.get("error", "") if response else ""
+
+                # Check if this is a product error
+                if is_product_error(error_msg):
+                    failed_products.append((product_url, error_msg))
+                else:
+                    # Product works (even if card declined, the product itself is fine)
+                    working_products.append(product_url)
+
+                # Small delay between requests
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                # On exception, assume product might be fine (don't remove)
+                logger.error(f"Error testing product {product_url}: {e}")
+                working_products.append(product_url)
+
+        # Update the user's products to only keep working ones
+        if working_products or not failed_products:
+            update_user_setting(user_id, "products", working_products)
+
+        # Build result message
+        result_text = f"🧹 *Product Cleaning Complete!*\n\n"
+        result_text += f"📊 *Summary:*\n"
+        result_text += f"• ✅ Working: {len(working_products)}\n"
+        result_text += f"• ❌ Removed: {len(failed_products)}\n\n"
+
+        if working_products:
+            result_text += "*✅ Kept Products:*\n"
+            for i, url in enumerate(working_products[:5], 1):
+                short = url.split("/products/")[-1][:25] if "/products/" in url else url[:25]
+                result_text += f"{i}. `{short}`\n"
+            if len(working_products) > 5:
+                result_text += f"_...and {len(working_products) - 5} more_\n"
+            result_text += "\n"
+
+        if failed_products:
+            result_text += "*❌ Removed Products:*\n"
+            for i, (url, reason) in enumerate(failed_products[:5], 1):
+                short = url.split("/products/")[-1][:20] if "/products/" in url else url[:20]
+                short_reason = reason[:30] + "..." if len(reason) > 30 else reason
+                result_text += f"{i}. `{short}`\n   └ _{short_reason}_\n"
+            if len(failed_products) > 5:
+                result_text += f"_...and {len(failed_products) - 5} more_\n"
+
+        if not working_products and failed_products:
+            result_text += "\n⚠️ *All products were removed!*\n"
+            result_text += "Use /addproduct to add new products."
+
+        await status_msg.edit_text(
+            result_text,
+            parse_mode="Markdown",
+            reply_markup=get_back_keyboard("menu_products")
+        )
         return
 
     # =============================================================================

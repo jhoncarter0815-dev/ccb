@@ -1183,17 +1183,24 @@ async def auto_shopify_client(
                     # Debug info
                     logger.info( f"[Attempt {attempt}/{max_retries}] status={status}, error={error}")
 
-                    # Retry conditions
-                    if error and any(err in error for err in (
+                    # Retry conditions - these errors should be retried
+                    error_lower = error.lower() if error else ""
+                    if error and any(err.lower() in error_lower for err in (
                         "ProxyError",
                         "Failed to connect to proxy",
                         "Failed to initialize checkout data",
                         "Failed to perform, curl",
-                        'Failed to add to cart'
+                        "Failed to add to cart",
+                        "unknown error occurred",
+                        "try again later",
+                        "internal server error",
+                        "service unavailable",
+                        "bad gateway",
+                        "gateway timeout",
                     )):
                         last_error = {"error": error, "status": status}
 
-                    elif error and "captcha is required for this checkout" in error.lower():
+                    elif error and "captcha is required for this checkout" in error_lower:
                         last_error = {
                             "error": "Captcha triggered! Try again.", "status": status}
 

@@ -1839,10 +1839,15 @@ def get_gateway_keyboard(user_id: int):
 
     keyboard = [
         [InlineKeyboardButton(f"{auto_mark}🛒 Auto Shopify", callback_data="gw_autoshopify")],
-        [InlineKeyboardButton(f"{stripe_mark}💳 Stripe", callback_data="gw_stripe")],
-        [InlineKeyboardButton("ℹ️ How to Check Cards", callback_data="menu_check_info")],
-        [InlineKeyboardButton("◀️ Back", callback_data="menu_main")],
     ]
+
+    # Stripe gateway only available to admins
+    if is_admin(user_id):
+        keyboard.append([InlineKeyboardButton(f"{stripe_mark}💳 Stripe", callback_data="gw_stripe")])
+
+    keyboard.append([InlineKeyboardButton("ℹ️ How to Check Cards", callback_data="menu_check_info")])
+    keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="menu_main")])
+
     return InlineKeyboardMarkup(keyboard)
 
 def get_products_keyboard(user_id: int):
@@ -2304,8 +2309,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_gateway_keyboard(user_id)
         )
 
-    # Gateway selection - Stripe
+    # Gateway selection - Stripe (Admin only)
     elif data == "gw_stripe":
+        if not is_admin(user_id):
+            await query.answer("❌ Stripe gateway is admin only!", show_alert=True)
+            return
         settings = get_user_settings(user_id)
         settings["gateway"] = "stripe"
         save_user_settings(user_id, settings)

@@ -4771,8 +4771,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Show progress message
         status_msg = await update.message.reply_text(
-            f"🧹 *Cleaning {len(products)} products in parallel...*\n\n"
-            f"⏳ This may take a few seconds...",
+            f"🧹 *Cleaning {len(products)} products...*\n\n"
+            f"⏳ Progress: 0/{len(products)}\n"
+            f"✅ Working: 0\n"
+            f"❌ Failed: 0",
             parse_mode="Markdown"
         )
 
@@ -4784,6 +4786,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             proxies = [user_proxy]
         else:
             proxies = config.PROXY_LIST
+
+        # Progress tracking
+        progress = {"done": 0, "working": 0, "failed": 0, "total": len(products)}
+        last_update = [0]  # Use list to allow modification in nested function
+
+        async def update_progress():
+            """Update progress message (max once per second)"""
+            import time
+            now = time.time()
+            if now - last_update[0] >= 1:  # Update at most once per second
+                last_update[0] = now
+                try:
+                    await status_msg.edit_text(
+                        f"🧹 *Cleaning {progress['total']} products...*\n\n"
+                        f"⏳ Progress: {progress['done']}/{progress['total']}\n"
+                        f"✅ Working: {progress['working']}\n"
+                        f"❌ Failed: {progress['failed']}",
+                        parse_mode="Markdown"
+                    )
+                except:
+                    pass
 
         # Test products in PARALLEL for speed
         async def test_product(product_url):
@@ -4801,12 +4824,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 error_msg = response.get("error", "") if response else ""
                 if is_product_error(error_msg):
+                    progress["failed"] += 1
+                    progress["done"] += 1
+                    await update_progress()
                     return (product_url, False, error_msg)
                 else:
+                    progress["working"] += 1
+                    progress["done"] += 1
+                    await update_progress()
                     return (product_url, True, "")
             except asyncio.TimeoutError:
+                progress["working"] += 1
+                progress["done"] += 1
+                await update_progress()
                 return (product_url, True, "")  # Keep on timeout
             except Exception as e:
+                progress["working"] += 1
+                progress["done"] += 1
+                await update_progress()
                 return (product_url, True, "")  # Keep on error
 
         # Run all tests in parallel (max 5 concurrent to avoid rate limits)

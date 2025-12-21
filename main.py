@@ -1832,7 +1832,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Send a Shopify product URL:\n"
             "`https://store.com/products/item`\n\n"
             "Or send *multiple URLs* (one per line)\n\n"
-            "_🔄 Invalid products will be auto-removed during card checking_",
+            "✅ Product must exist (404 = rejected)\n"
+            "_🔄 Delivery errors auto-remove during checking_",
             parse_mode="Markdown",
             reply_markup=get_cancel_keyboard()
         )
@@ -4669,8 +4670,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Handle product input - NO VALIDATION, just add directly
-    # Invalid products will be auto-removed during card checking
+    # Handle product input - validate product exists, but allow any product type
+    # Shipping/delivery errors will be auto-removed during card checking
     if waiting_for == "product":
         set_waiting_for(user_id, None)
 
@@ -4701,20 +4702,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Show validation status
+        if len(product_urls) == 1:
+            status_msg = await update.message.reply_text(
+                "⏳ *Validating product...*",
+                parse_mode="Markdown"
+            )
+        else:
+            status_msg = await update.message.reply_text(
+                f"⏳ *Validating {len(product_urls)} products...*",
+                parse_mode="Markdown"
+            )
+
         # Get current products
         settings = get_user_settings(user_id)
         current_products = settings.get("products", [])
 
-        # Add products (skip duplicates)
+        # Validate and add products
         added_products = []
+        failed_products = []
         duplicate_products = []
 
         for url in product_urls:
+            # Check for duplicates first
             if url in current_products:
                 duplicate_products.append(url)
-            else:
-                added_products.append(url)
+                continue
+
+            # Validate product exists (but allow any product type)
+            is_valid, message = await validate_shopify_product(url, check_shipping=False)
+
+            if is_valid:
+                added_products.append((url, message))
                 current_products.append(url)
+            else:
+                failed_products.append((url, message))
 
         # Save updated products
         if added_products:
@@ -4723,11 +4745,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Build response
         if added_products:
             if len(added_products) == 1:
-                short_url = added_products[0].split('/products/')[-1][:30]
-                result_text = f"✅ *Product Added!*\n\n🔗 `{short_url}`\n📦 Total products: {len(current_products)}"
+                url, msg = added_products[0]
+                result_text = f"✅ *Product Added!*\n\n📝 {msg}\n📦 Total products: {len(current_products)}"
             else:
                 result_text = f"✅ *{len(added_products)} Products Added!*\n\n"
-                for i, url in enumerate(added_products[:5], 1):
+                for i, (url, msg) in enumerate(added_products[:5], 1):
                     short_url = url.split('/products/')[-1][:25]
                     result_text += f"{i}. `{short_url}`\n"
                 if len(added_products) > 5:
@@ -4738,25 +4760,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if duplicate_products:
                 result_text += f"\n\n⚠️ *{len(duplicate_products)} duplicate(s) skipped*"
 
+            if failed_products:
+                result_text += f"\n\n❌ *{len(failed_products)} not found:*"
+                for url, error in failed_products[:3]:
+                    short_url = url.split('/products/')[-1][:20] + "..."
+                    result_text += f"\n• `{short_url}`: {error}"
+                if len(failed_products) > 3:
+                    result_text += f"\n_...and {len(failed_products) - 3} more_"
+
             if invalid_format:
                 result_text += f"\n\n⚠️ *{len(invalid_format)} invalid format* (missing /products/)"
 
-            result_text += "\n\n_🔄 Invalid products will be auto-removed during checking_"
+            result_text += "\n\n_🔄 Delivery errors will auto-remove products during checking_"
 
-            await update.message.reply_text(
+            await status_msg.edit_text(
                 result_text,
                 parse_mode="Markdown",
                 reply_markup=get_back_keyboard("menu_products")
             )
         else:
-            # All duplicates
-            result_text = "⚠️ *No new products added!*\n\n"
-            result_text += f"All {len(duplicate_products)} product(s) already in your list."
+            # All failed or duplicates
+            result_text = "❌ *No products could be added!*\n\n"
+
+            if duplicate_products:
+                result_text += f"⚠️ *{len(duplicate_products)} already in your list*\n\n"
+
+            if failed_products:
+                result_text += "*Not found:*\n"
+                for url, error in failed_products[:5]:
+                    short_url = url.split('/products/')[-1][:25]
+                    result_text += f"• `{short_url}`\n  └ _{error}_\n"
+                if len(failed_products) > 5:
+                    result_text += f"_...and {len(failed_products) - 5} more_"
 
             if invalid_format:
                 result_text += f"\n\n⚠️ *{len(invalid_format)} URLs missing /products/*"
 
-            await update.message.reply_text(
+            await status_msg.edit_text(
                 result_text,
                 parse_mode="Markdown",
                 reply_markup=get_back_keyboard("menu_products")

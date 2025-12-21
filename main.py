@@ -1891,21 +1891,42 @@ def get_products_keyboard(user_id: int):
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_edit_products_keyboard(user_id: int):
-    """Build edit products keyboard with delete options"""
+def get_edit_products_keyboard(user_id: int, page: int = 0):
+    """Build edit products keyboard with delete options and pagination"""
     settings = get_user_settings(user_id)
     products = settings.get("products", [])
+
+    ITEMS_PER_PAGE = 8
+    total_pages = max(1, (len(products) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))  # Clamp page to valid range
 
     keyboard = []
 
     if products:
-        for i, url in enumerate(products):
+        # Get products for current page
+        start_idx = page * ITEMS_PER_PAGE
+        end_idx = min(start_idx + ITEMS_PER_PAGE, len(products))
+        page_products = products[start_idx:end_idx]
+
+        for i, url in enumerate(page_products):
+            actual_idx = start_idx + i
             # Shorten URL for display
             display = url.split("/products/")[-1][:20] if "/products/" in url else url[:20]
             keyboard.append([
-                InlineKeyboardButton(f"📦 {display}", callback_data=f"prod_view_{i}"),
-                InlineKeyboardButton("🗑️", callback_data=f"prod_del_{i}")
+                InlineKeyboardButton(f"📦 {display}", callback_data=f"prod_view_{actual_idx}"),
+                InlineKeyboardButton("🗑️", callback_data=f"prod_del_{actual_idx}")
             ])
+
+        # Pagination buttons
+        if total_pages > 1:
+            nav_buttons = []
+            if page > 0:
+                nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"prod_page_{page-1}"))
+            nav_buttons.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+            if page < total_pages - 1:
+                nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"prod_page_{page+1}"))
+            keyboard.append(nav_buttons)
+
         keyboard.append([InlineKeyboardButton("🗑️ Clear All", callback_data="prod_clear_all")])
     else:
         keyboard.append([InlineKeyboardButton("➕ Add Products", callback_data="prod_add")])
@@ -2272,25 +2293,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     # Edit products - view/delete products
-    elif data == "prod_edit":
+    elif data == "prod_edit" or data.startswith("prod_page_"):
+        # Get page number
+        page = 0
+        if data.startswith("prod_page_"):
+            page = int(data.split("_")[-1])
+
         settings = get_user_settings(user_id)
         products = settings.get("products", [])
 
         if products:
-            text = f"✏️ *Edit Products* ({len(products)})\n\n"
-            for i, url in enumerate(products[:10]):
-                short_url = url.split('/products/')[-1][:25] if '/products/' in url else url[:25]
-                text += f"{i+1}. `{short_url}`\n"
-            if len(products) > 10:
-                text += f"_...and {len(products) - 10} more_\n"
-            text += "\nTap 🗑️ to delete a product."
+            text = f"✏️ *Edit Products* ({len(products)} total)\n\n"
+            text += "Tap 📦 to view full URL\nTap 🗑️ to delete"
         else:
             text = "✏️ *Edit Products*\n\nNo products added yet."
 
         await query.edit_message_text(
             text,
             parse_mode="Markdown",
-            reply_markup=get_edit_products_keyboard(user_id)
+            reply_markup=get_edit_products_keyboard(user_id, page)
         )
 
     # Proxy menu

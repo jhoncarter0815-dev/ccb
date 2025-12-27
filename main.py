@@ -3148,31 +3148,56 @@ async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         results = ["🔐 *Stripe SK Status Check*\n"]
 
-        # Check current IP first (with timeout protection)
-        try:
-            ip_info = await asyncio.wait_for(check_current_ip(), timeout=5.0)
-        except asyncio.TimeoutError:
-            ip_info = {"ip": "Timeout", "error": "IP check timed out"}
-        except Exception as e:
-            ip_info = {"ip": "Error", "error": str(e)[:30]}
+        # Check if admin has proxy configured
+        admin_settings = get_user_settings(user_id)
+        user_proxy = admin_settings.get("proxy")
 
-        results.append("🌐 *Server IP Check:*")
-        if "error" in ip_info:
-            results.append(f"  ⚠️ {ip_info.get('error', 'Unknown')[:30]}")
-        else:
-            ip = ip_info.get("ip", "Unknown")
-            isp = ip_info.get("isp", "Unknown") or "Unknown"
-            org = ip_info.get("org", "Unknown") or "Unknown"
-            is_dc = ip_info.get("is_datacenter", False)
-
-            results.append(f"  📍 IP: `{ip}`")
-            results.append(f"  🏢 ISP: {isp[:30]}")
-            if is_dc:
-                results.append(f"  ⚠️ *DATACENTER IP DETECTED!*")
-                results.append(f"  ⚠️ This causes high decline rates!")
-                results.append(f"  💡 Use residential proxy via /setproxy")
+        if user_proxy:
+            # User has proxy - show proxy info
+            if isinstance(user_proxy, list) and user_proxy:
+                proxy_str = user_proxy[0]
+            elif isinstance(user_proxy, str):
+                proxy_str = user_proxy
             else:
-                results.append(f"  ✅ Residential IP")
+                proxy_str = None
+
+            if proxy_str:
+                results.append("🌐 *Proxy Status:*")
+                # Mask proxy for display
+                parts = proxy_str.split(":")
+                if len(parts) >= 2:
+                    masked = f"{parts[0]}:****"
+                    results.append(f"  ✅ Proxy configured: `{masked}`")
+                else:
+                    results.append(f"  ✅ Proxy configured")
+                results.append(f"  ℹ️ Card checks will use this proxy")
+            else:
+                results.append("🌐 *Server IP (no proxy):*")
+                results.append(f"  ⚠️ No valid proxy configured")
+        else:
+            # No proxy - check server IP
+            try:
+                ip_info = await asyncio.wait_for(check_current_ip(), timeout=5.0)
+            except asyncio.TimeoutError:
+                ip_info = {"ip": "Timeout", "error": "IP check timed out"}
+            except Exception as e:
+                ip_info = {"ip": "Error", "error": str(e)[:30]}
+
+            results.append("🌐 *Server IP (no proxy):*")
+            if "error" in ip_info:
+                results.append(f"  ⚠️ {ip_info.get('error', 'Unknown')[:30]}")
+            else:
+                ip = ip_info.get("ip", "Unknown")
+                isp = ip_info.get("isp", "Unknown") or "Unknown"
+                is_dc = ip_info.get("is_datacenter", False)
+
+                results.append(f"  📍 IP: `{ip}`")
+                results.append(f"  🏢 ISP: {isp[:30]}")
+                if is_dc:
+                    results.append(f"  ⚠️ *DATACENTER IP DETECTED!*")
+                    results.append(f"  💡 Use /setproxy to add proxy")
+                else:
+                    results.append(f"  ✅ Residential IP")
 
         # Check if keys are configured
         if not stripe_sk:
@@ -3577,6 +3602,100 @@ async def synckeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results.append("\n💡 Use `/skstatus` to verify")
 
     await update.message.reply_text("\n".join(results), parse_mode="Markdown")
+
+
+async def testproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /testproxy command - test configured proxy"""
+    user_id = update.effective_user.id
+
+    msg = await update.message.reply_text("🔄 *Testing proxy...*", parse_mode="Markdown")
+
+    settings = get_user_settings(user_id)
+    user_proxy = settings.get("proxy")
+
+    if not user_proxy:
+        await msg.edit_text("❌ No proxy configured. Use `/setproxy` to add one.", parse_mode="Markdown")
+        return
+
+    # Get proxy string
+    if isinstance(user_proxy, list) and user_proxy:
+        proxy_str = user_proxy[0]
+    elif isinstance(user_proxy, str):
+        proxy_str = user_proxy
+    else:
+        await msg.edit_text("❌ Invalid proxy format in settings.", parse_mode="Markdown")
+        return
+
+    results = ["🌐 *Proxy Test Results*\n"]
+
+    # Parse and validate
+    is_valid, proxy_url, error = parse_proxy_format(proxy_str)
+    if not is_valid:
+        results.append(f"❌ *Parse Error*: {error}")
+        await msg.edit_text("\n".join(results), parse_mode="Markdown")
+        return
+
+    results.append(f"✅ Proxy format valid")
+
+    # Test connectivity
+    try:
+        import aiohttp
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Test 1: Basic connectivity
+            try:
+                async with session.get("https://httpbin.org/ip", proxy=proxy_url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        proxy_ip = data.get("origin", "Unknown")
+                        results.append(f"✅ Connected successfully!")
+                        results.append(f"📍 Proxy IP: `{proxy_ip}`")
+
+                        # Check if IP is residential
+                        try:
+                            async with session.get(f"http://ip-api.com/json/{proxy_ip}") as ip_resp:
+                                if ip_resp.status == 200:
+                                    ip_data = await ip_resp.json()
+                                    org = ip_data.get("org", "").lower()
+                                    isp = ip_data.get("isp", "Unknown")
+                                    country = ip_data.get("country", "Unknown")
+
+                                    results.append(f"🌍 Country: {country}")
+                                    results.append(f"🏢 ISP: {isp[:30]}")
+
+                                    is_dc = any(x in org for x in ["cloud", "hosting", "data", "server", "vps"])
+                                    if is_dc:
+                                        results.append(f"⚠️ *DATACENTER PROXY* - may still get blocks")
+                                    else:
+                                        results.append(f"✅ *RESIDENTIAL PROXY* - good for Stripe!")
+                        except:
+                            pass
+                    else:
+                        results.append(f"❌ Proxy returned status {resp.status}")
+            except aiohttp.ClientProxyConnectionError:
+                results.append(f"❌ Failed to connect to proxy")
+                results.append(f"💡 Check proxy host/port")
+            except aiohttp.ClientHttpProxyError as e:
+                results.append(f"❌ Proxy auth failed")
+                results.append(f"💡 Check username/password")
+            except Exception as e:
+                results.append(f"❌ Error: {str(e)[:40]}")
+
+            # Test 2: Stripe API access
+            results.append("\n📊 *Stripe API Test:*")
+            try:
+                async with session.get("https://api.stripe.com/", proxy=proxy_url) as resp:
+                    if resp.status in [200, 401, 403]:
+                        results.append(f"✅ Can reach Stripe API")
+                    else:
+                        results.append(f"⚠️ Stripe returned {resp.status}")
+            except Exception as e:
+                results.append(f"❌ Cannot reach Stripe: {str(e)[:30]}")
+
+    except Exception as e:
+        results.append(f"❌ Test failed: {str(e)[:50]}")
+
+    await msg.edit_text("\n".join(results), parse_mode="Markdown")
 
 
 async def clearkeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4977,6 +5096,7 @@ def main():
     app.add_handler(CommandHandler("setpk", setpk_command))
     app.add_handler(CommandHandler("synckeys", synckeys_command))
     app.add_handler(CommandHandler("clearkeys", clearkeys_command))
+    app.add_handler(CommandHandler("testproxy", testproxy_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("chk", check_command))
     app.add_handler(CallbackQueryHandler(handle_callback))

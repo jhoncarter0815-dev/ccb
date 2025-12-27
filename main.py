@@ -1528,10 +1528,12 @@ async def stripe_gateway_check(
 
                 # Click the submit/donate button
                 try:
-                    submit_btn = page.locator('button[type="submit"], input[type="submit"], .give-submit, #give-purchase-button').first
-                    await submit_btn.click()
+                    # Wait for submit button to be visible
+                    submit_btn = page.locator('.give-submit, .give-btn, input[name="give-purchase"], button:has-text("Donate")').first
+                    await submit_btn.wait_for(state="visible", timeout=10000)
+                    await submit_btn.click(timeout=10000)
                 except Exception as e:
-                    last_error = {"success": False, "error": f"Submit button error: {str(e)[:30]}"}
+                    last_error = {"success": False, "error": f"Submit error: {str(e)[:40]}"}
                     await browser.close()
                     await exponential_backoff(attempt)
                     continue

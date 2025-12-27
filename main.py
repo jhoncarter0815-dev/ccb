@@ -1448,108 +1448,53 @@ async def stripe_gateway_check(
                     logger.info(f"[Attempt {attempt}] Waiting for Stripe iframe...")
 
                 try:
-                    # Wait for any iframes to appear
+                    # Wait for Stripe iframes to appear
                     await page.wait_for_selector('iframe', timeout=10000)
+                    await page.wait_for_timeout(2000)  # Let Stripe.js initialize
 
-                    # Get all iframes and find the Stripe one
-                    iframes = await page.locator('iframe').all()
-                    if logger:
-                        logger.info(f"[Attempt {attempt}] Found {len(iframes)} iframes")
-
-                    stripe_frame = None
-                    frame = None
-
-                    for iframe in iframes:
+                    # Use frame_locator for Stripe iframes (proper Playwright API)
+                    # Try different Stripe iframe selectors
+                    stripe_frame_locator = None
+                    for selector in [
+                        'iframe[name*="__privateStripeFrame"]',
+                        'iframe[src*="stripe.com"]',
+                        'iframe[title*="Secure"]',
+                    ]:
                         try:
-                            name = await iframe.get_attribute('name') or ''
-                            src = await iframe.get_attribute('src') or ''
-                            if 'stripe' in name.lower() or 'stripe' in src.lower():
-                                stripe_frame = iframe
-                                frame = await iframe.content_frame()
-                                if frame:
-                                    break
+                            fl = page.frame_locator(selector).first
+                            # Test if we can find card input in this frame
+                            test_input = fl.locator('input').first
+                            if await test_input.count() > 0:
+                                stripe_frame_locator = fl
+                                break
                         except Exception:
                             continue
 
-                    if not frame:
-                        # Try the first iframe as fallback
-                        if iframes:
-                            frame = await iframes[0].content_frame()
-
-                    if not frame:
-                        raise Exception("Could not access Stripe iframe")
+                    if not stripe_frame_locator:
+                        # Fallback: try first iframe
+                        stripe_frame_locator = page.frame_locator('iframe').first
 
                     if logger:
                         logger.info(f"[Attempt {attempt}] Found Stripe iframe, entering card details...")
 
-                    # Find and fill card number - try multiple selectors
-                    card_selectors = [
-                        'input[name="cardnumber"]',
-                        'input[data-elements-stable-field-name="cardNumber"]',
-                        'input[autocomplete="cc-number"]',
-                        'input[placeholder*="card number" i]',
-                    ]
-
-                    card_input = None
-                    for sel in card_selectors:
-                        try:
-                            card_input = frame.locator(sel).first
-                            if await card_input.is_visible(timeout=2000):
-                                break
-                        except Exception:
-                            continue
-
-                    if not card_input:
-                        raise Exception("Card input not found")
-
-                    await card_input.click()
-                    await card_input.type(cc_num, delay=50)
+                    # Find and fill card number
+                    card_input = stripe_frame_locator.locator('input[name="cardnumber"], input[autocomplete="cc-number"]').first
+                    await card_input.click(timeout=5000)
+                    await card_input.fill(cc_num)
                     await random_delay(0.2, 0.4)
 
                     # Type expiry
-                    exp_selectors = [
-                        'input[name="exp-date"]',
-                        'input[data-elements-stable-field-name="cardExpiry"]',
-                        'input[autocomplete="cc-exp"]',
-                        'input[placeholder*="MM" i]',
-                    ]
-
-                    exp_input = None
-                    for sel in exp_selectors:
-                        try:
-                            exp_input = frame.locator(sel).first
-                            if await exp_input.is_visible(timeout=2000):
-                                break
-                        except Exception:
-                            continue
-
-                    if exp_input:
-                        await exp_input.click()
-                        exp_str = f"{cc_month}{cc_year}"
-                        await exp_input.type(exp_str, delay=50)
-                        await random_delay(0.2, 0.4)
+                    exp_input = stripe_frame_locator.locator('input[name="exp-date"], input[autocomplete="cc-exp"]').first
+                    await exp_input.click(timeout=5000)
+                    exp_str = f"{cc_month}/{cc_year}"
+                    await exp_input.fill(exp_str)
+                    await random_delay(0.2, 0.4)
 
                     # Type CVC
-                    cvc_selectors = [
-                        'input[name="cvc"]',
-                        'input[data-elements-stable-field-name="cardCvc"]',
-                        'input[autocomplete="cc-csc"]',
-                        'input[placeholder*="CVC" i]',
-                    ]
-
-                    cvc_input = None
-                    for sel in cvc_selectors:
-                        try:
-                            cvc_input = frame.locator(sel).first
-                            if await cvc_input.is_visible(timeout=2000):
-                                break
-                        except Exception:
-                            continue
-
-                    if cvc_input:
-                        await cvc_input.click()
-                        await cvc_input.type(cc_cvv, delay=50)
-                        await random_delay(0.3, 0.6)
+                    cvc_input = stripe_frame_locator.locator('input[name="cvc"], input[autocomplete="cc-csc"]').first
+                    await cvc_input.click(timeout=5000)
+                    await cvc_input.fill(cc_cvv)
+                    await random_delay(0.3, 0.6)
 
                 except PlaywrightTimeout:
                     last_error = {"success": False, "error": "Stripe iframe timeout"}

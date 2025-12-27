@@ -1332,27 +1332,45 @@ async def check_proxy_health(proxy: str, skip_cache: bool = False) -> tuple:
         return False, f"Error: {str(e)[:50]}"
 
 
-async def get_healthy_proxy(proxies: list) -> str:
+# Track last used proxy index per user for round-robin rotation
+_proxy_rotation_index = {}
+
+async def get_healthy_proxy(proxies: list, user_id: int = None) -> str:
     """
-    Get a healthy proxy from the list.
+    Get a healthy proxy from the list using round-robin rotation.
+    Each call rotates to the next proxy in the list.
     Returns None if no healthy proxies found.
     """
     if not proxies:
         return None
 
-    # Shuffle to distribute load
-    import random
-    shuffled = proxies.copy()
-    random.shuffle(shuffled)
+    # Filter out empty proxies
+    valid_proxies = [p for p in proxies if p]
+    if not valid_proxies:
+        return None
 
-    for proxy in shuffled:
-        if proxy:
-            is_healthy, _ = await check_proxy_health(proxy)
-            if is_healthy:
-                return proxy
+    # Use round-robin rotation
+    global _proxy_rotation_index
+    key = user_id or "global"
 
-    # If all proxies failed, return random one anyway (might recover)
-    return random.choice([p for p in proxies if p]) if any(proxies) else None
+    # Get current index and rotate
+    current_idx = _proxy_rotation_index.get(key, 0)
+
+    # Try proxies starting from current index
+    for i in range(len(valid_proxies)):
+        idx = (current_idx + i) % len(valid_proxies)
+        proxy = valid_proxies[idx]
+
+        is_healthy, _ = await check_proxy_health(proxy)
+        if is_healthy:
+            # Update index to next proxy for next call
+            _proxy_rotation_index[key] = (idx + 1) % len(valid_proxies)
+            return proxy
+
+    # All proxies unhealthy - return next one anyway (might recover)
+    next_proxy = valid_proxies[current_idx % len(valid_proxies)]
+    _proxy_rotation_index[key] = (current_idx + 1) % len(valid_proxies)
+    return next_proxy
 
 
 # =============================================================================
@@ -1789,8 +1807,14 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
                 else:
                     proxies = config.PROXY_LIST
 
-                # Get a healthy proxy if available
-                healthy_proxy = await get_healthy_proxy(proxies) if proxies else None
+                # Get a healthy proxy with round-robin rotation
+                healthy_proxy = await get_healthy_proxy(proxies, user_id) if proxies else None
+
+                if healthy_proxy and logger:
+                    # Log which proxy is being used (masked)
+                    parts = healthy_proxy.split(":")
+                    masked = f"{parts[0]}:***" if parts else "***"
+                    logger.debug(f"Using proxy: {masked}")
 
                 # Use Stripe gateway (only gateway)
                 response = await stripe_gateway_check(
@@ -3618,97 +3642,101 @@ async def synckeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def testproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /testproxy command - test configured proxy"""
+    """Handle /testproxy command - test ALL configured proxies"""
     user_id = update.effective_user.id
 
-    msg = await update.message.reply_text("🔄 *Testing proxy...*", parse_mode="Markdown")
+    msg = await update.message.reply_text("🔄 Testing proxies...")
 
     settings = get_user_settings(user_id)
     user_proxy = settings.get("proxy")
 
     if not user_proxy:
-        await msg.edit_text("❌ No proxy configured. Use `/setproxy` to add one.", parse_mode="Markdown")
+        await msg.edit_text("❌ No proxy configured. Use /setproxy to add one.")
         return
 
-    # Get proxy string
-    if isinstance(user_proxy, list) and user_proxy:
-        proxy_str = user_proxy[0]
+    # Get proxy list
+    if isinstance(user_proxy, list):
+        proxy_list = [p for p in user_proxy if p]
     elif isinstance(user_proxy, str):
-        proxy_str = user_proxy
+        proxy_list = [user_proxy]
     else:
-        await msg.edit_text("❌ Invalid proxy format in settings.", parse_mode="Markdown")
+        await msg.edit_text("❌ Invalid proxy format in settings.")
         return
 
-    results = ["🌐 *Proxy Test Results*\n"]
-
-    # Parse and validate
-    is_valid, proxy_url, error = parse_proxy_format(proxy_str)
-    if not is_valid:
-        results.append(f"❌ *Parse Error*: {error}")
-        await msg.edit_text("\n".join(results), parse_mode="Markdown")
+    if not proxy_list:
+        await msg.edit_text("❌ No valid proxies found.")
         return
 
-    results.append(f"✅ Proxy format valid")
+    results = [f"🌐 Proxy Test Results ({len(proxy_list)} proxies)\n"]
 
-    # Test connectivity
-    try:
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Test 1: Basic connectivity
+    import aiohttp
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    working = 0
+    residential = 0
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for i, proxy_str in enumerate(proxy_list[:5], 1):  # Test max 5
+            # Mask proxy for display
+            parts = proxy_str.split(":")
+            masked = f"{parts[0]}:***" if len(parts) >= 2 else "***"
+
+            results.append(f"\n📍 Proxy {i}: {masked}")
+
+            # Parse proxy
+            is_valid, proxy_url, error = parse_proxy_format(proxy_str)
+            if not is_valid:
+                results.append(f"  ❌ Invalid format: {error[:20]}")
+                continue
+
+            # Test connectivity
             try:
                 async with session.get("https://httpbin.org/ip", proxy=proxy_url) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         proxy_ip = data.get("origin", "Unknown")
-                        results.append(f"✅ Connected successfully!")
-                        results.append(f"📍 Proxy IP: `{proxy_ip}`")
+                        results.append(f"  ✅ Working - IP: {proxy_ip}")
+                        working += 1
 
-                        # Check if IP is residential
+                        # Quick residential check
                         try:
                             async with session.get(f"http://ip-api.com/json/{proxy_ip}") as ip_resp:
                                 if ip_resp.status == 200:
                                     ip_data = await ip_resp.json()
                                     org = ip_data.get("org", "").lower()
-                                    isp = ip_data.get("isp", "Unknown")
-                                    country = ip_data.get("country", "Unknown")
-
-                                    results.append(f"🌍 Country: {country}")
-                                    results.append(f"🏢 ISP: {isp[:30]}")
+                                    isp = ip_data.get("isp", "Unknown")[:20]
 
                                     is_dc = any(x in org for x in ["cloud", "hosting", "data", "server", "vps"])
                                     if is_dc:
-                                        results.append(f"⚠️ *DATACENTER PROXY* - may still get blocks")
+                                        results.append(f"  ⚠️ Datacenter ({isp})")
                                     else:
-                                        results.append(f"✅ *RESIDENTIAL PROXY* - good for Stripe!")
+                                        results.append(f"  ✅ Residential ({isp})")
+                                        residential += 1
                         except:
                             pass
                     else:
-                        results.append(f"❌ Proxy returned status {resp.status}")
+                        results.append(f"  ❌ Status {resp.status}")
             except aiohttp.ClientProxyConnectionError:
-                results.append(f"❌ Failed to connect to proxy")
-                results.append(f"💡 Check proxy host/port")
-            except aiohttp.ClientHttpProxyError as e:
-                results.append(f"❌ Proxy auth failed")
-                results.append(f"💡 Check username/password")
+                results.append(f"  ❌ Connection failed")
+            except aiohttp.ClientHttpProxyError:
+                results.append(f"  ❌ Auth failed")
+            except asyncio.TimeoutError:
+                results.append(f"  ❌ Timeout")
             except Exception as e:
-                results.append(f"❌ Error: {str(e)[:40]}")
+                results.append(f"  ❌ Error: {str(e)[:25]}")
 
-            # Test 2: Stripe API access
-            results.append("\n📊 *Stripe API Test:*")
-            try:
-                async with session.get("https://api.stripe.com/", proxy=proxy_url) as resp:
-                    if resp.status in [200, 401, 403]:
-                        results.append(f"✅ Can reach Stripe API")
-                    else:
-                        results.append(f"⚠️ Stripe returned {resp.status}")
-            except Exception as e:
-                results.append(f"❌ Cannot reach Stripe: {str(e)[:30]}")
+    # Summary
+    results.append(f"\n📊 Summary:")
+    results.append(f"  Total: {len(proxy_list)} proxies")
+    results.append(f"  Working: {working}")
+    results.append(f"  Residential: {residential}")
 
-    except Exception as e:
-        results.append(f"❌ Test failed: {str(e)[:50]}")
+    if working > 0:
+        results.append(f"\n✅ Rotation: Proxies will rotate per-check")
+    else:
+        results.append(f"\n❌ No working proxies!")
 
-    await msg.edit_text("\n".join(results), parse_mode="Markdown")
+    await msg.edit_text("\n".join(results))
 
 
 async def clearkeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

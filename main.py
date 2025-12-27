@@ -4263,9 +4263,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Handle admin set Stripe SK
-    if waiting_for == "admin_set_stripe_sk" and is_admin(user_id):
+    if waiting_for == "admin_set_stripe_sk":
+        if not is_admin(user_id):
+            await update.message.reply_text("🚫 Admin only!")
+            set_waiting_for(user_id, None)
+            return
+
         set_waiting_for(user_id, None)
         new_sk = text.strip()
+
+        logger.info(f"Admin {user_id} updating SK key (length: {len(new_sk)})")
 
         # Validate SK format
         if not (new_sk.startswith("sk_live_") or new_sk.startswith("sk_test_")):
@@ -4280,19 +4287,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Save to database
-        if set_bot_config("stripe_sk_key", new_sk):
-            masked_sk = f"{new_sk[:12]}...{new_sk[-4:]}"
+        try:
+            success = set_bot_config("stripe_sk_key", new_sk)
+            logger.info(f"SK save result: {success}")
+
+            if success:
+                # Clear cache to force reload
+                global bot_config_cache
+                if "stripe_sk_key" in bot_config_cache:
+                    del bot_config_cache["stripe_sk_key"]
+                bot_config_cache["stripe_sk_key"] = new_sk
+
+                masked_sk = f"{new_sk[:12]}...{new_sk[-4:]}"
+                await update.message.reply_text(
+                    f"✅ Stripe SK updated successfully!\n\n"
+                    f"New key: `{masked_sk}`",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("◀️ Back to Settings", callback_data="admin_settings")]
+                    ])
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ Failed to save Stripe SK. Database error.\n"
+                    "Check `/dbstatus` for connection issues.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("◀️ Back", callback_data="admin_settings")]
+                    ])
+                )
+        except Exception as e:
+            logger.error(f"Error saving SK: {e}")
             await update.message.reply_text(
-                f"✅ Stripe SK updated successfully!\n\n"
-                f"New key: `{masked_sk}`",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("◀️ Back to Settings", callback_data="admin_settings")]
-                ])
-            )
-        else:
-            await update.message.reply_text(
-                "❌ Failed to save Stripe SK. Database error.",
+                f"❌ Error saving SK: {str(e)[:50]}",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("◀️ Back", callback_data="admin_settings")]
                 ])

@@ -1571,9 +1571,8 @@ async def stripe_gateway_check(
                     "sid": sid,
                     "time_on_page": str(random.randint(30000, 120000)),  # Milliseconds on page
                     "pasted_fields": "number",  # Simulate pasted card number
-                    # Referrer info to help bypass integration_check
-                    "referrer_info[url]": STRIPE_DONATION_URL,
-                    "referrer_info[title]": "Donation Form",
+                    # Referrer to help bypass integration_check
+                    "referrer": STRIPE_DONATION_URL,
                 }
 
                 stripe_headers = {

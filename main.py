@@ -207,14 +207,21 @@ def init_database():
             )
         """)
 
-        # Insert default Stripe SK key from env if not exists
+        # Insert default Stripe keys from env if not exists
         default_stripe_sk = os.getenv("STRIPE_SK_KEY", "")
+        default_stripe_pk = os.getenv("STRIPE_PK_KEY", "")
         if default_stripe_sk:
             cur.execute("""
                 INSERT INTO bot_config (key, value)
                 VALUES ('stripe_sk_key', %s)
                 ON CONFLICT (key) DO NOTHING
             """, (default_stripe_sk,))
+        if default_stripe_pk:
+            cur.execute("""
+                INSERT INTO bot_config (key, value)
+                VALUES ('stripe_pk_key', %s)
+                ON CONFLICT (key) DO NOTHING
+            """, (default_stripe_pk,))
 
         conn.commit()
         cur.close()
@@ -1369,11 +1376,11 @@ async def stripe_gateway_check(
     logger = None
 ) -> dict:
     """
-    Fast API-based Stripe card check using Secret Key (SK).
-    Creates a PaymentMethod and validates via SetupIntent.
+    Fast API-based Stripe card check using PK + SK.
+    Step 1: Tokenize with PK (like Stripe.js)
+    Step 2: Validate with SK via SetupIntent
     """
     import aiohttp
-    import base64
 
     # Parse card
     parts = card.replace("/", "|").replace(":", "|").split("|")
@@ -1392,10 +1399,14 @@ async def stripe_gateway_check(
     last_error = None
     card_last4 = cc_num[-4:]
 
-    # Get Stripe SK from database config
+    # Get Stripe keys from database config
     stripe_sk = get_bot_config("stripe_sk_key", "")
+    stripe_pk = get_bot_config("stripe_pk_key", "")
+
     if not stripe_sk:
         return {"success": False, "error": "Stripe SK not configured"}
+    if not stripe_pk:
+        return {"success": False, "error": "Stripe PK not configured"}
 
     # Setup proxy
     proxy_url = None
@@ -1410,31 +1421,31 @@ async def stripe_gateway_check(
             connector = aiohttp.TCPConnector(ssl=True)
 
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                # Step 1: Create PaymentMethod with card details
-                pm_url = "https://api.stripe.com/v1/payment_methods"
-                pm_data = {
-                    "type": "card",
+                # Step 1: Tokenize card with PK (like Stripe.js does)
+                token_url = "https://api.stripe.com/v1/tokens"
+                token_data = {
                     "card[number]": cc_num,
                     "card[exp_month]": cc_month,
                     "card[exp_year]": cc_year,
                     "card[cvc]": cc_cvv,
                 }
 
-                headers = {
-                    "Authorization": f"Bearer {stripe_sk}",
+                pk_headers = {
+                    "Authorization": f"Bearer {stripe_pk}",
                     "Content-Type": "application/x-www-form-urlencoded",
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Origin": "https://js.stripe.com",
+                    "Referer": "https://js.stripe.com/",
                 }
 
-                async with session.post(pm_url, data=pm_data, headers=headers, proxy=proxy_url) as resp:
-                    pm_text = await resp.text()
-                    pm_result = json.loads(pm_text)
+                async with session.post(token_url, data=token_data, headers=pk_headers, proxy=proxy_url) as resp:
+                    token_text = await resp.text()
+                    token_result = json.loads(token_text)
 
                     if resp.status != 200:
-                        error = pm_result.get("error", {})
+                        error = token_result.get("error", {})
                         error_msg = error.get("message", "Unknown error")
                         error_code = error.get("code", "")
-                        decline_code = error.get("decline_code", "")
 
                         # Parse error types
                         if error_code == "incorrect_cvc" or "cvc" in error_msg.lower():
@@ -1458,10 +1469,10 @@ async def stripe_gateway_check(
                                 "gateway_message": error_msg,
                                 "status": "declined"
                             }
-                        elif error_code == "card_declined" or decline_code:
+                        elif error_code == "card_declined":
                             return {
                                 "success": False,
-                                "error": f"Declined: {decline_code or 'generic'}",
+                                "error": "Card declined",
                                 "gateway_message": error_msg,
                                 "status": "declined"
                             }
@@ -1469,14 +1480,39 @@ async def stripe_gateway_check(
                             last_error = {"success": False, "error": error_msg[:50]}
                             continue
 
-                    pm_id = pm_result.get("id")
-                    card_info = pm_result.get("card", {})
+                    token_id = token_result.get("id")
+                    card_info = token_result.get("card", {})
                     brand = card_info.get("brand", "card").upper()
                     funding = card_info.get("funding", "credit").upper()
                     last4 = card_info.get("last4", card_last4)
                     country = card_info.get("country", "")
 
-                # Step 2: Create SetupIntent to validate the card
+                # Step 2: Create PaymentMethod from token with SK
+                pm_url = "https://api.stripe.com/v1/payment_methods"
+                pm_data = {
+                    "type": "card",
+                    "card[token]": token_id,
+                }
+
+                sk_headers = {
+                    "Authorization": f"Bearer {stripe_sk}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                }
+
+                async with session.post(pm_url, data=pm_data, headers=sk_headers, proxy=proxy_url) as resp:
+                    pm_text = await resp.text()
+                    pm_result = json.loads(pm_text)
+
+                    if resp.status != 200:
+                        error = pm_result.get("error", {})
+                        error_msg = error.get("message", "Unknown error")
+                        last_error = {"success": False, "error": error_msg[:50]}
+                        continue
+
+                    pm_id = pm_result.get("id")
+
+                # Step 3: Create SetupIntent to validate the card
                 si_url = "https://api.stripe.com/v1/setup_intents"
                 si_data = {
                     "payment_method": pm_id,
@@ -1484,7 +1520,7 @@ async def stripe_gateway_check(
                     "usage": "off_session",
                 }
 
-                async with session.post(si_url, data=si_data, headers=headers, proxy=proxy_url) as resp:
+                async with session.post(si_url, data=si_data, headers=sk_headers, proxy=proxy_url) as resp:
                     si_text = await resp.text()
                     si_result = json.loads(si_text)
 
@@ -1495,12 +1531,14 @@ async def stripe_gateway_check(
                     # Check for 3DS requirement
                     if si_status == "requires_action":
                         return {
-                            "success": False,
-                            "error": "3DS authentication required",
-                            "gateway_message": "Card requires 3D Secure",
+                            "success": True,
+                            "message": f"✅ LIVE (3DS): {brand} {funding} •••• {last4}",
+                            "gateway_message": f"Card valid, requires 3D Secure | {country}",
                             "status": "3ds",
                             "card_last4": last4,
                             "brand": brand,
+                            "card_type": funding,
+                            "country": country
                         }
 
                     # Check for errors
@@ -2442,26 +2480,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id):
             return
 
-        # Get current Stripe SK (masked)
-        stripe_sk = get_bot_config("stripe_sk_key", "Not set")
+        # Get current Stripe keys (masked)
+        stripe_sk = get_bot_config("stripe_sk_key", "")
+        stripe_pk = get_bot_config("stripe_pk_key", "")
+
         if stripe_sk and len(stripe_sk) > 20:
             masked_sk = f"{stripe_sk[:12]}...{stripe_sk[-4:]}"
         else:
-            masked_sk = "Not configured"
+            masked_sk = "❌ Not configured"
+
+        if stripe_pk and len(stripe_pk) > 20:
+            masked_pk = f"{stripe_pk[:12]}...{stripe_pk[-4:]}"
+        else:
+            masked_pk = "❌ Not configured"
 
         text = (
             "⚙️ *Bot Settings*\n\n"
             f"*Concurrency Limit*: {config.CONCURRENCY_LIMIT}\n"
             f"*Global Limit*: {config.GLOBAL_CONCURRENCY_LIMIT}\n"
             f"*Card Delay*: {config.CARD_DELAY}s\n\n"
-            f"🔑 *Stripe SK Key*: `{masked_sk}`\n\n"
+            f"🔐 *Stripe SK*: `{masked_sk}`\n"
+            f"🔑 *Stripe PK*: `{masked_pk}`\n\n"
             "_Concurrency settings via Railway env vars_"
         )
         await query.edit_message_text(
             text,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔑 Update Stripe SK", callback_data="admin_set_stripe_sk")],
+                [InlineKeyboardButton("🔐 Update SK", callback_data="admin_set_stripe_sk"),
+                 InlineKeyboardButton("🔑 Update PK", callback_data="admin_set_stripe_pk")],
                 [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
             ])
         )
@@ -2471,9 +2518,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         set_waiting_for(user_id, "admin_set_stripe_sk")
         await query.edit_message_text(
-            "🔑 *Update Stripe Secret Key*\n\n"
+            "🔐 *Update Stripe Secret Key*\n\n"
             "Send me the new Stripe SK key:\n"
             "_(starts with sk\\_live\\_ or sk\\_test\\_)_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Cancel", callback_data="admin_settings")]
+            ])
+        )
+
+    elif data == "admin_set_stripe_pk":
+        if not is_admin(user_id):
+            return
+        set_waiting_for(user_id, "admin_set_stripe_pk")
+        await query.edit_message_text(
+            "🔑 *Update Stripe Publishable Key*\n\n"
+            "Send me the new Stripe PK key:\n"
+            "_(starts with pk\\_live\\_ or pk\\_test\\_)_",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("◀️ Cancel", callback_data="admin_settings")]
@@ -3987,6 +4048,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 "❌ Failed to save Stripe SK. Database error.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_settings")]
+                ])
+            )
+        return
+
+    # Handle admin set Stripe PK
+    if waiting_for == "admin_set_stripe_pk" and is_admin(user_id):
+        set_waiting_for(user_id, None)
+        new_pk = text.strip()
+
+        # Validate PK format
+        if not (new_pk.startswith("pk_live_") or new_pk.startswith("pk_test_")):
+            await update.message.reply_text(
+                "❌ Invalid Stripe PK format.\n"
+                "Must start with `pk_live_` or `pk_test_`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_settings")]
+                ])
+            )
+            return
+
+        # Save to database
+        if set_bot_config("stripe_pk_key", new_pk):
+            masked_pk = f"{new_pk[:12]}...{new_pk[-4:]}"
+            await update.message.reply_text(
+                f"✅ Stripe PK updated successfully!\n\n"
+                f"New key: `{masked_pk}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back to Settings", callback_data="admin_settings")]
+                ])
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Failed to save Stripe PK. Database error.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("◀️ Back", callback_data="admin_settings")]
                 ])

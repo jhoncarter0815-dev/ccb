@@ -2603,32 +2603,62 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "admin_set_stripe_sk":
+        await query.answer()
         if not is_admin(user_id):
+            await query.answer("🚫 Admin only!", show_alert=True)
             return
         set_waiting_for(user_id, "admin_set_stripe_sk")
-        await query.edit_message_text(
-            "🔐 *Update Stripe Secret Key*\n\n"
-            "Send me the new Stripe SK key:\n"
-            "_(starts with sk\\_live\\_ or sk\\_test\\_)_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("◀️ Cancel", callback_data="admin_settings")]
-            ])
-        )
+        logger.info(f"Admin {user_id} initiated SK update")
+        try:
+            await query.edit_message_text(
+                "🔐 *Update Stripe Secret Key*\n\n"
+                "Send me the new Stripe SK key:\n"
+                "_(starts with sk\\_live\\_ or sk\\_test\\_)_",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Cancel", callback_data="admin_settings")]
+                ])
+            )
+        except Exception as e:
+            logger.error(f"Error editing message for SK update: {e}")
+            await query.message.reply_text(
+                "🔐 *Update Stripe Secret Key*\n\n"
+                "Send me the new Stripe SK key:\n"
+                "_(starts with sk\\_live\\_ or sk\\_test\\_)_",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Cancel", callback_data="admin_settings")]
+                ])
+            )
 
     elif data == "admin_set_stripe_pk":
+        await query.answer()
         if not is_admin(user_id):
+            await query.answer("🚫 Admin only!", show_alert=True)
             return
         set_waiting_for(user_id, "admin_set_stripe_pk")
-        await query.edit_message_text(
-            "🔑 *Update Stripe Publishable Key*\n\n"
-            "Send me the new Stripe PK key:\n"
-            "_(starts with pk\\_live\\_ or pk\\_test\\_)_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("◀️ Cancel", callback_data="admin_settings")]
-            ])
-        )
+        logger.info(f"Admin {user_id} initiated PK update")
+        try:
+            await query.edit_message_text(
+                "🔑 *Update Stripe Publishable Key*\n\n"
+                "Send me the new Stripe PK key:\n"
+                "_(starts with pk\\_live\\_ or pk\\_test\\_)_",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Cancel", callback_data="admin_settings")]
+                ])
+            )
+        except Exception as e:
+            logger.error(f"Error editing message for PK update: {e}")
+            await query.message.reply_text(
+                "🔑 *Update Stripe Publishable Key*\n\n"
+                "Send me the new Stripe PK key:\n"
+                "_(starts with pk\\_live\\_ or pk\\_test\\_)_",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Cancel", callback_data="admin_settings")]
+                ])
+            )
 
     # =============================================================================
     # ADMIN CREDIT/SUBSCRIPTION MANAGEMENT
@@ -3398,6 +3428,92 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=get_admin_keyboard()
     )
+
+
+async def setsk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /setsk command - directly set Stripe SK key"""
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("🚫 Admin only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "🔐 *Set Stripe SK Key*\n\n"
+            "Usage: `/setsk sk_live_xxxxx`\n\n"
+            "Example:\n`/setsk sk_live_51ABC123...`",
+            parse_mode="Markdown"
+        )
+        return
+
+    new_sk = context.args[0].strip()
+
+    if not (new_sk.startswith("sk_live_") or new_sk.startswith("sk_test_")):
+        await update.message.reply_text(
+            "❌ Invalid SK format.\n"
+            "Must start with `sk_live_` or `sk_test_`",
+            parse_mode="Markdown"
+        )
+        return
+
+    if set_bot_config("stripe_sk_key", new_sk):
+        # Clear and update cache
+        global bot_config_cache
+        bot_config_cache["stripe_sk_key"] = new_sk
+
+        masked = f"{new_sk[:12]}...{new_sk[-4:]}"
+        await update.message.reply_text(
+            f"✅ *SK Updated Successfully!*\n\n"
+            f"New key: `{masked}`",
+            parse_mode="Markdown"
+        )
+        logger.info(f"Admin {user_id} updated SK via command")
+    else:
+        await update.message.reply_text("❌ Failed to save. Database error.")
+
+
+async def setpk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /setpk command - directly set Stripe PK key"""
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("🚫 Admin only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "🔑 *Set Stripe PK Key*\n\n"
+            "Usage: `/setpk pk_live_xxxxx`\n\n"
+            "Example:\n`/setpk pk_live_51ABC123...`",
+            parse_mode="Markdown"
+        )
+        return
+
+    new_pk = context.args[0].strip()
+
+    if not (new_pk.startswith("pk_live_") or new_pk.startswith("pk_test_")):
+        await update.message.reply_text(
+            "❌ Invalid PK format.\n"
+            "Must start with `pk_live_` or `pk_test_`",
+            parse_mode="Markdown"
+        )
+        return
+
+    if set_bot_config("stripe_pk_key", new_pk):
+        # Clear and update cache
+        global bot_config_cache
+        bot_config_cache["stripe_pk_key"] = new_pk
+
+        masked = f"{new_pk[:12]}...{new_pk[-4:]}"
+        await update.message.reply_text(
+            f"✅ *PK Updated Successfully!*\n\n"
+            f"New key: `{masked}`",
+            parse_mode="Markdown"
+        )
+        logger.info(f"Admin {user_id} updated PK via command")
+    else:
+        await update.message.reply_text("❌ Failed to save. Database error.")
 
 
 async def get_all_users_from_db():
@@ -4754,6 +4870,8 @@ def main():
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("dbstatus", dbstatus_command))
     app.add_handler(CommandHandler("skstatus", skstatus_command))
+    app.add_handler(CommandHandler("setsk", setsk_command))
+    app.add_handler(CommandHandler("setpk", setpk_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("chk", check_command))
     app.add_handler(CallbackQueryHandler(handle_callback))

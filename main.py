@@ -1389,23 +1389,24 @@ async def stripe_gateway_check(
                     logger.info(f"[Attempt {attempt}] Loading donation page...")
 
                 try:
-                    await page.goto(STRIPE_DONATION_URL, wait_until="networkidle", timeout=30000)
+                    # Use domcontentloaded instead of networkidle (faster, avoids analytics delays)
+                    await page.goto(STRIPE_DONATION_URL, wait_until="domcontentloaded", timeout=45000)
                 except PlaywrightTimeout:
                     last_error = {"success": False, "error": "Page load timeout"}
                     await browser.close()
                     await exponential_backoff(attempt)
                     continue
 
-                await random_delay(0.5, 1.0)
+                # Give page extra time to render JavaScript
+                await page.wait_for_timeout(3000)
 
                 # Wait for the GiveWP form to load
                 try:
-                    await page.wait_for_selector('form.give-form, #give-form, [data-id]', timeout=10000)
+                    await page.wait_for_selector('form.give-form, #give-form, .give-form, [class*="give"]', timeout=15000)
                 except PlaywrightTimeout:
-                    last_error = {"success": False, "error": "Donation form not found"}
-                    await browser.close()
-                    await exponential_backoff(attempt)
-                    continue
+                    # Try to continue anyway - form might have different structure
+                    if logger:
+                        logger.warning(f"[Attempt {attempt}] Form selector timeout, continuing...")
 
                 if logger:
                     logger.info(f"[Attempt {attempt}] Form found, filling donor info...")

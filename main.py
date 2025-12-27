@@ -1516,7 +1516,34 @@ async def stripe_gateway_check(
                     last_payment_error = pi_result.get("last_payment_error", {})
                     next_action = pi_result.get("next_action", {})
 
-                    # Get error message
+                    # Check for SK/Account issues first
+                    error_type = error.get("type", "")
+                    error_code = error.get("code", "")
+                    error_message = error.get("message", "")
+
+                    # SK Key Issues Detection
+                    if error_type == "invalid_request_error":
+                        if "api_key" in error_message.lower() or error_code in ["api_key_expired", "invalid_api_key"]:
+                            return {"success": False, "error": "⚠️ SK KEY INVALID/EXPIRED", "sk_issue": True, "status": "sk_error"}
+                        if "account" in error_message.lower():
+                            return {"success": False, "error": f"⚠️ STRIPE ACCOUNT ISSUE: {error_message[:50]}", "sk_issue": True, "status": "sk_error"}
+
+                    if error_type == "authentication_error":
+                        return {"success": False, "error": "⚠️ SK KEY AUTHENTICATION FAILED", "sk_issue": True, "status": "sk_error"}
+
+                    # Rate limiting detection
+                    if resp.status == 429 or error_code == "rate_limit":
+                        return {"success": False, "error": "⚠️ RATE LIMITED - Slow down!", "sk_issue": True, "status": "rate_limit"}
+
+                    # Account restricted/disabled
+                    if error_code in ["account_invalid", "account_disabled", "platform_api_key_expired"]:
+                        return {"success": False, "error": f"⚠️ STRIPE ACCOUNT DISABLED/RESTRICTED", "sk_issue": True, "status": "sk_error"}
+
+                    # Card testing blocked by Stripe
+                    if "card testing" in error_message.lower() or "suspected fraud" in error_message.lower():
+                        return {"success": False, "error": "⚠️ STRIPE BLOCKED - Card testing detected!", "sk_issue": True, "status": "sk_error"}
+
+                    # Get error message for card-level issues
                     error_msg = error.get("decline_code") or error.get("message") or ""
                     if not error_msg and last_payment_error:
                         error_msg = last_payment_error.get("decline_code") or last_payment_error.get("message") or ""
@@ -3027,6 +3054,145 @@ async def dbstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /skstatus command - Check Stripe SK key health"""
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("🚫 This command is restricted to administrators.")
+        return
+
+    status_msg = await update.message.reply_text("🔍 *Checking Stripe SK status...*", parse_mode="Markdown")
+
+    stripe_sk = get_bot_config("stripe_sk_key", "")
+    stripe_pk = get_bot_config("stripe_pk_key", "")
+
+    results = ["🔐 *Stripe SK Status Check*\n"]
+
+    # Check if keys are configured
+    if not stripe_sk:
+        results.append("❌ *SK Key*: Not configured!")
+        await status_msg.edit_text("\n".join(results), parse_mode="Markdown")
+        return
+
+    if not stripe_pk:
+        results.append("❌ *PK Key*: Not configured!")
+        await status_msg.edit_text("\n".join(results), parse_mode="Markdown")
+        return
+
+    # Mask keys for display
+    sk_masked = stripe_sk[:12] + "..." + stripe_sk[-4:]
+    pk_masked = stripe_pk[:12] + "..." + stripe_pk[-4:]
+    results.append(f"🔑 *SK*: `{sk_masked}`")
+    results.append(f"🔑 *PK*: `{pk_masked}`")
+
+    import aiohttp
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Test 1: Check account info with SK
+            results.append("\n📊 *Account Check:*")
+
+            sk_auth = aiohttp.BasicAuth(stripe_sk, '')
+            async with session.get("https://api.stripe.com/v1/account", auth=sk_auth) as resp:
+                account_data = await resp.json()
+
+                if resp.status == 200:
+                    account_id = account_data.get("id", "Unknown")
+                    country = account_data.get("country", "Unknown")
+                    charges_enabled = account_data.get("charges_enabled", False)
+                    payouts_enabled = account_data.get("payouts_enabled", False)
+                    business_type = account_data.get("business_type", "Unknown")
+
+                    results.append(f"  ✅ Account ID: `{account_id}`")
+                    results.append(f"  🌍 Country: {country}")
+                    results.append(f"  💳 Charges: {'✅ Enabled' if charges_enabled else '❌ Disabled'}")
+                    results.append(f"  💸 Payouts: {'✅ Enabled' if payouts_enabled else '❌ Disabled'}")
+                    results.append(f"  🏢 Type: {business_type}")
+
+                    # Check for restrictions
+                    requirements = account_data.get("requirements", {})
+                    disabled_reason = requirements.get("disabled_reason")
+                    if disabled_reason:
+                        results.append(f"  ⚠️ *DISABLED*: {disabled_reason}")
+
+                    currently_due = requirements.get("currently_due", [])
+                    if currently_due:
+                        results.append(f"  ⚠️ *Action needed*: {len(currently_due)} items")
+                else:
+                    error = account_data.get("error", {})
+                    error_msg = error.get("message", "Unknown error")
+                    error_type = error.get("type", "")
+                    results.append(f"  ❌ *ERROR*: {error_msg}")
+
+                    if error_type == "authentication_error":
+                        results.append(f"  ⚠️ SK Key is INVALID or EXPIRED!")
+                    elif "rate_limit" in error_msg.lower():
+                        results.append(f"  ⚠️ Rate limited - too many requests!")
+
+            # Test 2: Check balance
+            results.append("\n💰 *Balance Check:*")
+            async with session.get("https://api.stripe.com/v1/balance", auth=sk_auth) as resp:
+                balance_data = await resp.json()
+
+                if resp.status == 200:
+                    available = balance_data.get("available", [])
+                    pending = balance_data.get("pending", [])
+
+                    for bal in available:
+                        amount = bal.get("amount", 0) / 100
+                        currency = bal.get("currency", "usd").upper()
+                        results.append(f"  ✅ Available: ${amount:.2f} {currency}")
+
+                    for bal in pending:
+                        amount = bal.get("amount", 0) / 100
+                        currency = bal.get("currency", "usd").upper()
+                        results.append(f"  ⏳ Pending: ${amount:.2f} {currency}")
+                else:
+                    results.append(f"  ❌ Failed to get balance")
+
+            # Test 3: Check recent charges for patterns
+            results.append("\n📈 *Recent Activity:*")
+            async with session.get("https://api.stripe.com/v1/charges?limit=10", auth=sk_auth) as resp:
+                charges_data = await resp.json()
+
+                if resp.status == 200:
+                    charges = charges_data.get("data", [])
+                    succeeded = sum(1 for c in charges if c.get("status") == "succeeded")
+                    failed = sum(1 for c in charges if c.get("status") == "failed")
+
+                    results.append(f"  📊 Last 10 charges: {succeeded} ✅ / {failed} ❌")
+
+                    # Check for high decline rate
+                    if failed > 7:
+                        results.append(f"  ⚠️ *HIGH DECLINE RATE* - SK may get flagged!")
+                    elif failed > 5:
+                        results.append(f"  ⚠️ Elevated decline rate - be careful")
+                else:
+                    results.append(f"  ❌ Failed to get charges")
+
+            # Test 4: Check for radar/fraud rules
+            results.append("\n🛡️ *Fraud Protection:*")
+            async with session.get("https://api.stripe.com/v1/radar/value_lists?limit=1", auth=sk_auth) as resp:
+                if resp.status == 200:
+                    results.append(f"  ✅ Radar access: Available")
+                elif resp.status == 403:
+                    results.append(f"  ℹ️ Radar: Not enabled on this account")
+                else:
+                    results.append(f"  ⚠️ Radar: Check manually")
+
+        results.append("\n✅ *SK Key is working!*")
+
+    except aiohttp.ClientError as e:
+        results.append(f"\n❌ *Network Error*: {str(e)[:50]}")
+    except Exception as e:
+        results.append(f"\n❌ *Error*: {str(e)[:50]}")
+
+    await status_msg.edit_text("\n".join(results), parse_mode="Markdown")
+
+
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /settings command"""
     user_id = update.effective_user.id
@@ -3574,6 +3740,23 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
 
                     # Track stats
                     increment_stat("total_cards_checked")
+
+                    # Check for SK/gateway issues - alert user immediately
+                    if response.get("sk_issue"):
+                        sk_error = response.get("error", "SK Issue detected")
+                        asyncio.create_task(
+                            update.message.reply_text(
+                                f"⚠️ *GATEWAY ISSUE DETECTED*\n\n"
+                                f"❌ {sk_error}\n\n"
+                                f"🔧 Use `/skstatus` to check SK health\n"
+                                f"⏸️ Consider pausing checks until resolved",
+                                parse_mode="Markdown"
+                            )
+                        )
+                        # Add to retriable since it's not the card's fault
+                        retriable.append(card)
+                        all_results.append(f"SK_ERROR | {result_line}")
+                        continue
 
                     # Use improved error categorization
                     error_category = categorize_error(full_response, response)
@@ -4489,6 +4672,7 @@ def main():
     app.add_handler(CommandHandler("subscribe", subscribe_command))
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("dbstatus", dbstatus_command))
+    app.add_handler(CommandHandler("skstatus", skstatus_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("chk", check_command))
     app.add_handler(CallbackQueryHandler(handle_callback))

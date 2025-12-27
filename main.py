@@ -1687,25 +1687,83 @@ async def stripe_gateway_check(
 
 
 # =============================================================================
-# CONCURRENCY MANAGEMENT - Per-user + Global limits
+# CONCURRENCY MANAGEMENT - Anti-detection & Rate Limiting
 # =============================================================================
 
-# Global semaphore - prevents server overload and captcha (all users combined)
-# Uses config value (default 20) to avoid triggering captcha
+# Global semaphore - prevents server overload (all users combined)
 global_semaphore = asyncio.Semaphore(config.GLOBAL_CONCURRENCY_LIMIT)
 
 # Per-user semaphores - each user gets their own limit
-# This ensures User A's checking doesn't block User B
 user_semaphores = {}
 user_semaphore_lock = asyncio.Lock()
+
+# Track check counts per user for smart delays
+user_check_counts = {}
+user_last_check_time = {}
+
+# Speed mode: "safe" (slowest), "normal", "fast" (riskiest)
+# Admin can change via /setspeed command
+checking_speed_mode = "safe"
+
+# Speed presets (base_min, base_max, pause_5, pause_15, pause_50)
+SPEED_PRESETS = {
+    "safe": {
+        "base": (3.0, 5.0),      # 3-5 seconds base
+        "pause_5": (4.0, 6.0),   # Every 5 cards
+        "pause_15": (8.0, 12.0), # Every 15 cards
+        "pause_50": (30.0, 50.0) # Every 50 cards - big break
+    },
+    "normal": {
+        "base": (2.0, 3.5),
+        "pause_5": (2.0, 4.0),
+        "pause_15": (5.0, 8.0),
+        "pause_50": (15.0, 25.0)
+    },
+    "fast": {
+        "base": (1.0, 2.0),
+        "pause_5": (1.0, 2.0),
+        "pause_15": (3.0, 5.0),
+        "pause_50": (8.0, 12.0)
+    }
+}
+
+
+def get_smart_delay(user_id: int, card_index: int = 0) -> float:
+    """
+    Calculate smart delay to avoid Stripe rate limits and detection.
+    Uses human-like random delays with occasional longer pauses.
+    """
+    import random
+
+    preset = SPEED_PRESETS.get(checking_speed_mode, SPEED_PRESETS["safe"])
+
+    # Base delay
+    base_delay = random.uniform(*preset["base"])
+
+    # Every 5 cards: short pause
+    if card_index > 0 and card_index % 5 == 0:
+        base_delay += random.uniform(*preset["pause_5"])
+
+    # Every 15 cards: medium pause
+    if card_index > 0 and card_index % 15 == 0:
+        base_delay += random.uniform(*preset["pause_15"])
+
+    # Every 50 cards: major pause
+    if card_index > 0 and card_index % 50 == 0:
+        base_delay += random.uniform(*preset["pause_50"])
+
+    # Add small random jitter
+    jitter = random.uniform(-0.3, 0.3)
+
+    return max(1.0, base_delay + jitter)
 
 
 async def get_user_semaphore(user_id: int) -> asyncio.Semaphore:
     """Get or create a semaphore for a specific user"""
     async with user_semaphore_lock:
         if user_id not in user_semaphores:
-            # Each user can process CONCURRENCY_LIMIT cards at once
-            user_semaphores[user_id] = asyncio.Semaphore(config.CONCURRENCY_LIMIT)
+            # Limit to 2 concurrent checks per user (safer for Stripe)
+            user_semaphores[user_id] = asyncio.Semaphore(2)
         return user_semaphores[user_id]
 
 
@@ -1713,6 +1771,23 @@ def cleanup_user_semaphore(user_id: int):
     """Remove user semaphore when they're done (optional cleanup)"""
     if user_id in user_semaphores:
         del user_semaphores[user_id]
+    if user_id in user_check_counts:
+        del user_check_counts[user_id]
+    if user_id in user_last_check_time:
+        del user_last_check_time[user_id]
+
+
+def increment_user_check_count(user_id: int) -> int:
+    """Increment and return the user's check count for this session"""
+    if user_id not in user_check_counts:
+        user_check_counts[user_id] = 0
+    user_check_counts[user_id] += 1
+    return user_check_counts[user_id]
+
+
+def reset_user_check_count(user_id: int):
+    """Reset user's check count (call when starting new batch)"""
+    user_check_counts[user_id] = 0
 
 
 async def bin_lookup(bin_number: str):
@@ -1744,25 +1819,32 @@ def create_progress_bar(current: int, total: int, length: int = 10) -> str:
     return f"[{bar}] {percent}%"
 
 
-async def process_single_card(card: str, user_id: int = None, user_settings: dict = None, bot=None) -> dict:
+async def process_single_card(card: str, user_id: int = None, user_settings: dict = None, bot=None, card_index: int = 0) -> dict:
     """
-    Process a single card and return result.
+    Process a single card with anti-detection delays.
 
-    Uses two-level concurrency control:
-    1. Per-user semaphore: Each user can process up to CONCURRENCY_LIMIT cards at once
-    2. Global semaphore: Total concurrent operations across all users capped at GLOBAL_CONCURRENCY_LIMIT
-
-    This ensures User A checking cards doesn't block User B.
+    Uses smart delays to avoid Stripe velocity triggers:
+    - 2-4 second base delay between cards
+    - Longer pauses every 5, 15, 50 cards
+    - Random jitter for human-like timing
 
     Args:
         card: Card string to check
         user_id: User ID for concurrency control
-        user_settings: Pre-fetched user settings (optional, avoids DB calls inside semaphore)
-        bot: Optional Telegram bot instance for sending notifications on product removal
+        user_settings: Pre-fetched user settings
+        bot: Optional Telegram bot instance
+        card_index: Index in batch for smart delay calculation
     """
     # ==========================================================================
+    # SMART DELAY: Wait before checking to avoid rate limits
+    # ==========================================================================
+    if card_index > 0:
+        delay = get_smart_delay(user_id, card_index)
+        logger.debug(f"Smart delay: {delay:.1f}s before card {card_index + 1}")
+        await asyncio.sleep(delay)
+
+    # ==========================================================================
     # PRE-VALIDATION: Check card format/validity BEFORE using API
-    # This saves API calls and improves accuracy
     # ==========================================================================
 
     # Validate card format, Luhn, expiry, and CVV
@@ -1782,20 +1864,20 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
         settings = user_settings
 
     # Optional: Validate BIN (async, non-blocking)
-    # This is done outside semaphore to not hold resources
     bin_valid, bin_data_early, bin_error = await validate_bin(parsed_card["number"])
     if not bin_valid and bin_error:
-        # Unknown BIN - card might be fake, but let it through for API to decide
         logger.debug(f"BIN validation warning for {card[:6]}: {bin_error}")
 
-    # Get user-specific semaphore (or create one)
-    user_sem = await get_user_semaphore(user_id) if user_id else asyncio.Semaphore(config.CONCURRENCY_LIMIT)
+    # Get user-specific semaphore (max 2 concurrent per user for safety)
+    user_sem = await get_user_semaphore(user_id) if user_id else asyncio.Semaphore(2)
 
     # Acquire both: user limit AND global limit
     async with user_sem:
         async with global_semaphore:
             try:
-                logger.info(f'Processing card: {card} (user: {user_id}, gateway: stripe)')
+                # Increment check count for this user
+                check_num = increment_user_check_count(user_id) if user_id else card_index + 1
+                logger.info(f'Processing card #{check_num}: {card[:10]}*** (user: {user_id})')
 
                 # Use user's proxies or fall back to config
                 # Support both old format (string) and new format (list)
@@ -3803,6 +3885,54 @@ async def testproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text("\n".join(results))
 
 
+async def setspeed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /setspeed command - Set checking speed mode"""
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("🚫 Admin only.")
+        return
+
+    global checking_speed_mode
+
+    if not context.args:
+        # Show current speed and options
+        preset = SPEED_PRESETS.get(checking_speed_mode, SPEED_PRESETS["safe"])
+        msg = (
+            f"⚡ Current Speed: {checking_speed_mode.upper()}\n\n"
+            f"📊 Current delays:\n"
+            f"  Base: {preset['base'][0]}-{preset['base'][1]}s\n"
+            f"  Every 5 cards: +{preset['pause_5'][0]}-{preset['pause_5'][1]}s\n"
+            f"  Every 15 cards: +{preset['pause_15'][0]}-{preset['pause_15'][1]}s\n"
+            f"  Every 50 cards: +{preset['pause_50'][0]}-{preset['pause_50'][1]}s\n\n"
+            f"Available modes:\n"
+            f"  /setspeed safe - Slowest, safest (recommended)\n"
+            f"  /setspeed normal - Balanced\n"
+            f"  /setspeed fast - Fastest, riskier\n\n"
+            f"⚠️ Faster = more likely to trigger Stripe limits"
+        )
+        await update.message.reply_text(msg)
+        return
+
+    new_speed = context.args[0].lower()
+
+    if new_speed not in SPEED_PRESETS:
+        await update.message.reply_text(f"❌ Invalid speed. Use: safe, normal, or fast")
+        return
+
+    checking_speed_mode = new_speed
+    preset = SPEED_PRESETS[new_speed]
+
+    await update.message.reply_text(
+        f"✅ Speed set to: {new_speed.upper()}\n\n"
+        f"📊 New delays:\n"
+        f"  Base: {preset['base'][0]}-{preset['base'][1]}s\n"
+        f"  Every 5 cards: +{preset['pause_5'][0]}-{preset['pause_5'][1]}s\n"
+        f"  Every 15 cards: +{preset['pause_15'][0]}-{preset['pause_15'][1]}s\n"
+        f"  Every 50 cards: +{preset['pause_50'][0]}-{preset['pause_50'][1]}s"
+    )
+
+
 async def clearkeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /clearkeys command - clear cached keys and reload from env"""
     user_id = update.effective_user.id
@@ -4118,16 +4248,17 @@ def categorize_error(error_msg: str, response: dict = None) -> str:
 
 async def run_batch_check(cards: list, user_id: int, user_settings: dict, session: dict, status_msg, update: Update, bot=None):
     """
-    Run batch card checking as a background task.
-    This function runs independently of the update handler, allowing other users to interact with the bot.
+    Run batch card checking with smart anti-detection delays.
 
-    Args:
-        bot: Optional Telegram bot instance for notifications (e.g., product removal alerts)
+    Delay strategy to avoid Stripe limits:
+    - 2-4 seconds between cards
+    - Longer pauses every 5, 15, 50 cards
+    - Max 2 concurrent checks per user
     """
     charged = []
     declined = []
     three_ds = []
-    retriable = []  # Cards that failed due to captcha/network/timeout
+    retriable = []
     all_results = []
     last_response = ""
     checked_count = 0
@@ -4135,12 +4266,17 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
     total_cards = len(cards)
     username = update.effective_user.username or update.effective_user.first_name
 
+    # Reset check count for this batch
+    reset_user_check_count(user_id)
+
     try:
-        # Process cards with controlled pacing to avoid captcha
-        # Instead of creating all tasks upfront, we process in controlled batches
+        # Process cards SEQUENTIALLY with smart delays (safer for Stripe)
+        # This avoids velocity triggers better than parallel processing
         pending_tasks = set()
         card_index = 0
-        card_delay = config.CARD_DELAY
+
+        # Use much slower pace for anti-detection
+        max_concurrent = 1  # Process one at a time for maximum safety
 
         while card_index < total_cards or pending_tasks:
             # Check for stop FIRST
@@ -4162,15 +4298,13 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                     task.cancel()
                 break
 
-            # Add new tasks if under limit and cards remain
-            while len(pending_tasks) < config.CONCURRENCY_LIMIT and card_index < total_cards:
+            # Add new tasks - limit to 1 concurrent for anti-detection
+            while len(pending_tasks) < max_concurrent and card_index < total_cards:
                 card = cards[card_index]
-                task = asyncio.create_task(process_single_card(card, user_id, user_settings, bot))
+                # Pass card_index for smart delay calculation
+                task = asyncio.create_task(process_single_card(card, user_id, user_settings, bot, card_index))
                 pending_tasks.add(task)
                 card_index += 1
-                # Small delay between starting each card to avoid captcha
-                if card_delay > 0 and card_index < total_cards:
-                    await asyncio.sleep(card_delay)
 
             if not pending_tasks:
                 break
@@ -5265,6 +5399,7 @@ def main():
     app.add_handler(CommandHandler("setpk", setpk_command))
     app.add_handler(CommandHandler("synckeys", synckeys_command))
     app.add_handler(CommandHandler("clearkeys", clearkeys_command))
+    app.add_handler(CommandHandler("setspeed", setspeed_command))
     app.add_handler(CommandHandler("testproxy", testproxy_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("chk", check_command))

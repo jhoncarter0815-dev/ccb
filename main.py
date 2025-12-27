@@ -1792,50 +1792,89 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
 
 
 def format_result(result: dict, show_full: bool = True) -> str:
-    """Format check result for Telegram message with proper escaping"""
+    """Format check result for Telegram message with emoji-rich style"""
     card = result["card"]
     response = result["response"]
     bin_data = result.get("bin_data", {})
 
-    bin_info = ""
+    # Get card info from response
+    brand = response.get("brand", "").upper()
+    card_type = response.get("card_type", "").upper()
+    country = response.get("country", "")
+    risk_level = response.get("risk_level", "")
+
+    # Get BIN data if available
+    bank = ""
+    country_emoji = ""
+    country_name = country
     if show_full and bin_data.get("success"):
         bd = bin_data.get("data", {})
-        # Escape all dynamic content from BIN data
-        bank = escape_markdown(bd.get("bank", "Unknown"))
-        emoji = bd.get("emoji", "")  # Emoji doesn't need escaping
-        country = escape_markdown(bd.get("country", "Unknown"))
-        level = escape_markdown(bd.get("level", "Unknown"))
-        card_type = escape_markdown(bd.get("type", "Unknown"))
-        scheme = escape_markdown(bd.get("scheme", "Unknown"))
-        bin_info = f"\n🏦 *Bank*: {bank}\n💳 *Type*: {scheme} {card_type} {level}\n🌍 *Country*: {country} {emoji}"
+        bank = bd.get("bank", "")
+        country_emoji = bd.get("emoji", "")
+        if bd.get("country"):
+            country_name = bd.get("country", country)
+        if bd.get("scheme") and not brand:
+            brand = bd.get("scheme", "").upper()
+        if bd.get("type") and not card_type:
+            card_type = bd.get("type", "").upper()
 
-    # Get response details and escape them
-    error = escape_markdown(response.get("error", ""))
-    message = escape_markdown(response.get("message", ""))
-    gateway_msg = escape_markdown(response.get("gateway_message", ""))
-    decline_code = escape_markdown(response.get("decline_code", ""))
+    # Escape markdown in dynamic content
+    bank = escape_markdown(bank) if bank else ""
+    country_name = escape_markdown(country_name) if country_name else ""
+    brand = escape_markdown(brand) if brand else "CARD"
+    card_type = escape_markdown(card_type) if card_type else ""
 
-    # Build status message with all available info
-    status_parts = []
-    if message:
-        status_parts.append(message)
-    if error:
-        status_parts.append(error)
-    if gateway_msg and gateway_msg not in str(status_parts):
-        status_parts.append(f"Gateway: {gateway_msg}")
-    if decline_code and decline_code not in str(status_parts):
-        status_parts.append(f"Code: {decline_code}")
+    # Separator line
+    sep = "━━━━━━━━━━━━━━━━━━━━"
 
-    status_text = " \\| ".join(status_parts) if status_parts else "Unknown"
-
-    # Card is displayed in code block (backticks), so it doesn't need escaping
+    # Determine status and header
     if response.get('success'):
-        return f"✅ *CHARGED*\n\n💳 `{card}`\n📝 *Response*: {status_text}{bin_info}"
-    else:
-        if '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("error", "")).lower():
-            return f"🔐 *3DS REQUIRED*\n\n💳 `{card}`\n📝 *Response*: {status_text}{bin_info}"
+        status = response.get("status", "charged")
+        if status == "ccn_live":
+            header = "✅ 𝗖𝗖𝗡 𝗟𝗜𝗩𝗘 \\(𝗕𝗮𝗱 𝗖𝗩𝗩\\)"
+        elif "NSF" in response.get("message", "") or "insufficient" in response.get("gateway_message", "").lower():
+            header = "✅ 𝗟𝗜𝗩𝗘 \\(𝗜𝗻𝘀𝘂𝗳𝗳𝗶𝗰𝗶𝗲𝗻𝘁 𝗙𝘂𝗻𝗱𝘀\\)"
         else:
-            return f"❌ *DECLINED*\n\n💳 `{card}`\n📝 *Response*: {status_text}{bin_info}"
+            header = "✅ 𝗖𝗩𝗩 𝗟𝗜𝗩𝗘 \\(\\$𝟭 𝗖𝗛𝗔𝗥𝗚𝗘𝗗\\)"
+    elif '3ds' in str(response.get("error", "")).lower() or '3d' in str(response.get("status", "")).lower():
+        header = "🔐 𝟯𝗗𝗦 𝗥𝗘𝗤𝗨𝗜𝗥𝗘𝗗"
+    else:
+        error_msg = response.get("error", "Declined")
+        header = f"❌ 𝗗𝗘𝗖𝗟𝗜𝗡𝗘𝗗"
+
+    # Build card type line
+    type_line = f"🏷️ {brand}"
+    if card_type:
+        type_line += f" • {card_type}"
+
+    # Build country line
+    country_line = ""
+    if country_name:
+        country_line = f"\n🌍 {country_name}"
+        if country_emoji:
+            country_line += f" {country_emoji}"
+
+    # Build bank line
+    bank_line = ""
+    if bank:
+        bank_line = f"\n🏦 {bank}"
+
+    # Build risk line
+    risk_line = ""
+    if risk_level:
+        risk_line = f"\n⚡ Risk Level: {escape_markdown(risk_level)}"
+
+    # Build error/response line for declined cards
+    response_line = ""
+    if not response.get('success'):
+        error = response.get("error", "")
+        if error and "3ds" not in error.lower():
+            response_line = f"\n📝 {escape_markdown(error)}"
+
+    # Assemble final message
+    msg = f"{sep}\n{header}\n{sep}\n💳 `{card}`\n{sep}\n{type_line}{bank_line}{country_line}{risk_line}{response_line}\n{sep}"
+
+    return msg
 
 
 # Global bot application reference for admin notifications

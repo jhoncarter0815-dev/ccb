@@ -2858,26 +2858,90 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text_msg, parse_mode="Markdown", reply_markup=keyboard)
 
 async def setproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /setproxy command"""
+    """Handle /setproxy command - supports multiple proxies (up to 100)"""
     user_id = update.effective_user.id
 
     if not context.args:
+        settings = get_user_settings(user_id)
+        current = settings.get("proxy", [])
+        count = len(current) if isinstance(current, list) else (1 if current else 0)
+
         await update.message.reply_text(
-            "❌ Usage: `/setproxy host:port:user:pass`\n"
-            "Example: `/setproxy proxy.example.com:8080:username:password`\n\n"
-            "To remove proxy: `/setproxy clear`",
-            parse_mode="Markdown"
+            f"📡 Proxy Settings (Current: {count} proxies)\n\n"
+            "Add proxies:\n"
+            "/setproxy host:port:user:pass\n"
+            "/setproxy proxy1 proxy2 proxy3\n\n"
+            "Or send a .txt file with proxies (one per line)\n\n"
+            "Commands:\n"
+            "/setproxy clear - Remove all proxies\n"
+            "/setproxy list - Show current proxies\n"
+            "/testproxy - Test all proxies\n\n"
+            "Max: 100 proxies"
         )
         return
 
-    proxy_str = context.args[0]
+    first_arg = context.args[0].lower()
 
-    if proxy_str.lower() == "clear":
+    if first_arg == "clear":
         update_user_setting(user_id, "proxy", None)
-        await update.message.reply_text("✅ Proxy cleared! Using default proxy.")
-    else:
-        update_user_setting(user_id, "proxy", proxy_str)
-        await update.message.reply_text(f"✅ Proxy set to: `{proxy_str}`", parse_mode="Markdown")
+        await update.message.reply_text("✅ All proxies cleared!")
+        return
+
+    if first_arg == "list":
+        settings = get_user_settings(user_id)
+        current = settings.get("proxy", [])
+
+        if not current:
+            await update.message.reply_text("❌ No proxies configured.")
+            return
+
+        if isinstance(current, str):
+            current = [current]
+
+        lines = [f"📡 Your Proxies ({len(current)} total):\n"]
+        for i, p in enumerate(current[:20], 1):  # Show max 20
+            parts = p.split(":")
+            masked = f"{parts[0]}:***" if len(parts) >= 2 else "***"
+            lines.append(f"{i}. {masked}")
+
+        if len(current) > 20:
+            lines.append(f"\n... and {len(current) - 20} more")
+
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    # Get current proxies
+    settings = get_user_settings(user_id)
+    current = settings.get("proxy", [])
+    if isinstance(current, str):
+        current = [current] if current else []
+    elif current is None:
+        current = []
+
+    # Add new proxies from args
+    new_proxies = []
+    for arg in context.args:
+        # Basic validation: must have at least host:port
+        if ":" in arg and len(arg) > 5:
+            new_proxies.append(arg.strip())
+
+    if not new_proxies:
+        await update.message.reply_text("❌ Invalid proxy format. Use: host:port:user:pass")
+        return
+
+    # Combine and limit to 100
+    all_proxies = current + new_proxies
+    all_proxies = list(dict.fromkeys(all_proxies))  # Remove duplicates
+    all_proxies = all_proxies[:100]  # Max 100
+
+    update_user_setting(user_id, "proxy", all_proxies)
+
+    await update.message.reply_text(
+        f"✅ Added {len(new_proxies)} proxy(s)\n"
+        f"📡 Total: {len(all_proxies)} proxies\n\n"
+        f"Use /testproxy to test them\n"
+        f"Use /setproxy list to view all"
+    )
 
 
 async def send_card_history(chat_id, bot, target_user_id: int, card_type: str, reply_to_message_id=None):
@@ -4358,7 +4422,7 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle .txt file uploads for mass checking"""
+    """Handle .txt file uploads for mass checking or proxy import"""
     try:
         user_id = update.effective_user.id
         document = update.message.document
@@ -4378,7 +4442,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check file extension
         file_name = document.file_name or ""
         if not file_name.lower().endswith('.txt'):
-            await update.message.reply_text("❌ Please send a .txt file containing cards.")
+            await update.message.reply_text("❌ Please send a .txt file.")
             return
 
         # Download file
@@ -4386,11 +4450,75 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_bytes = await file.download_as_bytearray()
 
         try:
-            card_text = file_bytes.decode('utf-8')
+            file_text = file_bytes.decode('utf-8')
         except UnicodeDecodeError:
-            card_text = file_bytes.decode('latin-1')
+            file_text = file_bytes.decode('latin-1')
 
-        cards = create_lista_(card_text)
+        # Detect if it's a proxy file or card file
+        lines = [l.strip() for l in file_text.strip().split('\n') if l.strip()]
+
+        # Check if it looks like proxies (host:port:user:pass format, no card patterns)
+        is_proxy_file = False
+        if lines:
+            # Sample first few lines
+            sample = lines[:5]
+            proxy_pattern = 0
+            card_pattern = 0
+
+            for line in sample:
+                parts = line.split(":")
+                # Proxy format: host:port:user:pass or host:port
+                if len(parts) in [2, 4] and not parts[0].isdigit():
+                    # First part is not a number (not a card number)
+                    if len(parts) >= 2:
+                        try:
+                            int(parts[1])  # Port should be numeric
+                            proxy_pattern += 1
+                        except:
+                            pass
+                # Card format: starts with digits, has | or : separator
+                if parts[0].isdigit() and len(parts[0]) >= 13:
+                    card_pattern += 1
+
+            is_proxy_file = proxy_pattern > card_pattern and proxy_pattern > 0
+
+        # Handle proxy file
+        if is_proxy_file or "proxy" in file_name.lower():
+            # Import proxies
+            valid_proxies = []
+            for line in lines:
+                if ":" in line and len(line) > 5:
+                    valid_proxies.append(line)
+
+            if not valid_proxies:
+                await update.message.reply_text("❌ No valid proxies found in file.")
+                return
+
+            # Get current proxies and add new ones
+            settings = get_user_settings(user_id)
+            current = settings.get("proxy", [])
+            if isinstance(current, str):
+                current = [current] if current else []
+            elif current is None:
+                current = []
+
+            all_proxies = current + valid_proxies
+            all_proxies = list(dict.fromkeys(all_proxies))  # Remove duplicates
+            all_proxies = all_proxies[:100]  # Max 100
+
+            update_user_setting(user_id, "proxy", all_proxies)
+
+            await update.message.reply_text(
+                f"✅ Imported {len(valid_proxies)} proxies!\n"
+                f"📡 Total: {len(all_proxies)} proxies\n\n"
+                f"Use /testproxy to test them\n"
+                f"Use /setproxy list to view all\n"
+                f"Use /setproxy clear to remove all"
+            )
+            return
+
+        # Otherwise treat as card file
+        cards = create_lista_(file_text)
 
         if not cards:
             await update.message.reply_text("❌ No valid cards found in the file.")

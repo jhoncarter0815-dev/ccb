@@ -18,11 +18,9 @@ aptPkgs = [
     "libcairo2"
 ]
 
-[phases.install]
-cmds = [
-    "pip install -r requirements.txt",
-    "playwright install chromium"
-]
+# Let nixpacks handle pip install automatically, just add playwright install after
+[phases.build]
+cmds = ["playwright install chromium"]
 
 [start]
 cmd = "python main.py"

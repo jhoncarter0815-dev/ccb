@@ -3100,34 +3100,36 @@ async def check_current_ip() -> dict:
     """Check the current outgoing IP address"""
     import aiohttp
     try:
-        timeout = aiohttp.ClientTimeout(total=10)
+        timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get("https://api.ipify.org?format=json") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    ip = data.get("ip", "Unknown")
+            try:
+                async with session.get("https://api.ipify.org?format=json") as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        ip = data.get("ip", "Unknown")
 
-                    # Check IP type
-                    async with session.get(f"http://ip-api.com/json/{ip}") as ip_resp:
-                        if ip_resp.status == 200:
-                            ip_data = await ip_resp.json()
-                            return {
-                                "ip": ip,
-                                "country": ip_data.get("country", "Unknown"),
-                                "isp": ip_data.get("isp", "Unknown"),
-                                "org": ip_data.get("org", "Unknown"),
-                                "is_datacenter": "cloud" in ip_data.get("org", "").lower() or
-                                                "hosting" in ip_data.get("org", "").lower() or
-                                                "railway" in ip_data.get("org", "").lower() or
-                                                "amazon" in ip_data.get("org", "").lower() or
-                                                "google" in ip_data.get("org", "").lower() or
-                                                "digital" in ip_data.get("org", "").lower() or
-                                                "vultr" in ip_data.get("org", "").lower() or
-                                                "linode" in ip_data.get("org", "").lower()
-                            }
+                        # Check IP type
+                        try:
+                            async with session.get(f"http://ip-api.com/json/{ip}") as ip_resp:
+                                if ip_resp.status == 200:
+                                    ip_data = await ip_resp.json()
+                                    org = ip_data.get("org", "").lower()
+                                    return {
+                                        "ip": ip,
+                                        "country": ip_data.get("country", "Unknown"),
+                                        "isp": ip_data.get("isp", "Unknown"),
+                                        "org": ip_data.get("org", "Unknown"),
+                                        "is_datacenter": any(x in org for x in ["cloud", "hosting", "railway", "amazon", "google", "digital", "vultr", "linode", "hetzner", "ovh"])
+                                    }
+                        except:
+                            pass
                         return {"ip": ip, "country": "Unknown", "isp": "Unknown", "org": "Unknown", "is_datacenter": False}
+                    else:
+                        return {"ip": "Unknown", "error": f"Status {resp.status}"}
+            except Exception as e:
+                return {"ip": "Unknown", "error": str(e)[:50]}
     except Exception as e:
-        return {"ip": "Error", "error": str(e)}
+        return {"ip": "Error", "error": str(e)[:50]}
 
 
 async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3140,51 +3142,56 @@ async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("🔍 *Checking Stripe SK status...*", parse_mode="Markdown")
 
-    stripe_sk = get_bot_config("stripe_sk_key", "")
-    stripe_pk = get_bot_config("stripe_pk_key", "")
-
-    results = ["🔐 *Stripe SK Status Check*\n"]
-
-    # Check current IP first
-    ip_info = await check_current_ip()
-    results.append("🌐 *Server IP Check:*")
-    if "error" in ip_info:
-        results.append(f"  ❌ Error: {ip_info.get('error', 'Unknown')[:30]}")
-    else:
-        ip = ip_info.get("ip", "Unknown")
-        isp = ip_info.get("isp", "Unknown")
-        org = ip_info.get("org", "Unknown")
-        is_dc = ip_info.get("is_datacenter", False)
-
-        results.append(f"  📍 IP: `{ip}`")
-        results.append(f"  🏢 ISP: {isp[:30]}")
-        if is_dc:
-            results.append(f"  ⚠️ *DATACENTER IP DETECTED!*")
-            results.append(f"  ⚠️ This causes high decline rates!")
-            results.append(f"  💡 Use residential proxy via /setproxy")
-        else:
-            results.append(f"  ✅ Residential IP")
-
-    # Check if keys are configured
-    if not stripe_sk:
-        results.append("❌ *SK Key*: Not configured!")
-        await status_msg.edit_text("\n".join(results), parse_mode="Markdown")
-        return
-
-    if not stripe_pk:
-        results.append("❌ *PK Key*: Not configured!")
-        await status_msg.edit_text("\n".join(results), parse_mode="Markdown")
-        return
-
-    # Mask keys for display
-    sk_masked = stripe_sk[:12] + "..." + stripe_sk[-4:]
-    pk_masked = stripe_pk[:12] + "..." + stripe_pk[-4:]
-    results.append(f"🔑 *SK*: `{sk_masked}`")
-    results.append(f"🔑 *PK*: `{pk_masked}`")
-
-    import aiohttp
-
     try:
+        stripe_sk = get_bot_config("stripe_sk_key", "")
+        stripe_pk = get_bot_config("stripe_pk_key", "")
+
+        results = ["🔐 *Stripe SK Status Check*\n"]
+
+        # Check current IP first (with timeout protection)
+        try:
+            ip_info = await asyncio.wait_for(check_current_ip(), timeout=5.0)
+        except asyncio.TimeoutError:
+            ip_info = {"ip": "Timeout", "error": "IP check timed out"}
+        except Exception as e:
+            ip_info = {"ip": "Error", "error": str(e)[:30]}
+
+        results.append("🌐 *Server IP Check:*")
+        if "error" in ip_info:
+            results.append(f"  ⚠️ {ip_info.get('error', 'Unknown')[:30]}")
+        else:
+            ip = ip_info.get("ip", "Unknown")
+            isp = ip_info.get("isp", "Unknown") or "Unknown"
+            org = ip_info.get("org", "Unknown") or "Unknown"
+            is_dc = ip_info.get("is_datacenter", False)
+
+            results.append(f"  📍 IP: `{ip}`")
+            results.append(f"  🏢 ISP: {isp[:30]}")
+            if is_dc:
+                results.append(f"  ⚠️ *DATACENTER IP DETECTED!*")
+                results.append(f"  ⚠️ This causes high decline rates!")
+                results.append(f"  💡 Use residential proxy via /setproxy")
+            else:
+                results.append(f"  ✅ Residential IP")
+
+        # Check if keys are configured
+        if not stripe_sk:
+            results.append("\n❌ *SK Key*: Not configured!")
+            await status_msg.edit_text("\n".join(results), parse_mode="Markdown")
+            return
+
+        if not stripe_pk:
+            results.append("\n❌ *PK Key*: Not configured!")
+            await status_msg.edit_text("\n".join(results), parse_mode="Markdown")
+            return
+
+        # Mask keys for display
+        sk_masked = stripe_sk[:12] + "..." + stripe_sk[-4:]
+        pk_masked = stripe_pk[:12] + "..." + stripe_pk[-4:]
+        results.append(f"\n🔑 *SK*: `{sk_masked}`")
+        results.append(f"🔑 *PK*: `{pk_masked}`")
+
+        import aiohttp
         timeout = aiohttp.ClientTimeout(total=15)
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -3279,14 +3286,17 @@ async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     results.append(f"  ⚠️ Radar: Check manually")
 
-        results.append("\n✅ *SK Key is working!*")
+            results.append("\n✅ *SK Key is working!*")
 
-    except aiohttp.ClientError as e:
-        results.append(f"\n❌ *Network Error*: {str(e)[:50]}")
     except Exception as e:
+        logger.error(f"Error in skstatus: {e}")
         results.append(f"\n❌ *Error*: {str(e)[:50]}")
 
-    await status_msg.edit_text("\n".join(results), parse_mode="Markdown")
+    try:
+        await status_msg.edit_text("\n".join(results), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error editing skstatus message: {e}")
+        await update.message.reply_text("\n".join(results), parse_mode="Markdown")
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

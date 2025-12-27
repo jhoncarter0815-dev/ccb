@@ -1401,19 +1401,17 @@ async def stripe_gateway_check(
             if logger:
                 logger.warning(f"Invalid proxy format: {proxy}")
 
-    # Use SSL verification for better compatibility
-    connector = aiohttp.TCPConnector(ssl=False, limit=10, force_close=True)
-
     for attempt in range(1, max_retries + 1):
         try:
-            # Create fresh cookie jar for each attempt to avoid fingerprinting
+            # Create fresh connector and cookie jar for each attempt
+            # This prevents "Session is closed" errors and avoids fingerprinting
+            connector = aiohttp.TCPConnector(ssl=False, limit=10, force_close=True)
             jar = aiohttp.CookieJar()
 
             async with aiohttp.ClientSession(
                 timeout=timeout,
                 cookie_jar=jar,
-                connector=connector,
-                trust_env=True
+                connector=connector
             ) as session:
 
                 # =============================================================

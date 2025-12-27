@@ -3132,6 +3132,16 @@ async def check_current_ip() -> dict:
         return {"ip": "Error", "error": str(e)[:50]}
 
 
+def escape_md(text: str) -> str:
+    """Escape markdown special characters"""
+    if not text:
+        return ""
+    # Escape special markdown characters
+    for char in ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']:
+        text = str(text).replace(char, f'\\{char}')
+    return text
+
+
 async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /skstatus command - Check Stripe SK key health"""
     user_id = update.effective_user.id
@@ -3140,13 +3150,13 @@ async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 This command is restricted to administrators.")
         return
 
-    status_msg = await update.message.reply_text("🔍 *Checking Stripe SK status...*", parse_mode="Markdown")
+    status_msg = await update.message.reply_text("🔍 Checking Stripe SK status...")
 
     try:
         stripe_sk = get_bot_config("stripe_sk_key", "")
         stripe_pk = get_bot_config("stripe_pk_key", "")
 
-        results = ["🔐 *Stripe SK Status Check*\n"]
+        results = ["🔐 Stripe SK Status Check\n"]
 
         # Check if admin has proxy configured
         admin_settings = get_user_settings(user_id)
@@ -3162,17 +3172,17 @@ async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 proxy_str = None
 
             if proxy_str:
-                results.append("🌐 *Proxy Status:*")
+                results.append("🌐 Proxy Status:")
                 # Mask proxy for display
                 parts = proxy_str.split(":")
                 if len(parts) >= 2:
                     masked = f"{parts[0]}:****"
-                    results.append(f"  ✅ Proxy configured: `{masked}`")
+                    results.append(f"  ✅ Proxy configured: {masked}")
                 else:
                     results.append(f"  ✅ Proxy configured")
                 results.append(f"  ℹ️ Card checks will use this proxy")
             else:
-                results.append("🌐 *Server IP (no proxy):*")
+                results.append("🌐 Server IP (no proxy):")
                 results.append(f"  ⚠️ No valid proxy configured")
         else:
             # No proxy - check server IP
@@ -3183,7 +3193,7 @@ async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 ip_info = {"ip": "Error", "error": str(e)[:30]}
 
-            results.append("🌐 *Server IP (no proxy):*")
+            results.append("🌐 Server IP (no proxy):")
             if "error" in ip_info:
                 results.append(f"  ⚠️ {ip_info.get('error', 'Unknown')[:30]}")
             else:
@@ -3191,37 +3201,37 @@ async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 isp = ip_info.get("isp", "Unknown") or "Unknown"
                 is_dc = ip_info.get("is_datacenter", False)
 
-                results.append(f"  📍 IP: `{ip}`")
+                results.append(f"  📍 IP: {ip}")
                 results.append(f"  🏢 ISP: {isp[:30]}")
                 if is_dc:
-                    results.append(f"  ⚠️ *DATACENTER IP DETECTED!*")
+                    results.append(f"  ⚠️ DATACENTER IP DETECTED!")
                     results.append(f"  💡 Use /setproxy to add proxy")
                 else:
                     results.append(f"  ✅ Residential IP")
 
         # Check if keys are configured
         if not stripe_sk:
-            results.append("\n❌ *SK Key*: Not configured!")
-            await status_msg.edit_text("\n".join(results), parse_mode="Markdown")
+            results.append("\n❌ SK Key: Not configured!")
+            await status_msg.edit_text("\n".join(results))
             return
 
         if not stripe_pk:
-            results.append("\n❌ *PK Key*: Not configured!")
-            await status_msg.edit_text("\n".join(results), parse_mode="Markdown")
+            results.append("\n❌ PK Key: Not configured!")
+            await status_msg.edit_text("\n".join(results))
             return
 
         # Mask keys for display
         sk_masked = stripe_sk[:12] + "..." + stripe_sk[-4:]
         pk_masked = stripe_pk[:12] + "..." + stripe_pk[-4:]
-        results.append(f"\n🔑 *SK*: `{sk_masked}`")
-        results.append(f"🔑 *PK*: `{pk_masked}`")
+        results.append(f"\n🔑 SK: {sk_masked}")
+        results.append(f"🔑 PK: {pk_masked}")
 
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=15)
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # Test 1: Check account info with SK
-            results.append("\n📊 *Account Check:*")
+            results.append("\n📊 Account Check:")
 
             sk_auth = aiohttp.BasicAuth(stripe_sk, '')
             async with session.get("https://api.stripe.com/v1/account", auth=sk_auth) as resp:
@@ -3234,7 +3244,7 @@ async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     payouts_enabled = account_data.get("payouts_enabled", False)
                     business_type = account_data.get("business_type", "Unknown")
 
-                    results.append(f"  ✅ Account ID: `{account_id}`")
+                    results.append(f"  ✅ Account ID: {account_id}")
                     results.append(f"  🌍 Country: {country}")
                     results.append(f"  💳 Charges: {'✅ Enabled' if charges_enabled else '❌ Disabled'}")
                     results.append(f"  💸 Payouts: {'✅ Enabled' if payouts_enabled else '❌ Disabled'}")
@@ -3244,16 +3254,16 @@ async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     requirements = account_data.get("requirements", {})
                     disabled_reason = requirements.get("disabled_reason")
                     if disabled_reason:
-                        results.append(f"  ⚠️ *DISABLED*: {disabled_reason}")
+                        results.append(f"  ⚠️ DISABLED: {disabled_reason}")
 
                     currently_due = requirements.get("currently_due", [])
                     if currently_due:
-                        results.append(f"  ⚠️ *Action needed*: {len(currently_due)} items")
+                        results.append(f"  ⚠️ Action needed: {len(currently_due)} items")
                 else:
                     error = account_data.get("error", {})
                     error_msg = error.get("message", "Unknown error")
                     error_type = error.get("type", "")
-                    results.append(f"  ❌ *ERROR*: {error_msg}")
+                    results.append(f"  ❌ ERROR: {error_msg[:50]}")
 
                     if error_type == "authentication_error":
                         results.append(f"  ⚠️ SK Key is INVALID or EXPIRED!")
@@ -3261,7 +3271,7 @@ async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         results.append(f"  ⚠️ Rate limited - too many requests!")
 
             # Test 2: Check balance
-            results.append("\n💰 *Balance Check:*")
+            results.append("\n💰 Balance Check:")
             async with session.get("https://api.stripe.com/v1/balance", auth=sk_auth) as resp:
                 balance_data = await resp.json()
 
@@ -3282,7 +3292,7 @@ async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     results.append(f"  ❌ Failed to get balance")
 
             # Test 3: Check recent charges for patterns
-            results.append("\n📈 *Recent Activity:*")
+            results.append("\n📈 Recent Activity:")
             async with session.get("https://api.stripe.com/v1/charges?limit=10", auth=sk_auth) as resp:
                 charges_data = await resp.json()
 
@@ -3295,14 +3305,14 @@ async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     # Check for high decline rate
                     if failed > 7:
-                        results.append(f"  ⚠️ *HIGH DECLINE RATE* - SK may get flagged!")
+                        results.append(f"  ⚠️ HIGH DECLINE RATE - SK may get flagged!")
                     elif failed > 5:
                         results.append(f"  ⚠️ Elevated decline rate - be careful")
                 else:
                     results.append(f"  ❌ Failed to get charges")
 
             # Test 4: Check for radar/fraud rules
-            results.append("\n🛡️ *Fraud Protection:*")
+            results.append("\n🛡️ Fraud Protection:")
             async with session.get("https://api.stripe.com/v1/radar/value_lists?limit=1", auth=sk_auth) as resp:
                 if resp.status == 200:
                     results.append(f"  ✅ Radar access: Available")
@@ -3311,17 +3321,20 @@ async def skstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     results.append(f"  ⚠️ Radar: Check manually")
 
-            results.append("\n✅ *SK Key is working!*")
+            results.append("\n✅ SK Key is working!")
 
     except Exception as e:
         logger.error(f"Error in skstatus: {e}")
-        results.append(f"\n❌ *Error*: {str(e)[:50]}")
+        results.append(f"\n❌ Error: {str(e)[:50]}")
 
     try:
-        await status_msg.edit_text("\n".join(results), parse_mode="Markdown")
+        await status_msg.edit_text("\n".join(results))
     except Exception as e:
         logger.error(f"Error editing skstatus message: {e}")
-        await update.message.reply_text("\n".join(results), parse_mode="Markdown")
+        try:
+            await update.message.reply_text("\n".join(results))
+        except:
+            await update.message.reply_text("Error displaying status. Check logs.")
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

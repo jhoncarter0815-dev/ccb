@@ -1519,7 +1519,6 @@ async def stripe_gateway_check(
                     "billing_details[email]": email,
                     "key": stripe_pk,
                     "payment_user_agent": stripe_version,
-                    "_stripe_account": "",
                 }
 
                 stripe_headers = {

@@ -1,38 +1,27 @@
 # Nixpacks configuration for Playwright support
 [phases.setup]
-nixPkgs = [
-    "python312",
+aptPkgs = [
     "chromium",
-    "nss",
-    "freetype",
-    "harfbuzz",
-    "ca-certificates",
-    "fontconfig",
-    "glib",
-    "gtk3",
-    "libdrm",
-    "mesa",
-    "alsa-lib",
-    "pango",
-    "cairo",
-    "expat",
-    "dbus",
-    "at-spi2-atk",
-    "cups",
-    "libxkbcommon",
-    "xorg.libX11",
-    "xorg.libXcomposite",
-    "xorg.libXdamage",
-    "xorg.libXext",
-    "xorg.libXfixes",
-    "xorg.libXrandr",
-    "xorg.libxcb"
+    "libnss3",
+    "libatk1.0-0",
+    "libatk-bridge2.0-0",
+    "libcups2",
+    "libdrm2",
+    "libxkbcommon0",
+    "libxcomposite1",
+    "libxdamage1",
+    "libxfixes3",
+    "libxrandr2",
+    "libgbm1",
+    "libasound2",
+    "libpango-1.0-0",
+    "libcairo2"
 ]
 
 [phases.install]
 cmds = [
     "pip install -r requirements.txt",
-    "playwright install chromium --with-deps"
+    "playwright install chromium"
 ]
 
 [start]

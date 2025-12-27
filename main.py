@@ -1416,6 +1416,7 @@ async def stripe_gateway_check(
 
                 # =============================================================
                 # STEP 1: Load donation page (with anti-detection headers)
+                # Try without proxy first (page load), use proxy for Stripe API
                 # =============================================================
 
                 page_headers = {
@@ -1436,34 +1437,47 @@ async def stripe_gateway_check(
                     "sec-ch-ua-platform": '"Windows"',
                 }
 
-                async with session.get(
-                    STRIPE_DONATION_URL,
-                    headers=page_headers,
-                    proxy=proxy_url,
-                    allow_redirects=True
-                ) as resp:
-                    # Check for rate limiting
-                    if is_rate_limited(resp.status):
-                        if logger:
-                            logger.warning(f"[Stripe Attempt {attempt}] Rate limited on page load")
-                        last_error = {"success": False, "error": "Rate limited - try again later", "status": "rate_limited"}
-                        await exponential_backoff(attempt, base_delay=5.0)
+                # Try loading page - first without proxy, then with proxy if that fails
+                page_html = None
+                page_load_error = None
+
+                for use_proxy in [False, True] if proxy_url else [False]:
+                    current_proxy = proxy_url if use_proxy else None
+                    try:
+                        async with session.get(
+                            STRIPE_DONATION_URL,
+                            headers=page_headers,
+                            proxy=current_proxy,
+                            allow_redirects=True
+                        ) as resp:
+                            if resp.status == 200:
+                                page_html = await resp.text()
+                                break
+                            elif resp.status == 403:
+                                page_load_error = "Access denied (403) - site may be blocking requests"
+                                if use_proxy:
+                                    # Proxy is blocked, continue to try without
+                                    continue
+                            elif is_rate_limited(resp.status):
+                                page_load_error = "Rate limited - try again later"
+                            else:
+                                page_load_error = f"Failed to load page (HTTP {resp.status})"
+                    except Exception as e:
+                        page_load_error = f"Page load error: {str(e)[:30]}"
                         continue
 
-                    if resp.status != 200:
-                        last_error = {"success": False, "error": f"Failed to load page (HTTP {resp.status})"}
-                        await exponential_backoff(attempt)
-                        continue
+                if not page_html:
+                    last_error = {"success": False, "error": page_load_error or "Failed to load page"}
+                    await exponential_backoff(attempt)
+                    continue
 
-                    page_html = await resp.text()
-
-                    # Check for rate limit in response body
-                    if is_rate_limited(200, page_html):
-                        if logger:
-                            logger.warning(f"[Stripe Attempt {attempt}] Rate limit detected in page content")
-                        last_error = {"success": False, "error": "Rate limited - try again later", "status": "rate_limited"}
-                        await exponential_backoff(attempt, base_delay=5.0)
-                        continue
+                # Check for rate limit in response body
+                if is_rate_limited(200, page_html):
+                    if logger:
+                        logger.warning(f"[Stripe Attempt {attempt}] Rate limit detected in page content")
+                    last_error = {"success": False, "error": "Rate limited - try again later", "status": "rate_limited"}
+                    await exponential_backoff(attempt, base_delay=5.0)
+                    continue
 
                 # Extract Stripe publishable key from page
                 stripe_pk = None

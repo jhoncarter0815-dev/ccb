@@ -239,7 +239,7 @@ user_settings_cache = {}
 bot_config_cache = {}
 
 def get_bot_config(key: str, default: str = "") -> str:
-    """Get a bot config value from database or cache"""
+    """Get a bot config value from database, env vars, or cache"""
     global bot_config_cache
 
     # Check cache first
@@ -260,6 +260,18 @@ def get_bot_config(key: str, default: str = "") -> str:
                 return row[0]
         except Exception as e:
             logger.error(f"Error getting bot config {key}: {e}")
+
+    # Fallback to environment variables
+    env_key_map = {
+        "stripe_sk_key": "STRIPE_SK_KEY",
+        "stripe_pk_key": "STRIPE_PK_KEY"
+    }
+
+    if key in env_key_map:
+        env_value = os.getenv(env_key_map[key], "")
+        if env_value:
+            bot_config_cache[key] = env_value
+            return env_value
 
     return default
 
@@ -3516,6 +3528,87 @@ async def setpk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Failed to save. Database error.")
 
 
+async def synckeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /synckeys command - sync SK/PK from Railway env vars to database"""
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("🚫 Admin only.")
+        return
+
+    global bot_config_cache
+
+    # Get from environment variables
+    env_sk = os.getenv("STRIPE_SK_KEY", "")
+    env_pk = os.getenv("STRIPE_PK_KEY", "")
+
+    results = ["🔄 *Syncing Keys from Railway Env Vars*\n"]
+
+    if env_sk:
+        if set_bot_config("stripe_sk_key", env_sk):
+            bot_config_cache["stripe_sk_key"] = env_sk
+            masked = f"{env_sk[:12]}...{env_sk[-4:]}"
+            results.append(f"✅ SK synced: `{masked}`")
+        else:
+            results.append("❌ Failed to sync SK")
+    else:
+        results.append("⚠️ No STRIPE_SK_KEY env var found")
+
+    if env_pk:
+        if set_bot_config("stripe_pk_key", env_pk):
+            bot_config_cache["stripe_pk_key"] = env_pk
+            masked = f"{env_pk[:12]}...{env_pk[-4:]}"
+            results.append(f"✅ PK synced: `{masked}`")
+        else:
+            results.append("❌ Failed to sync PK")
+    else:
+        results.append("⚠️ No STRIPE_PK_KEY env var found")
+
+    results.append("\n💡 Use `/skstatus` to verify")
+
+    await update.message.reply_text("\n".join(results), parse_mode="Markdown")
+
+
+async def clearkeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /clearkeys command - clear cached keys and reload from env"""
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("🚫 Admin only.")
+        return
+
+    global bot_config_cache
+
+    # Clear cache
+    if "stripe_sk_key" in bot_config_cache:
+        del bot_config_cache["stripe_sk_key"]
+    if "stripe_pk_key" in bot_config_cache:
+        del bot_config_cache["stripe_pk_key"]
+
+    # Delete from database so env vars are used
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM bot_config WHERE key IN ('stripe_sk_key', 'stripe_pk_key')")
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            await update.message.reply_text(
+                "✅ *Keys Cleared!*\n\n"
+                "Bot will now use Railway env vars:\n"
+                f"• STRIPE_SK_KEY: {'✅ Set' if os.getenv('STRIPE_SK_KEY') else '❌ Not set'}\n"
+                f"• STRIPE_PK_KEY: {'✅ Set' if os.getenv('STRIPE_PK_KEY') else '❌ Not set'}\n\n"
+                "💡 Use `/skstatus` to verify",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {e}")
+    else:
+        await update.message.reply_text("❌ Database connection failed")
+
+
 async def get_all_users_from_db():
     """Get all users from database"""
     users = []
@@ -4872,6 +4965,8 @@ def main():
     app.add_handler(CommandHandler("skstatus", skstatus_command))
     app.add_handler(CommandHandler("setsk", setsk_command))
     app.add_handler(CommandHandler("setpk", setpk_command))
+    app.add_handler(CommandHandler("synckeys", synckeys_command))
+    app.add_handler(CommandHandler("clearkeys", clearkeys_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("chk", check_command))
     app.add_handler(CallbackQueryHandler(handle_callback))

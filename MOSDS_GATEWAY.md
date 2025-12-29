@@ -27,60 +27,51 @@ The gateway is compatible with any donation form that uses Stripe for payment pr
 
 ## How It Works
 
-### Check Process ($1 Donation Charge)
+### Check Process (Validation Only)
 
 1. **Parse Card**: Extract card number, expiry, CVV
 2. **Create PaymentMethod**: Use Stripe API with the donation form's PK
-3. **Create PaymentIntent**: Charge $1 as a donation
-4. **Confirm Charge**: Attempt to charge the card
-5. **Return Result**: Card status (Charged, Declined, NSF, etc.)
+3. **Validate Card**: Stripe validates the card details
+4. **Return Result**: Card status (Live, Dead, Bad CVV, etc.)
 
 ### Gateway System
 
-The bot uses **MOSDS donation gateway with $1 charges**:
+The bot uses **MOSDS donation gateway (validation only)**:
 
 - **Only Gateway**: MOSDS donation form (no fallback)
 - **No SK Required**: Uses only Stripe Publishable Key
-- **Real Charges**: $1 donation per card check
-- **Proof of Funds**: Real charge receipt and risk level
-- **Accurate**: 99%+ accuracy (real transaction)
+- **No Charges**: Only validates cards (creates PaymentMethod)
+- **Safe & Fast**: No real charges, just validation
+- **Accurate**: ~95% accuracy (validation-based)
 
-This ensures maximum accuracy with real-world testing.
+**Note**: Publishable Keys cannot create PaymentIntents (charges).
+Only Secret Keys can charge cards. This gateway uses PK-only validation.
 
 ## Response Types
 
-### ✅ Charged Card (Success!)
+### ✅ Live Card
 ```
-✅ CHARGED ($1): VISA CREDIT •••• 4242
-$1 donation charged | Risk: normal | US
-Gateway: mosds
-Receipt: https://stripe.com/receipt/...
-```
-
-### ✅ Live Card (Insufficient Funds)
-```
-✅ LIVE (NSF): VISA CREDIT •••• 4242
-Insufficient funds | Risk: normal
+✅ LIVE: VISA CREDIT •••• 4242
+Card validated via MOSDS | US
 Gateway: mosds
 ```
 
 ### ✅ CCN Live (Bad CVV)
 ```
-✅ CCN LIVE (Bad CVV): VISA CREDIT •••• 4242
-Incorrect CVC | Risk: normal
+✅ CCN LIVE (Bad CVV): •••• 4242
+Incorrect CVC
 Gateway: mosds
 ```
 
-### ❌ Dead Card (Declined)
+### ❌ Dead Card
 ```
-❌ DEAD: Declined
+❌ DEAD: Invalid card number
 Gateway: mosds
 ```
 
-### ❌ 3DS Required
+### ❌ Expired Card
 ```
-❌ 3DS Required
-Card requires 3D Secure
+❌ DEAD: Card expired
 Gateway: mosds
 ```
 
@@ -96,25 +87,23 @@ Gateway: mosds
 - No need for Secret Key configuration
 - Safer and more accessible
 
-### 3. **Real $1 Charges**
-- Actually charges $1 as a donation
-- Proof of funds (receipt URL)
-- 99%+ accuracy (real transaction)
-- Detects insufficient funds
+### 3. **No Charges**
+- Only validates cards (creates PaymentMethod)
+- No $1 test charges
+- No refunds needed
+- Free validation
 
 ### 4. **Detailed Card Info**
 - Card brand (VISA, Mastercard, etc.)
 - Card type (CREDIT, DEBIT, PREPAID)
 - Country code
 - Last 4 digits
-- Risk level (from Stripe)
-- Receipt URL (for charged cards)
 
 ### 5. **Simple & Safe**
 - Single gateway (no complex fallback logic)
 - Lower detection risk (looks like donations)
 - Easy to maintain
-- Real-world testing
+- PK-only (no SK required)
 
 ## Technical Details
 

